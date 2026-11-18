@@ -1,6 +1,10 @@
 # Softphone
 
-A native Rust desktop phone for voice calls over SIP. The interface uses **egui / eframe 0.37** with OpenGL. **RVoIP 0.4** handles SIP Digest registration, SDP, G.711 (PCMU / PCMA), RTP / SRTP, and RFC 4733 keypad tones. CPAL connects the microphone and speaker. Linux is the validated target.
+A Rust desktop app for voice calls over SIP, tested on Linux. It uses **egui / eframe 0.37** with OpenGL for the interface and CPAL for the microphone and speaker. **RVoIP 0.4** handles SIP Digest registration, SDP, G.711 (PCMU / PCMA), RTP / SRTP, and RFC 4733 keypad tones.
+
+## System documentation
+
+The [documentation index](docs/README.md) covers the app's purpose, context, design, behavior, data, development, and deployment. Small Mermaid and SVG diagrams explain each part using the supplied description method.
 
 ## Build and run
 
@@ -18,7 +22,7 @@ cargo build --locked --release
 ./target/release/softphone
 ```
 
-No JavaScript, webview, Tauri CLI, or Node tooling is needed. The source is now under `src/`, with a root `Cargo.toml`.
+Cargo builds the whole app from `src/` and the root `Cargo.toml`. No JavaScript, webview, Tauri CLI, or Node tools are needed.
 
 ## Connect to a PBX
 
@@ -27,11 +31,11 @@ No JavaScript, webview, Tauri CLI, or Node tooling is needed. The source is now 
 3. Choose **Register account**. Once registered, dial an extension or `sip:1002@pbx.example.com`.
 4. Use **Answer**, **Decline**, **Hang up**, and **Mute microphone** as appropriate. During a connected call, the keypad sends DTMF. Microphone and speaker selection is available between calls.
 
-One account and one call are supported. Registration refresh is handled by RVoIP. After a connection failure, register again. If registration fails while the endpoint remains open, choose **Disconnect** before retrying. There is no automatic redial.
+The app supports one account and one call. RVoIP refreshes registration. After a connection failure, register again. If registration fails while the endpoint is still open, choose **Disconnect** first. Calls are not redialed automatically.
 
-**Remember in system keyring** stores the password in the OS credential store. An empty password field uses the saved credential for the same account. Passwords are cleared from the form after submission and never saved in account JSON. Existing Linux settings remain compatible at `$XDG_CONFIG_HOME/com.softphone.desktop/account.json` or `~/.config/com.softphone.desktop/account.json`.
+**Remember in system keyring** saves the password in the OS credential store. Leave the password field empty to use the saved password for that account. The form clears passwords after submission; account JSON never contains them. Existing Linux settings still work at `$XDG_CONFIG_HOME/com.softphone.desktop/account.json` or `~/.config/com.softphone.desktop/account.json`.
 
-Incoming calls request desktop attention and show answer controls. Incoming calls play a repeating ringtone on the selected speaker. The tone stops on answer, decline, remote cancellation, or disconnect. Keep the application running to receive calls. Closing the window ends the call and unregisters, with a bounded shutdown wait.
+Incoming calls request desktop attention, show answer controls, and ring through the selected speaker. Ringing stops when you answer, decline, disconnect, or the caller cancels. Keep the app running to receive calls. Closing the window ends the call and unregisters, with a time limit on shutdown.
 
 ## Asterisk interoperability
 
@@ -39,7 +43,7 @@ Use a reachable PJSIP extension with Digest authentication, `allow=ulaw,alaw`, `
 
 This build targets a PBX reachable over an IPv4 LAN or VPN. IPv6, ICE/TURN configuration, hold, transfer, conferencing, video, and messaging are outside this implementation.
 
-See [TESTING.md](TESTING.md) for the complete operation coverage matrix and test boundaries.
+See [TESTING.md](TESTING.md) for covered operations and test limits.
 
 ## Verification
 
@@ -49,16 +53,16 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The tests cover account and target validation, stale call commands, caller label sanitization, and shutdown. See [RELIABILITY_REVIEW.md](RELIABILITY_REVIEW.md) for fixes, integration evidence, and remaining limits. Physical headset audio and a real provider should be checked before daily use.
+Tests cover account and destination checks, commands for ended calls, caller label cleanup, and shutdown. [RELIABILITY_REVIEW.md](RELIABILITY_REVIEW.md) records fixes, integration results, and remaining limits. Test a physical headset and your provider before daily use.
 
 ## Diagnostic log
 
-Each run appends to `logs/softphone.log` in this project folder. The startup message prints its full path. The file records application actions, state transitions, operation durations, registration updates, and SIP REGISTER / INVITE / ACK / BYE / CANCEL directions and numeric response codes. Call-control clicks are recorded separately from backend receipt so input and signaling delays can be distinguished.
+Each run adds records to `logs/softphone.log` in this project folder. The startup message shows the full path. Logs include actions, state changes, timings, registration updates, and the direction and numeric response codes of SIP REGISTER / INVITE / ACK / BYE / CANCEL messages. Separate records for clicks and backend receipt help locate delays.
 
-The log rotates at 5 MiB, retaining `logs/softphone.log.1`. Share both files after reproducing a problem. `SOFTPHONE_LOG_DIR` overrides the directory when needed. Logs are ignored by version control. Passwords, dialed digits, caller addresses, authentication headers, SDP, and full SIP messages are excluded. Socket addresses and internal call identifiers are included for correlation.
+At 5 MiB, the log rotates and keeps the previous file as `logs/softphone.log.1`. Share both files after reproducing a problem. Set `SOFTPHONE_LOG_DIR` to change the directory. Git ignores logs. They exclude passwords, dialed digits, caller addresses, authentication headers, SDP, and full SIP messages. Socket addresses and internal call IDs help match related events.
 
 Call controls are fixed above the scrolling account/dialer area. Escape hangs up an active call or declines a ringing call.
 
-Twilio accounts automatically use their SIP domain as the outbound proxy. This keeps ACK and BYE on the provider edge when a dialog Contact contains a private address. A custom proxy can be entered under **Connection options → Outbound proxy**. Other PBX accounts keep direct routing unless a proxy is configured. The bundled `rvoip-sip-dialog` patch preserves this route in 2xx ACKs, including after authentication retries; see `vendor/rvoip-sip-dialog/SOFTPHONE_PATCH.md`.
+Twilio accounts use their SIP domain as the outbound proxy so ACK and BYE reach the provider even when Contact contains a private address. Set a custom proxy under **Connection options → Outbound proxy**. Other PBX accounts use direct routing unless you set a proxy. The bundled `rvoip-sip-dialog` patch keeps this route in 2xx ACKs, including after authentication retries; see `vendor/rvoip-sip-dialog/SOFTPHONE_PATCH.md`.
 
 The log startup marker `routing_revision="ack-hostname-v3"` identifies the build containing hostname-proxy ACK resolution.

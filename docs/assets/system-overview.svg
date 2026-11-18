@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="360" viewBox="0 0 1080 360" role="img" aria-labelledby="title desc">
+<title id="title">Call controls</title>
+<desc id="desc">The Desktop UI sends actions to the Phone actor, which controls the SIP/media stack. The stack exchanges SIP with the provider. Status returns to the UI. All app components share one process.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#2563eb"/></marker></defs>
+<style>text{font-family:DejaVu Sans,Arial,sans-serif;fill:#17283e}.title{font-size:26px;font-weight:700}.subtitle{font-size:15px;fill:#40536a}.node{font-size:17px;font-weight:700}.detail{font-size:14px;fill:#40536a}.label{font-size:13px;fill:#40536a}</style>
+<rect width="1080" height="360" rx="12" fill="#f6f9fd"/>
+<text x="32" y="44" class="title">Call controls</text>
+
+<rect x="32" y="118" width="210" height="78" rx="10" fill="#fff" stroke="#bdccdf" stroke-width="2"/>
+<text x="137.0" y="149" text-anchor="middle" class="node">Desktop UI</text>
+<text x="137.0" y="174" text-anchor="middle" class="detail">Buttons and status</text>
+<rect x="302" y="118" width="210" height="78" rx="10" fill="#fff" stroke="#bdccdf" stroke-width="2"/>
+<text x="407.0" y="149" text-anchor="middle" class="node">Phone actor</text>
+<text x="407.0" y="174" text-anchor="middle" class="detail">Call state and deadlines</text>
+<rect x="572" y="118" width="210" height="78" rx="10" fill="#fff" stroke="#bdccdf" stroke-width="2"/>
+<text x="677.0" y="149" text-anchor="middle" class="node">SIP/media stack</text>
+<text x="677.0" y="174" text-anchor="middle" class="detail">SIP, SDP, call routing</text>
+<rect x="842" y="118" width="206" height="78" rx="10" fill="#fff" stroke="#bdccdf" stroke-width="2"/>
+<text x="945.0" y="149" text-anchor="middle" class="node">PBX / provider</text>
+<text x="945.0" y="174" text-anchor="middle" class="detail">External server</text>
+<path d="M242 151 H302" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M512 151 H572" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M782 151 H842" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M407 196 V254 H137 V196" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="272" y="137" text-anchor="middle" class="label">Action</text>
+<text x="542" y="137" text-anchor="middle" class="label">Control</text>
+<text x="812" y="137" text-anchor="middle" class="label">SIP</text>
+<text x="272" y="244" text-anchor="middle" class="label">Latest status</text>
+<text x="540" y="319" text-anchor="middle" class="label">Desktop UI, Phone actor, and SIP/media stack run in one app process.</text>
+</svg>
