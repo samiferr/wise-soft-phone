@@ -1,0 +1,10 @@
+//! SDP negotiation and media tracking
+//!
+//! This module handles SDP offer/answer negotiation within dialogs.
+
+pub mod negotiation;
+
+// Sprint 3 C2 — RFC 3264 §6 matcher.
+pub use negotiation::{
+    match_offer, AnswerCapabilities, MatchError, MediaLineMatch, OfferAnswerMatch,
+};

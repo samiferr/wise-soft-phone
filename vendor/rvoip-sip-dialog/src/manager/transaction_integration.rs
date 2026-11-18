@@ -1,0 +1,8696 @@
+//! Transaction Integration for Dialog Management
+//!
+//! This module handles the integration between dialog-core and transaction-core,
+//! managing transaction lifecycle events, request/response routing, and event processing.
+//! It provides the bridge between SIP transaction reliability and dialog state management.
+//!
+//! ## Key Responsibilities
+//!
+//! - Processing transaction events and routing to appropriate dialogs
+//! - Managing transaction-to-dialog associations
+//! - Handling transaction completion and cleanup
+//! - Converting between transaction and dialog abstractions
+//! - Coordinating request sending through transaction layer
+
+use super::core::DialogManager;
+use super::session_coordination::SessionCoordinator;
+use crate::api::config::RelUsage;
+use crate::dialog::{dialog_utils::extract_uri_from_contact, DialogId, DialogState};
+use crate::errors::{DialogError, DialogResult};
+use crate::events::session_coordination::tracks_generic_outbound_request_completion;
+use crate::events::{DialogEvent, SessionCoordinationEvent};
+use crate::protocol::response_handler::response_has_auth_challenge;
+use crate::transaction::builders::dialog_quick;
+use crate::transaction::client::builders::ByeBuilder;
+use crate::transaction::dialog::{request_builder_from_dialog_template, DialogRequestTemplate};
+use crate::transaction::{TransactionEvent, TransactionKey, TransactionState};
+use rvoip_infra_common::events::cross_crate::OutboundRequestOutcome;
+use rvoip_sip_core::types::uri::Scheme;
+use rvoip_sip_core::{HeaderName, Host, Method, Request, Response, TypedHeader, Uri};
+use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
+
+fn safe_operation_failure(operation: &'static str, error_class: &'static str) -> String {
+    format!("operation={operation}; error_class={error_class}")
+}
+
+fn safe_uri_scheme_class(uri: &Uri) -> &'static str {
+    match uri.scheme() {
+        Scheme::Sip => "sip",
+        Scheme::Sips => "sips",
+        Scheme::Tel => "tel",
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+        Scheme::Custom(_) => "custom",
+    }
+}
+
+fn safe_uri_transport_class(uri: &Uri) -> &'static str {
+    match uri.transport() {
+        Some(value) if value.eq_ignore_ascii_case("udp") => "udp",
+        Some(value) if value.eq_ignore_ascii_case("tcp") => "tcp",
+        Some(value) if value.eq_ignore_ascii_case("tls") => "tls",
+        Some(value) if value.eq_ignore_ascii_case("ws") => "ws",
+        Some(value) if value.eq_ignore_ascii_case("wss") => "wss",
+        Some(_) => "other",
+        None => "unspecified",
+    }
+}
+
+#[cfg(test)]
+mod safe_uri_diagnostic_tests {
+    use super::{safe_uri_scheme_class, safe_uri_transport_class};
+
+    #[test]
+    fn distinguishes_sips_from_sip_over_tls_without_exposing_the_uri() {
+        let sip_tls: rvoip_sip_core::Uri = "sip:private-user@private.example;transport=tls"
+            .parse()
+            .unwrap();
+        let sips: rvoip_sip_core::Uri = "sips:private-user@private.example".parse().unwrap();
+
+        assert_eq!(safe_uri_scheme_class(&sip_tls), "sip");
+        assert_eq!(safe_uri_transport_class(&sip_tls), "tls");
+        assert_eq!(safe_uri_scheme_class(&sips), "sips");
+        assert_eq!(safe_uri_transport_class(&sips), "unspecified");
+    }
+}
+
+fn safe_method_operation_failure(
+    operation: &'static str,
+    error_class: &'static str,
+    method: &Method,
+) -> String {
+    format!(
+        "operation={operation}; method={}; error_class={error_class}",
+        crate::transaction::safe_diagnostics::SafeMethod::new(method)
+    )
+}
+
+/// Immutable wire inputs for one in-dialog INFO attempt.
+///
+/// Authentication retries create a new value with the authorization header
+/// appended to `extra_headers`; the content type and exact byte entity remain
+/// unchanged.  Keeping those values together prevents Digest `auth-int` from
+/// being calculated over one body while a lossy reconstruction reaches the
+/// wire.
+#[derive(Clone)]
+pub(crate) struct InfoRequestSnapshot {
+    content_type: String,
+    body: bytes::Bytes,
+    extra_headers: Vec<TypedHeader>,
+    generate_missing_local_tag: bool,
+}
+
+impl InfoRequestSnapshot {
+    /// Compatibility shape for the generic/legacy INFO facades.
+    pub(crate) fn legacy(body: Option<bytes::Bytes>, extra_headers: Vec<TypedHeader>) -> Self {
+        Self {
+            content_type: "application/info".to_string(),
+            body: body.unwrap_or_else(|| bytes::Bytes::from_static(b"Application info")),
+            extra_headers,
+            generate_missing_local_tag: true,
+        }
+    }
+
+    /// Exact options shape used by the byte-oriented public API.
+    pub(crate) fn exact(
+        content_type: String,
+        body: bytes::Bytes,
+        extra_headers: Vec<TypedHeader>,
+    ) -> Self {
+        Self {
+            content_type,
+            body,
+            extra_headers,
+            generate_missing_local_tag: false,
+        }
+    }
+
+    /// Compatibility shape for the legacy caller-chosen Content-Type facade.
+    pub(crate) fn legacy_with_content_type(
+        content_type: String,
+        body: bytes::Bytes,
+        extra_headers: Vec<TypedHeader>,
+    ) -> Self {
+        Self {
+            content_type,
+            body,
+            extra_headers,
+            generate_missing_local_tag: true,
+        }
+    }
+}
+
+/// Where a compatibility NOTIFY obtains its Subscription-State value.
+#[derive(Clone)]
+pub(crate) enum NotifySubscriptionState {
+    /// Preserve the legacy facade behavior by snapshotting the dialog-owned
+    /// subscription state while the CSeq/template is captured.
+    Tracked,
+    /// Use exactly the caller-supplied value. `None` deliberately omits the
+    /// header and does not fall back to mutable dialog state.
+    Explicit(Option<String>),
+}
+
+/// Immutable wire inputs for one in-dialog NOTIFY attempt.
+///
+/// `event == None` is used only by the generic Method::Notify facade and means
+/// "snapshot the dialog event package". An explicit empty event remains empty
+/// and is never confused with that compatibility behavior.
+#[derive(Clone)]
+pub(crate) struct NotifyRequestSnapshot {
+    event: Option<String>,
+    subscription_state: NotifySubscriptionState,
+    content_type: Option<String>,
+    body: Option<bytes::Bytes>,
+    subscription_id: Option<String>,
+    extra_headers: Vec<TypedHeader>,
+    generate_missing_local_tag: bool,
+}
+
+impl NotifyRequestSnapshot {
+    /// Compatibility shape used by the generic and legacy NOTIFY facades.
+    pub(crate) fn legacy(
+        event: Option<String>,
+        subscription_state: NotifySubscriptionState,
+        body: Option<bytes::Bytes>,
+        extra_headers: Vec<TypedHeader>,
+    ) -> Self {
+        Self {
+            event,
+            subscription_state,
+            content_type: None,
+            body,
+            subscription_id: None,
+            extra_headers,
+            generate_missing_local_tag: true,
+        }
+    }
+
+    /// Exact options shape used by the byte-oriented RFC 6665 API.
+    pub(crate) fn exact(
+        event: String,
+        subscription_state: Option<String>,
+        content_type: Option<String>,
+        body: Option<bytes::Bytes>,
+        subscription_id: Option<String>,
+        extra_headers: Vec<TypedHeader>,
+    ) -> Self {
+        Self {
+            event: Some(event),
+            subscription_state: NotifySubscriptionState::Explicit(subscription_state),
+            content_type,
+            body,
+            subscription_id,
+            extra_headers,
+            generate_missing_local_tag: false,
+        }
+    }
+}
+
+/// Dialog-owned fields captured once for one INFO or NOTIFY materialization.
+struct InDialogRequestMaterializationContext {
+    call_id: String,
+    local_uri: String,
+    local_tag: String,
+    remote_uri: String,
+    remote_tag: String,
+    /// RFC 3261 §12.2.1.1 Request-URI: the dialog's remote target (the
+    /// peer's Contact), never its From/To AOR.
+    remote_target: rvoip_sip_core::Uri,
+    cseq: u32,
+    local_address: SocketAddr,
+    route_set: Vec<rvoip_sip_core::Uri>,
+}
+
+fn materialize_info_request_snapshot(
+    context: &InDialogRequestMaterializationContext,
+    snapshot: &InfoRequestSnapshot,
+) -> DialogResult<Request> {
+    let body_projection = String::from_utf8_lossy(&snapshot.body).into_owned();
+    let request = dialog_quick::info_for_dialog_with_extras(
+        &context.call_id,
+        &context.local_uri,
+        &context.local_tag,
+        &context.remote_uri,
+        &context.remote_tag,
+        &body_projection,
+        Some(snapshot.content_type.clone()),
+        context.cseq,
+        context.local_address,
+        (!context.route_set.is_empty()).then(|| context.route_set.clone()),
+        (!snapshot.extra_headers.is_empty()).then(|| snapshot.extra_headers.clone()),
+    )
+    .map_err(|_| crate::errors::DialogError::InternalError {
+        message: safe_method_operation_failure(
+            "dialog_request_build",
+            "builder_error",
+            &Method::Info,
+        ),
+        context: None,
+    })?;
+
+    // The quick builder addresses the AOR; an in-dialog request goes to the
+    // remote target (RFC 3261 §12.2.1.1).
+    let mut request = request;
+    request.uri = context.remote_target.clone();
+    // The quick builder remains String-shaped. Restore the same immutable
+    // byte entity used by the caller and Digest auth-int calculation.
+    Ok(request.with_body(snapshot.body.clone()))
+}
+
+fn materialize_notify_request_snapshot(
+    context: &InDialogRequestMaterializationContext,
+    snapshot: &NotifyRequestSnapshot,
+    event: String,
+    subscription_state: Option<String>,
+) -> DialogResult<Request> {
+    let event = match snapshot.subscription_id.as_deref() {
+        Some(subscription_id) if !subscription_id.is_empty() => {
+            format!("{event};id={subscription_id}")
+        }
+        _ => event,
+    };
+    let body_projection = snapshot
+        .body
+        .as_ref()
+        .map(|body| String::from_utf8_lossy(body).into_owned());
+    let mut request = dialog_quick::notify_for_dialog_with_extras(
+        context.call_id.clone(),
+        context.local_uri.clone(),
+        context.local_tag.clone(),
+        context.remote_uri.clone(),
+        context.remote_tag.clone(),
+        event,
+        body_projection,
+        subscription_state,
+        snapshot.content_type.clone(),
+        context.cseq,
+        context.local_address,
+        (!context.route_set.is_empty()).then(|| context.route_set.clone()),
+        (!snapshot.extra_headers.is_empty()).then(|| snapshot.extra_headers.clone()),
+    )
+    .map_err(|_| crate::errors::DialogError::InternalError {
+        message: safe_method_operation_failure(
+            "dialog_request_build",
+            "builder_error",
+            &Method::Notify,
+        ),
+        context: None,
+    })?;
+    // RFC 3261 §12.2.1.1: the remote target, not the subscriber's AOR.
+    request.uri = context.remote_target.clone();
+
+    // Preserve arbitrary bytes, Content-Length and Digest auth-int identity.
+    Ok(match &snapshot.body {
+        Some(body) => request.with_body(body.clone()),
+        None => request,
+    })
+}
+
+fn parse_notify_subscription_state(
+    state: &str,
+) -> crate::dialog::subscription_state::SubscriptionState {
+    use crate::dialog::subscription_state::{SubscriptionState, SubscriptionTerminationReason};
+
+    if state.starts_with("active") {
+        let expires = state
+            .find("expires=")
+            .and_then(|position| {
+                state[position + 8..]
+                    .split(';')
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(3600);
+        SubscriptionState::Active {
+            remaining_duration: Duration::from_secs(expires),
+            original_duration: Duration::from_secs(expires),
+        }
+    } else if state.starts_with("pending") {
+        SubscriptionState::Pending
+    } else if state.starts_with("terminated") {
+        let reason = if state.contains("noresource") {
+            Some(SubscriptionTerminationReason::NoResource)
+        } else if state.contains("deactivated") {
+            Some(SubscriptionTerminationReason::ClientRequested)
+        } else if state.contains("rejected") {
+            Some(SubscriptionTerminationReason::Rejected)
+        } else if state.contains("timeout") {
+            Some(SubscriptionTerminationReason::Expired)
+        } else {
+            None
+        };
+        SubscriptionState::Terminated { reason }
+    } else {
+        SubscriptionState::Terminated { reason: None }
+    }
+}
+
+/// Validated caller-controlled portion of an initial INVITE.
+///
+/// Contact is planned separately because `InviteBuilder` owns the one stack
+/// Contact slot. All remaining fields retain their caller-supplied order and
+/// multiplicity and are appended only after stack policy headers exist.
+struct InitialInviteHeaderPlan {
+    contact_uri: Option<String>,
+    appended: Vec<TypedHeader>,
+}
+
+/// The one policy difference among initial-INVITE attempts. Request
+/// reconstruction, routing, CSeq ownership and wire dispatch remain in one
+/// implementation so the first send and retry variants cannot drift.
+#[derive(Debug, Clone, Copy)]
+enum InitialInviteTimerPolicy {
+    Configured,
+    Override { session_secs: u32, min_se: u32 },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CandidateWirePlan {
+    /// The request's Contact was synthesized by the stack and may be
+    /// regenerated to match each resolver-selected transport candidate.
+    pub regenerate_stack_default_contact: bool,
+}
+
+/// Failure from initial-INVITE dispatch with a monotonic wire-boundary
+/// receipt. `ZeroWire` is safe for exact local rollback; `Unknown` must retain
+/// the dialog and transaction route for CANCEL/BYE teardown.
+pub enum InitialInviteSendFailure {
+    ZeroWire(crate::errors::DialogError),
+    Unknown(crate::errors::DialogError),
+}
+
+impl InitialInviteSendFailure {
+    pub fn wire_was_attempted(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+
+    pub fn into_dialog_error(self) -> crate::errors::DialogError {
+        match self {
+            Self::ZeroWire(error) | Self::Unknown(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Debug for InitialInviteSendFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitialInviteSendFailure")
+            .field("wire_was_attempted", &self.wire_was_attempted())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) const INVITE_FAILOVER_PLAN_TTL: Duration = Duration::from_secs(90);
+pub(crate) const INVITE_FAILOVER_PRUNE_INTERVAL: usize = 1024;
+const INVITE_FAILOVER_EXPIRY_BATCH: usize = 4096;
+pub(super) const INVITE_FAILOVER_EXPIRY_BUSY_RETRY: Duration = Duration::from_secs(1);
+const INVITE_FAILOVER_DIALOG_CLEANUP_BATCH: usize = INVITE_FAILOVER_EXPIRY_BATCH / 2;
+// Kept as an explicit policy seam so deployments can disable Timer-B and
+// transport-event failover without changing 503/immediate-send behavior.
+// The default is enabled only because exact-route authentication, bounded
+// orphan cleanup and serialized CANCEL targeting are covered by conformance
+// tests in this crate.
+const INVITE_TIMEOUT_FAILOVER_ENABLED: bool = true;
+const INVITE_CANDIDATE_COMPENSATION_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InviteFailoverPlanPhase {
+    Active,
+    /// Wire emission may have occurred and exact CANCEL/BYE teardown has not
+    /// completed. This phase is non-expiring and remains capacity-charged.
+    WireUnknown,
+    Accepted,
+    Cancelled,
+    Exhausted,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InviteCancelDispatchState {
+    Idle,
+    Dispatching,
+    Sent,
+    WireUnknown,
+}
+
+impl InviteFailoverPlanPhase {
+    fn has_expiry_deadline(self) -> bool {
+        self != Self::WireUnknown
+    }
+
+    fn is_overflow_evictable(self) -> bool {
+        !matches!(self, Self::Active | Self::WireUnknown)
+    }
+}
+
+/// One versioned wake-up in the retained initial-INVITE expiry scheduler.
+///
+/// Ordering by deadline keeps maintenance proportional to work that is
+/// actually due. The plan generation prevents a deadline captured before a
+/// concurrent close/re-arm from removing the newer retained generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct InviteFailoverExpiryKey {
+    wake_at: Instant,
+    plan_id: u64,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InviteFailoverScheduledExpiry {
+    key: InviteFailoverExpiryKey,
+    overflow_evictable: bool,
+}
+
+/// One exact retry for dialog-owned failover compaction when the plan mutex
+/// was busy during synchronous dialog removal.
+///
+/// This queue is deliberately orthogonal to protocol expiry deadlines: a
+/// short cleanup retry must never replace or extend the retained late-2xx
+/// horizon. The scheduler generation prevents a popped busy retry from
+/// replacing a newer request, while the weak plan identity prevents a
+/// wrapped/reused numeric ID from touching another plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct InviteFailoverDialogCleanupKey {
+    wake_at: Instant,
+    plan_id: u64,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct InviteFailoverScheduledDialogCleanup {
+    key: InviteFailoverDialogCleanupKey,
+    dialog_id: DialogId,
+    plan: std::sync::Weak<tokio::sync::Mutex<InviteFailoverPlan>>,
+}
+
+/// Exact bounded scheduler for retained initial-INVITE plans.
+///
+/// `current` and the two ordered sets contain at most one entry per plan, so
+/// repeated deadline changes cannot accumulate stale heap nodes. The explicit
+/// capacity is the same as the retained-plan registry capacity. A popped entry
+/// may still race with a re-arm; its generation is checked against the plan
+/// before removal and `restore_after_busy` never replaces a newer entry.
+pub(crate) struct InviteFailoverExpiryScheduler {
+    capacity: usize,
+    deadlines: BTreeSet<InviteFailoverExpiryKey>,
+    overflow_evictable: BTreeSet<InviteFailoverExpiryKey>,
+    current: HashMap<u64, InviteFailoverScheduledExpiry>,
+    dialog_cleanup_deadlines: BTreeSet<InviteFailoverDialogCleanupKey>,
+    dialog_cleanup_current: HashMap<u64, InviteFailoverScheduledDialogCleanup>,
+    next_dialog_cleanup_generation: u64,
+}
+
+impl InviteFailoverExpiryScheduler {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            deadlines: BTreeSet::new(),
+            overflow_evictable: BTreeSet::new(),
+            // `capacity` is the logical correctness bound. Reserving the
+            // complete multi-second churn horizon here made an otherwise
+            // empty manager allocate for every possible retained plan.
+            current: HashMap::with_capacity(capacity.min(4_096)),
+            dialog_cleanup_deadlines: BTreeSet::new(),
+            dialog_cleanup_current: HashMap::with_capacity(capacity.min(256)),
+            next_dialog_cleanup_generation: 1,
+        }
+    }
+
+    /// Diagnostic-only storage shape for retained failover scheduling.
+    ///
+    /// Logical protocol capacity is intentionally distinct from allocated
+    /// hash capacity. Reporting both catches accidental eager reservation of
+    /// the complete high-CPS retention horizon without scanning SIP payloads.
+    pub(crate) fn storage_breakdown(&self) -> serde_json::Value {
+        serde_json::json!({
+            "logical_capacity": self.capacity,
+            "deadlines": self.deadlines.len(),
+            "overflow_evictable": self.overflow_evictable.len(),
+            "current": self.current.len(),
+            "current_hash_capacity": self.current.capacity(),
+            "dialog_cleanup_deadlines": self.dialog_cleanup_deadlines.len(),
+            "dialog_cleanup_current": self.dialog_cleanup_current.len(),
+            "dialog_cleanup_hash_capacity": self.dialog_cleanup_current.capacity(),
+            "record_inline_bytes": {
+                "expiry_key": std::mem::size_of::<InviteFailoverExpiryKey>(),
+                "scheduled_expiry": std::mem::size_of::<InviteFailoverScheduledExpiry>(),
+                "dialog_cleanup_key": std::mem::size_of::<InviteFailoverDialogCleanupKey>(),
+                "scheduled_dialog_cleanup": std::mem::size_of::<InviteFailoverScheduledDialogCleanup>(),
+            },
+        })
+    }
+
+    fn remove_current(&mut self, plan_id: u64) {
+        let Some(previous) = self.current.remove(&plan_id) else {
+            return;
+        };
+        self.deadlines.remove(&previous.key);
+        if previous.overflow_evictable {
+            self.overflow_evictable.remove(&previous.key);
+        }
+    }
+
+    /// Install or replace the sole current deadline for a plan. Wire-unknown
+    /// plans deliberately remove their deadline and remain capacity-charged.
+    fn schedule(
+        &mut self,
+        plan_id: u64,
+        generation: u64,
+        wake_at: Instant,
+        phase: InviteFailoverPlanPhase,
+    ) -> bool {
+        let previous = self.current.get(&plan_id).copied();
+        self.remove_current(plan_id);
+        if !phase.has_expiry_deadline() {
+            return true;
+        }
+        if self.current.len() >= self.capacity {
+            if let Some(previous) = previous {
+                self.insert(previous);
+            }
+            return false;
+        }
+        self.insert(InviteFailoverScheduledExpiry {
+            key: InviteFailoverExpiryKey {
+                wake_at,
+                plan_id,
+                generation,
+            },
+            overflow_evictable: phase.is_overflow_evictable(),
+        });
+        true
+    }
+
+    fn insert(&mut self, expiry: InviteFailoverScheduledExpiry) {
+        self.deadlines.insert(expiry.key);
+        if expiry.overflow_evictable {
+            self.overflow_evictable.insert(expiry.key);
+        }
+        self.current.insert(expiry.key.plan_id, expiry);
+    }
+
+    fn pop_due(&mut self, now: Instant, limit: usize) -> Vec<InviteFailoverScheduledExpiry> {
+        let mut due = Vec::with_capacity(limit.min(self.current.len()));
+        while due.len() < limit {
+            let Some(key) = self.deadlines.first().copied() else {
+                break;
+            };
+            if key.wake_at > now {
+                break;
+            }
+            self.deadlines.remove(&key);
+            let Some(current) = self.current.get(&key.plan_id).copied() else {
+                continue;
+            };
+            if current.key != key {
+                continue;
+            }
+            self.current.remove(&key.plan_id);
+            if current.overflow_evictable {
+                self.overflow_evictable.remove(&key);
+            }
+            due.push(current);
+        }
+        due
+    }
+
+    fn pop_oldest_overflow_evictable(&mut self) -> Option<InviteFailoverScheduledExpiry> {
+        loop {
+            let key = self.overflow_evictable.pop_first()?;
+            let Some(current) = self.current.get(&key.plan_id).copied() else {
+                continue;
+            };
+            if current.key != key || !current.overflow_evictable {
+                continue;
+            }
+            self.current.remove(&key.plan_id);
+            self.deadlines.remove(&key);
+            return Some(current);
+        }
+    }
+
+    /// Requeue a due entry whose plan mutex was busy, without overwriting a
+    /// newer deadline installed while maintenance was attempting the lock.
+    fn restore_after_busy(&mut self, mut expiry: InviteFailoverScheduledExpiry, retry_at: Instant) {
+        if self.current.contains_key(&expiry.key.plan_id) || self.current.len() >= self.capacity {
+            return;
+        }
+        expiry.key.wake_at = retry_at;
+        self.insert(expiry);
+    }
+
+    fn remove_dialog_cleanup_current(&mut self, plan_id: u64) {
+        let Some(previous) = self.dialog_cleanup_current.remove(&plan_id) else {
+            return;
+        };
+        self.dialog_cleanup_deadlines.remove(&previous.key);
+    }
+
+    /// Install or replace the sole dialog-cleanup retry for one exact plan.
+    pub(crate) fn schedule_dialog_cleanup(
+        &mut self,
+        plan_id: u64,
+        dialog_id: &DialogId,
+        plan: std::sync::Weak<tokio::sync::Mutex<InviteFailoverPlan>>,
+        wake_at: Instant,
+    ) -> bool {
+        let replacing = self.dialog_cleanup_current.contains_key(&plan_id);
+        if !replacing && self.dialog_cleanup_current.len() >= self.capacity {
+            return false;
+        }
+        self.remove_dialog_cleanup_current(plan_id);
+        let generation = self.next_dialog_cleanup_generation;
+        self.next_dialog_cleanup_generation =
+            self.next_dialog_cleanup_generation.wrapping_add(1).max(1);
+        let cleanup = InviteFailoverScheduledDialogCleanup {
+            key: InviteFailoverDialogCleanupKey {
+                wake_at,
+                plan_id,
+                generation,
+            },
+            dialog_id: dialog_id.clone(),
+            plan,
+        };
+        self.dialog_cleanup_deadlines.insert(cleanup.key);
+        self.dialog_cleanup_current.insert(plan_id, cleanup);
+        true
+    }
+
+    fn pop_due_dialog_cleanup(
+        &mut self,
+        now: Instant,
+        limit: usize,
+    ) -> Vec<InviteFailoverScheduledDialogCleanup> {
+        let mut due = Vec::with_capacity(limit.min(self.dialog_cleanup_current.len()));
+        while due.len() < limit {
+            let Some(key) = self.dialog_cleanup_deadlines.first().copied() else {
+                break;
+            };
+            if key.wake_at > now {
+                break;
+            }
+            self.dialog_cleanup_deadlines.remove(&key);
+            let Some(current) = self.dialog_cleanup_current.get(&key.plan_id).cloned() else {
+                continue;
+            };
+            if current.key != key {
+                continue;
+            }
+            self.dialog_cleanup_current.remove(&key.plan_id);
+            due.push(current);
+        }
+        due
+    }
+
+    /// Requeue a busy cleanup without overwriting a newer exact generation.
+    fn restore_dialog_cleanup_after_busy(
+        &mut self,
+        mut cleanup: InviteFailoverScheduledDialogCleanup,
+        retry_at: Instant,
+    ) -> bool {
+        if self
+            .dialog_cleanup_current
+            .contains_key(&cleanup.key.plan_id)
+        {
+            return true;
+        }
+        if self.dialog_cleanup_current.len() >= self.capacity {
+            return false;
+        }
+        cleanup.key.wake_at = retry_at;
+        self.dialog_cleanup_deadlines.insert(cleanup.key);
+        self.dialog_cleanup_current
+            .insert(cleanup.key.plan_id, cleanup);
+        true
+    }
+
+    fn remove(&mut self, plan_id: u64) {
+        self.remove_current(plan_id);
+        self.remove_dialog_cleanup_current(plan_id);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.deadlines.clear();
+        self.overflow_evictable.clear();
+        self.current.clear();
+        self.dialog_cleanup_deadlines.clear();
+        self.dialog_cleanup_current.clear();
+    }
+
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.current.len(),
+            self.overflow_evictable.len(),
+            self.dialog_cleanup_current.len(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InviteFailoverRemovalOutcome {
+    Removed,
+    Missing,
+    Busy,
+    Stale,
+    NonExpiring,
+    Deferred {
+        wake_at: Instant,
+        overflow_evictable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InviteFailoverDialogCleanupOutcome {
+    Complete,
+    Busy,
+    Stale,
+}
+
+#[cfg(test)]
+mod retained_invite_expiry_scheduler_tests {
+    use super::{InviteFailoverExpiryScheduler, InviteFailoverPlan, InviteFailoverPlanPhase};
+    use crate::dialog::DialogId;
+    use std::sync::Weak;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn exact_deadline_order_only_returns_due_plans() {
+        let now = Instant::now();
+        let mut scheduler = InviteFailoverExpiryScheduler::new(4);
+        assert!(scheduler.schedule(
+            1,
+            1,
+            now - Duration::from_millis(1),
+            InviteFailoverPlanPhase::Closed,
+        ));
+        assert!(scheduler.schedule(
+            2,
+            1,
+            now + Duration::from_secs(30),
+            InviteFailoverPlanPhase::Closed,
+        ));
+
+        let due = scheduler.pop_due(now, 4);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].key.plan_id, 1);
+        assert_eq!(scheduler.counts(), (1, 1, 0));
+        assert!(scheduler.pop_due(now, 4).is_empty());
+    }
+
+    #[test]
+    fn stale_popped_deadline_cannot_replace_new_generation() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(30);
+        let mut scheduler = InviteFailoverExpiryScheduler::new(2);
+        assert!(scheduler.schedule(
+            7,
+            1,
+            now - Duration::from_millis(1),
+            InviteFailoverPlanPhase::Closed,
+        ));
+        let stale = scheduler.pop_due(now, 1).pop().expect("old deadline");
+
+        assert!(scheduler.schedule(7, 2, later, InviteFailoverPlanPhase::Closed));
+        scheduler.restore_after_busy(stale, now);
+
+        assert!(scheduler.pop_due(now, 1).is_empty());
+        let current = scheduler
+            .pop_due(later + Duration::from_millis(1), 1)
+            .pop()
+            .expect("new deadline");
+        assert_eq!(current.key.plan_id, 7);
+        assert_eq!(current.key.generation, 2);
+    }
+
+    #[test]
+    fn wire_unknown_is_unscheduled_and_capacity_stays_bounded() {
+        let now = Instant::now();
+        let mut scheduler = InviteFailoverExpiryScheduler::new(2);
+        assert!(scheduler.schedule(
+            1,
+            1,
+            now + Duration::from_secs(10),
+            InviteFailoverPlanPhase::Closed,
+        ));
+        assert!(scheduler.schedule(1, 2, now, InviteFailoverPlanPhase::WireUnknown,));
+        assert_eq!(scheduler.counts(), (0, 0, 0));
+        assert!(scheduler
+            .pop_due(now + Duration::from_secs(60), 2)
+            .is_empty());
+
+        assert!(scheduler.schedule(
+            2,
+            1,
+            now + Duration::from_secs(20),
+            InviteFailoverPlanPhase::Closed,
+        ));
+        assert!(scheduler.schedule(
+            3,
+            1,
+            now + Duration::from_secs(30),
+            InviteFailoverPlanPhase::Active,
+        ));
+        assert!(!scheduler.schedule(
+            4,
+            1,
+            now + Duration::from_secs(40),
+            InviteFailoverPlanPhase::Closed,
+        ));
+        assert_eq!(scheduler.counts(), (2, 1, 0));
+
+        let overflow = scheduler
+            .pop_oldest_overflow_evictable()
+            .expect("closed plan is overflow-eligible");
+        assert_eq!(overflow.key.plan_id, 2);
+        assert!(scheduler.schedule(
+            4,
+            1,
+            now + Duration::from_secs(40),
+            InviteFailoverPlanPhase::Closed,
+        ));
+        assert_eq!(scheduler.counts(), (2, 1, 0));
+    }
+
+    #[test]
+    fn dialog_cleanup_retry_is_exact_deduplicated_and_bounded() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(30);
+        let dialog_id = DialogId::new();
+        let plan = Weak::<Mutex<InviteFailoverPlan>>::new();
+        let mut scheduler = InviteFailoverExpiryScheduler::new(1);
+
+        assert!(scheduler.schedule_dialog_cleanup(
+            7,
+            &dialog_id,
+            plan.clone(),
+            now - Duration::from_millis(1),
+        ));
+        let stale = scheduler
+            .pop_due_dialog_cleanup(now, 1)
+            .pop()
+            .expect("first cleanup generation");
+        assert!(scheduler.schedule_dialog_cleanup(7, &dialog_id, plan, later));
+        assert!(scheduler.restore_dialog_cleanup_after_busy(stale, now));
+        assert!(scheduler.pop_due_dialog_cleanup(now, 1).is_empty());
+        assert!(!scheduler.schedule_dialog_cleanup(8, &DialogId::new(), Weak::new(), now,));
+
+        let current = scheduler
+            .pop_due_dialog_cleanup(later + Duration::from_millis(1), 1)
+            .pop()
+            .expect("new cleanup generation");
+        assert_eq!(current.key.plan_id, 7);
+        assert_eq!(current.dialog_id, dialog_id);
+        assert_ne!(current.key.generation, 0);
+        assert_eq!(scheduler.counts(), (0, 0, 0));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InviteFailoverAttemptOutcome {
+    Active,
+    ImmediateTransportFailure,
+    ServiceUnavailable,
+    TransactionTimeout,
+    TransportError,
+    InternalError,
+    Accepted,
+    Cancelled,
+    FinalResponse,
+}
+
+pub(crate) struct InviteFailoverAttempt {
+    /// Shared with the exact attempt index. Retained plans therefore keep one
+    /// branch allocation rather than cloning the complete transaction key
+    /// into the plan, attempt map, and dialog reverse index.
+    pub transaction_id: std::sync::Arc<TransactionKey>,
+    pub outcome: InviteFailoverAttemptOutcome,
+}
+
+/// Heavy state needed only while an initial INVITE can still advance to a
+/// resolver candidate.
+///
+/// Retained plans deliberately outlive the dialog/active call for late-2xx
+/// ACK+BYE handling. Keeping the immutable request and resolver targets in
+/// those tombstones multiplies call-setup memory by the retention window, even
+/// though terminal processing uses the transaction manager's exact request.
+/// An `Option` makes that lifetime boundary explicit and lets every terminal
+/// transition release the payload immediately.
+pub(crate) struct InviteFailoverActivePayload {
+    pub request: Request,
+    pub candidates: Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+    pub wire_plan: CandidateWirePlan,
+    pub next_candidate_index: usize,
+    /// Monotonic token assigned before candidate work leaves the plan mutex.
+    /// Completion may mutate the plan only while this generation is current.
+    pub next_send_generation: u64,
+    pub pending_candidate: Option<(u64, usize)>,
+    pub current_candidate_index: Option<usize>,
+    pub current_send_generation: Option<u64>,
+    pub provisional_seen: bool,
+    pub attempts: Vec<InviteFailoverAttempt>,
+    pub setup_deadline: Instant,
+}
+
+impl InviteFailoverActivePayload {
+    pub(crate) fn new(
+        request: Request,
+        candidates: Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+        wire_plan: CandidateWirePlan,
+        setup_deadline: Instant,
+    ) -> Self {
+        Self {
+            request,
+            candidates,
+            wire_plan,
+            next_candidate_index: 0,
+            next_send_generation: 0,
+            pending_candidate: None,
+            current_candidate_index: None,
+            current_send_generation: None,
+            provisional_seen: false,
+            attempts: Vec::new(),
+            setup_deadline,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct InviteFailoverForkCleanup {
+    cleaned: std::collections::HashSet<String>,
+    in_flight: std::collections::HashSet<String>,
+}
+
+/// One logical initial-INVITE operation. The immutable request is finalized
+/// separately for every candidate so Via, Contact provenance and signatures
+/// remain candidate-correct. The mutex around this record serializes 503,
+/// timeout, transport-error and CANCEL races for a single dialog.
+pub(crate) struct InviteFailoverPlan {
+    pub id: u64,
+    pub dialog_id: DialogId,
+    /// The active state is boxed so a terminal tombstone does not retain the
+    /// inline size of a complete SIP request, resolver plan, counters, and
+    /// attempt history for the entire late-response horizon.
+    pub active_payload: Option<Box<InviteFailoverActivePayload>>,
+    /// Immutable amount charged to the retained-attempt capacity counter.
+    /// Terminal compaction drops `active_payload.candidates`, so release must
+    /// never infer the reservation from the live vector length.
+    pub reserved_attempt_slots: usize,
+    pub current_transaction: Option<std::sync::Arc<TransactionKey>>,
+    /// Monotonic proof that this logical INVITE crossed the transaction
+    /// layer's wire-attempt boundary. Once true, an error can no longer be
+    /// treated as a local-only rollback.
+    pub wire_attempted: bool,
+    pub phase: InviteFailoverPlanPhase,
+    /// Compact terminal ownership needed to remove exact attempt indexes at
+    /// expiry. The Arc keys are shared with the attempt map.
+    pub retained_attempts: Box<[std::sync::Arc<TransactionKey>]>,
+    pub accepted_candidate_index: Option<usize>,
+    /// Exact client transaction which selected the application-visible dialog.
+    /// Candidate number and To-tag alone are insufficient: a retained late
+    /// response from another attempt can reuse either value while still
+    /// requiring the fork-cleanup path.
+    pub accepted_transaction: Option<std::sync::Arc<TransactionKey>>,
+    pub accepted_to_tag: Option<String>,
+    /// Exact one-author authority for locally generated CANCEL. Zero-wire
+    /// failures return to `Idle`; a sent or ambiguous generation is never
+    /// generated again by either the explicit caller or teardown supervisor.
+    pub cancel_dispatch_state: InviteCancelDispatchState,
+    pub cancel_transaction: Option<std::sync::Arc<TransactionKey>>,
+    /// Allocated only for the exceptional late/forked-2xx cleanup path.
+    pub(crate) fork_cleanup: Option<Box<InviteFailoverForkCleanup>>,
+    pub expires_at: Instant,
+    /// Incremented whenever `expires_at` or its expiry eligibility changes.
+    /// Scheduled maintenance may remove only the exact matching generation.
+    pub expiry_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SelectedInviteSuccessDeliveryState {
+    Unselected = 0,
+    Pending = 1,
+    Delivering = 2,
+    Delivered = 3,
+}
+
+impl SelectedInviteSuccessDeliveryState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Pending,
+            2 => Self::Delivering,
+            3 => Self::Delivered,
+            _ => Self::Unselected,
+        }
+    }
+}
+
+/// Exact-attempt authority for the one application-visible initial-INVITE
+/// success. The state is attached to the retained transaction index, so a
+/// response from another dialog, failover attempt, or fork cannot satisfy it.
+#[derive(Clone)]
+pub(crate) struct SelectedInviteSuccessDelivery {
+    state: std::sync::Arc<AtomicU8>,
+}
+
+impl Default for SelectedInviteSuccessDelivery {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Arc::new(AtomicU8::new(
+                SelectedInviteSuccessDeliveryState::Unselected as u8,
+            )),
+        }
+    }
+}
+
+impl SelectedInviteSuccessDelivery {
+    /// Claim either the first selected success or a retry released by an ACK or
+    /// causal-delivery failure. Only one transaction-event worker can deliver
+    /// the lifecycle fact at a time.
+    fn claim(&self) -> Option<SelectedInviteSuccessDeliveryClaim> {
+        loop {
+            let observed =
+                SelectedInviteSuccessDeliveryState::from_u8(self.state.load(Ordering::Acquire));
+            if matches!(
+                observed,
+                SelectedInviteSuccessDeliveryState::Delivering
+                    | SelectedInviteSuccessDeliveryState::Delivered
+            ) {
+                return None;
+            }
+            if self
+                .state
+                .compare_exchange(
+                    observed as u8,
+                    SelectedInviteSuccessDeliveryState::Delivering as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(SelectedInviteSuccessDeliveryClaim {
+                    state: std::sync::Arc::clone(&self.state),
+                    committed: false,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn is_delivered(&self) -> bool {
+        SelectedInviteSuccessDeliveryState::from_u8(self.state.load(Ordering::Acquire))
+            == SelectedInviteSuccessDeliveryState::Delivered
+    }
+}
+
+/// Cancellation-safe claim carried from failover classification through ACK
+/// write and acknowledged session delivery. Dropping an uncommitted claim
+/// makes the same exact selected response retryable by the next retransmission.
+pub(crate) struct SelectedInviteSuccessDeliveryClaim {
+    state: std::sync::Arc<AtomicU8>,
+    committed: bool,
+}
+
+impl SelectedInviteSuccessDeliveryClaim {
+    fn commit(mut self) {
+        let result = self.state.compare_exchange(
+            SelectedInviteSuccessDeliveryState::Delivering as u8,
+            SelectedInviteSuccessDeliveryState::Delivered as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(
+            result.is_ok(),
+            "selected INVITE success claim lost ownership"
+        );
+        self.committed = true;
+    }
+}
+
+impl Drop for SelectedInviteSuccessDeliveryClaim {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = self.state.compare_exchange(
+            SelectedInviteSuccessDeliveryState::Delivering as u8,
+            SelectedInviteSuccessDeliveryState::Pending as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+impl InviteFailoverPlan {
+    /// Move a plan to a non-active phase and release all active-only payload.
+    /// The attempt history, selected fork identity, cleanup tags, and exact
+    /// current transaction remain available for late response processing.
+    pub(crate) fn transition_to_terminal(&mut self, phase: InviteFailoverPlanPhase) {
+        debug_assert_ne!(phase, InviteFailoverPlanPhase::Active);
+        self.phase = phase;
+        if let Some(active) = self.active_payload.take() {
+            self.retained_attempts = active
+                .attempts
+                .into_iter()
+                .map(|attempt| attempt.transaction_id)
+                .collect();
+        }
+        if !matches!(
+            phase,
+            InviteFailoverPlanPhase::Cancelled | InviteFailoverPlanPhase::WireUnknown
+        ) {
+            self.current_transaction = None;
+        }
+    }
+
+    fn candidate_count(&self) -> usize {
+        self.active_payload
+            .as_ref()
+            .map_or(0, |payload| payload.candidates.len())
+    }
+
+    fn attempt_transaction_ids(&self) -> Vec<std::sync::Arc<TransactionKey>> {
+        if let Some(active) = self.active_payload.as_ref() {
+            active
+                .attempts
+                .iter()
+                .map(|attempt| attempt.transaction_id.clone())
+                .collect()
+        } else {
+            self.retained_attempts.to_vec()
+        }
+    }
+
+    fn is_cleaned_fork(&self, to_tag: &str) -> bool {
+        self.fork_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.cleaned.contains(to_tag))
+    }
+
+    fn is_fork_cleanup_in_flight(&self, to_tag: &str) -> bool {
+        self.fork_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.in_flight.contains(to_tag))
+    }
+
+    fn mark_fork_cleanup_in_flight(&mut self, to_tag: String) {
+        self.fork_cleanup
+            .get_or_insert_with(|| Box::new(InviteFailoverForkCleanup::default()))
+            .in_flight
+            .insert(to_tag);
+    }
+
+    fn clear_fork_cleanup_in_flight(&mut self, to_tag: &str) {
+        if let Some(cleanup) = self.fork_cleanup.as_mut() {
+            cleanup.in_flight.remove(to_tag);
+        }
+    }
+
+    fn mark_cleaned_fork(&mut self, to_tag: String) {
+        self.fork_cleanup
+            .get_or_insert_with(|| Box::new(InviteFailoverForkCleanup::default()))
+            .cleaned
+            .insert(to_tag);
+    }
+}
+
+#[cfg(test)]
+mod retained_invite_payload_tests {
+    use super::{
+        transport_route_for_invite_candidate, CandidateWirePlan, InviteCancelDispatchState,
+        InviteFailoverActivePayload, InviteFailoverAttempt, InviteFailoverAttemptOutcome,
+        InviteFailoverForkCleanup, InviteFailoverPlan, InviteFailoverPlanPhase,
+    };
+    use crate::dialog::DialogId;
+    use crate::transaction::TransactionKey;
+    use rvoip_sip_core::{builder::SimpleRequestBuilder, Method};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn registered_flow_candidate_retains_exact_transport_identity() {
+        let flow_id = rvoip_sip_transport::TransportFlowId::from_process_local_value(77).unwrap();
+        let mut target = rvoip_sip_transport::ResolvedTarget::immediate(
+            "198.51.100.20:41000".parse().unwrap(),
+            rvoip_sip_transport::transport::TransportType::Tls,
+        );
+        target.flow_id = Some(flow_id);
+        let route = transport_route_for_invite_candidate(&target);
+        assert_eq!(route.destination, target.addr);
+        assert_eq!(route.transport_type, Some(target.transport));
+        assert_eq!(route.flow_id, Some(flow_id));
+    }
+
+    fn active_plan() -> InviteFailoverPlan {
+        let request = SimpleRequestBuilder::new(Method::Invite, "sip:bob@example.com")
+            .expect("request builder")
+            .from("Alice", "sip:alice@example.com", Some("alice-payload"))
+            .to("Bob", "sip:bob@example.com", None)
+            .contact("sip:alice@127.0.0.1:5060", None)
+            .call_id("retained-payload")
+            .cseq(1)
+            .via("127.0.0.1:5060", "UDP", Some("z9hG4bK-payload"))
+            .max_forwards(70)
+            .build();
+        let transaction_id =
+            TransactionKey::new("z9hG4bK-payload-attempt".into(), Method::Invite, false);
+        let transaction_id = std::sync::Arc::new(transaction_id);
+        let now = Instant::now();
+        let mut active_payload = InviteFailoverActivePayload::new(
+            request,
+            vec![rvoip_sip_transport::resolver::ResolvedTarget::immediate(
+                "127.0.0.1:5060".parse().expect("target address"),
+                rvoip_sip_transport::transport::TransportType::Udp,
+            )],
+            CandidateWirePlan {
+                regenerate_stack_default_contact: true,
+            },
+            now + Duration::from_secs(32),
+        );
+        active_payload.next_candidate_index = 1;
+        active_payload.next_send_generation = 1;
+        active_payload.pending_candidate = Some((1, 0));
+        active_payload.current_candidate_index = Some(0);
+        active_payload.current_send_generation = Some(1);
+        active_payload.attempts.push(InviteFailoverAttempt {
+            transaction_id: transaction_id.clone(),
+            outcome: InviteFailoverAttemptOutcome::Active,
+        });
+        InviteFailoverPlan {
+            id: 1,
+            dialog_id: DialogId::new(),
+            active_payload: Some(Box::new(active_payload)),
+            reserved_attempt_slots: 1,
+            current_transaction: Some(transaction_id.clone()),
+            wire_attempted: true,
+            phase: InviteFailoverPlanPhase::Active,
+            retained_attempts: Box::new([]),
+            accepted_candidate_index: Some(0),
+            accepted_transaction: Some(transaction_id.clone()),
+            accepted_to_tag: Some("selected-tag".into()),
+            cancel_dispatch_state: InviteCancelDispatchState::Idle,
+            cancel_transaction: None,
+            fork_cleanup: Some(Box::new(InviteFailoverForkCleanup {
+                cleaned: ["cleaned-tag".into()].into_iter().collect(),
+                in_flight: ["pending-tag".into()].into_iter().collect(),
+            })),
+            expires_at: now + Duration::from_secs(90),
+            expiry_generation: 1,
+        }
+    }
+
+    #[test]
+    fn every_terminal_phase_drops_only_active_payload() {
+        for phase in [
+            InviteFailoverPlanPhase::Accepted,
+            InviteFailoverPlanPhase::Cancelled,
+            InviteFailoverPlanPhase::Exhausted,
+            InviteFailoverPlanPhase::Closed,
+            InviteFailoverPlanPhase::WireUnknown,
+        ] {
+            let mut plan = active_plan();
+            plan.transition_to_terminal(phase);
+
+            assert_eq!(plan.phase, phase);
+            assert!(plan.active_payload.is_none());
+            assert_eq!(plan.reserved_attempt_slots, 1);
+            assert_eq!(plan.retained_attempts.len(), 1);
+            if matches!(
+                phase,
+                InviteFailoverPlanPhase::Cancelled | InviteFailoverPlanPhase::WireUnknown
+            ) {
+                assert!(plan.current_transaction.is_some());
+            } else {
+                assert!(plan.current_transaction.is_none());
+            }
+            assert!(plan.accepted_transaction.is_some());
+            assert_eq!(plan.accepted_to_tag.as_deref(), Some("selected-tag"));
+            assert!(plan.is_cleaned_fork("cleaned-tag"));
+            assert!(plan.is_fork_cleanup_in_flight("pending-tag"));
+        }
+    }
+}
+
+struct InviteCandidateSendLease {
+    plan_id: u64,
+    dialog_id: DialogId,
+    generation: u64,
+    candidate_index: usize,
+    target: rvoip_sip_transport::resolver::ResolvedTarget,
+    request: Request,
+    wire_plan: CandidateWirePlan,
+    setup_deadline: Instant,
+    remaining_candidate_count: usize,
+}
+
+fn transport_route_for_invite_candidate(
+    target: &rvoip_sip_transport::ResolvedTarget,
+) -> rvoip_sip_transport::TransportRoute {
+    let mut route =
+        rvoip_sip_transport::TransportRoute::new(target.addr).with_transport_type(target.transport);
+    route.authority = target.authority.clone();
+    route.flow_id = target.flow_id;
+    route
+}
+
+struct InviteCandidateCancellationGuard {
+    manager: DialogManager,
+    plan: std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+    generation: u64,
+    transaction_id: Option<TransactionKey>,
+    armed: bool,
+}
+
+impl InviteCandidateCancellationGuard {
+    fn new(
+        manager: &DialogManager,
+        plan: &std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            manager: manager.clone(),
+            plan: plan.clone(),
+            generation,
+            transaction_id: None,
+            armed: true,
+        }
+    }
+
+    fn set_transaction(&mut self, transaction_id: &TransactionKey) {
+        self.transaction_id = Some(transaction_id.clone());
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InviteCandidateCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let transaction_id = self.transaction_id.clone();
+        if let Ok(mut plan) = self.plan.try_lock() {
+            let terminate = self.manager.abandon_invite_candidate_generation_locked(
+                &mut plan,
+                self.generation,
+                transaction_id.as_ref(),
+            );
+            drop(plan);
+            if let (Some(transaction_id), Ok(handle)) =
+                (terminate, tokio::runtime::Handle::try_current())
+            {
+                let manager = self.manager.clone();
+                if let Some(cleanup_operation) = manager.enter_invite_failover_operation() {
+                    handle.spawn(async move {
+                        let _cleanup_operation = cleanup_operation;
+                        manager
+                            .compensate_invite_candidate_transaction(&transaction_id, false)
+                            .await;
+                    });
+                }
+            }
+            return;
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let manager = self.manager.clone();
+            let plan = self.plan.clone();
+            let generation = self.generation;
+            if let Some(cleanup_operation) = manager.enter_invite_failover_operation() {
+                handle.spawn(async move {
+                    let _cleanup_operation = cleanup_operation;
+                    manager
+                        .abandon_invite_candidate_generation(
+                            &plan,
+                            generation,
+                            transaction_id.as_ref(),
+                        )
+                        .await;
+                });
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct InviteFailoverAttemptIndex {
+    pub plan_id: u64,
+    pub dialog_id: DialogId,
+    pub candidate_index: usize,
+    /// One exact-attempt fence for delivery of the selected 2xx into the
+    /// application-visible session lifecycle.
+    pub(crate) selected_success_delivery: SelectedInviteSuccessDelivery,
+    /// One exact-attempt fence for authoritative delivery of the terminal 487
+    /// produced by a locally owned CANCEL. The same cancellation-safe claim
+    /// mechanism is used so a failed session route remains retransmission-
+    /// retryable without allowing duplicate lifecycle transitions.
+    pub(crate) cancel_terminal_delivery: SelectedInviteSuccessDelivery,
+    /// Exact transaction-layer admission owner. Failover tombstones may be
+    /// rearmed after the transaction manager's ordinary late-2xx horizon, so
+    /// the attempt index itself must fence same-wire-key reuse until its exact
+    /// plan removal.
+    pub(crate) _admission_owner: Option<crate::transaction::manager::TransactionAdmissionOwner>,
+}
+
+pub(crate) enum InviteFailoverEventDisposition {
+    Continue,
+    ContinueSelectedSuccess(SelectedInviteSuccessDeliveryClaim),
+    ContinueCancelTerminal(SelectedInviteSuccessDeliveryClaim),
+    Consumed,
+}
+
+enum InviteCandidateSendError {
+    Fatal(crate::errors::DialogError),
+    WireUnknown(crate::errors::DialogError),
+}
+
+impl InviteCandidateSendError {
+    fn into_dialog_error(self) -> crate::errors::DialogError {
+        match self {
+            Self::Fatal(error) | Self::WireUnknown(error) => error,
+        }
+    }
+
+    fn retains_wire_owner(&self) -> bool {
+        matches!(self, Self::WireUnknown(_))
+    }
+}
+
+fn candidate_transport_token(
+    transport: rvoip_sip_transport::transport::TransportType,
+) -> &'static str {
+    use rvoip_sip_transport::transport::TransportType;
+    match transport {
+        TransportType::Udp => "UDP",
+        TransportType::Tcp => "TCP",
+        TransportType::Tls => "TLS",
+        TransportType::Ws => "WS",
+        TransportType::Wss => "WSS",
+    }
+}
+
+/// Retarget a direct dialog to the validated packet source retained at
+/// admission time. An explicit Route set always wins; the override exists
+/// only for peers whose Contact advertised an unspecified/NAT-only address.
+pub(crate) fn apply_observed_source(
+    observed_source: Option<SocketAddr>,
+    route_set_is_empty: bool,
+    candidates: &mut Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+) {
+    if !route_set_is_empty {
+        return;
+    }
+    if let (Some(observed_source), Some(candidate)) = (observed_source, candidates.first_mut()) {
+        candidate.addr = observed_source;
+        candidate.expires = None;
+        candidates.truncate(1);
+    }
+}
+
+fn finalize_request_for_candidate(
+    manager: &DialogManager,
+    request: &Request,
+    target: &rvoip_sip_transport::resolver::ResolvedTarget,
+    wire_plan: CandidateWirePlan,
+) -> DialogResult<Request> {
+    use rvoip_sip_core::types::{
+        address::Address,
+        contact::{Contact, ContactParamInfo},
+        uri::{Host, Scheme},
+        Param,
+    };
+
+    let mut request = request.clone();
+    let local_address = manager.local_address_for_transport(target.transport);
+    let branch = (request.method() != Method::Cancel)
+        .then(crate::transaction::utils::dialog_utils::generate_branch);
+    let mut stamped_via = false;
+    for header in &mut request.headers {
+        if !header.name().wire_eq(&HeaderName::Via) {
+            continue;
+        }
+        let TypedHeader::Via(via) = header else {
+            return Err(crate::errors::DialogError::protocol_error(
+                "outbound request contains an unstructured Via header",
+            ));
+        };
+        let Some(top_via) = via.0.first_mut() else {
+            return Err(crate::errors::DialogError::protocol_error(
+                "outbound request has an empty Via header",
+            ));
+        };
+        top_via.sent_protocol.transport = candidate_transport_token(target.transport).to_string();
+        top_via.sent_by_host = Host::Address(local_address.ip());
+        top_via.sent_by_port = Some(local_address.port());
+        if let Some(branch) = branch.as_ref() {
+            top_via
+                .params
+                .retain(|param| !matches!(param, Param::Branch(_)));
+            top_via.params.push(Param::branch(branch.clone()));
+        }
+        stamped_via = true;
+        break;
+    }
+    if !stamped_via {
+        return Err(crate::errors::DialogError::protocol_error(
+            "candidate-planned request is missing a structured Via header",
+        ));
+    }
+
+    if !wire_plan.regenerate_stack_default_contact {
+        return Ok(request);
+    }
+
+    let user = request
+        .from()
+        .and_then(|from| from.uri().user.as_ref())
+        .map(ToString::to_string)
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "user".to_string());
+    let (scheme, transport_parameter) = match target.transport {
+        rvoip_sip_transport::transport::TransportType::Udp => ("sip", None),
+        rvoip_sip_transport::transport::TransportType::Tcp => ("sip", Some("tcp")),
+        rvoip_sip_transport::transport::TransportType::Tls => ("sips", Some("tls")),
+        rvoip_sip_transport::transport::TransportType::Ws => ("sip", Some("ws")),
+        rvoip_sip_transport::transport::TransportType::Wss => ("sips", Some("wss")),
+    };
+    let suffix = transport_parameter
+        .map(|transport| format!(";transport={transport}"))
+        .unwrap_or_default();
+    let contact_uri: rvoip_sip_core::Uri = format!("{scheme}:{user}@{local_address}{suffix}")
+        .parse()
+        .map_err(|_| {
+            crate::errors::DialogError::protocol_error(
+                "failed to plan the stack-default Contact for a candidate",
+            )
+        })?;
+    if matches!(request.uri().scheme(), Scheme::Sips)
+        && !matches!(contact_uri.scheme(), Scheme::Sips)
+    {
+        return Err(crate::errors::DialogError::routing_error(
+            "secure request candidate produced a non-SIPS Contact",
+        ));
+    }
+    let replacement = TypedHeader::Contact(Contact::new_params(vec![ContactParamInfo {
+        address: Address::new(contact_uri),
+    }]));
+    let Some(contact) = request
+        .headers
+        .iter_mut()
+        .find(|header| header.name().wire_eq(&HeaderName::Contact))
+    else {
+        return Err(crate::errors::DialogError::protocol_error(
+            "stack-default Contact plan has no Contact header",
+        ));
+    };
+    *contact = replacement;
+    Ok(request)
+}
+
+fn planned_initial_invite_routes(
+    outbound_proxy_uri: Option<&rvoip_sip_core::types::uri::Uri>,
+    service_routes: &[rvoip_sip_core::types::uri::Uri],
+) -> Vec<rvoip_sip_core::types::uri::Uri> {
+    outbound_proxy_uri
+        .into_iter()
+        .cloned()
+        .chain(service_routes.iter().cloned())
+        .collect()
+}
+
+fn is_stack_owned_initial_invite_header(header: &TypedHeader) -> bool {
+    [
+        HeaderName::Via,
+        HeaderName::Route,
+        HeaderName::RecordRoute,
+        HeaderName::Contact,
+        HeaderName::From,
+        HeaderName::To,
+        HeaderName::CallId,
+        HeaderName::CSeq,
+        HeaderName::MaxForwards,
+        HeaderName::ContentLength,
+        HeaderName::ContentType,
+        HeaderName::SessionExpires,
+        HeaderName::MinSE,
+    ]
+    .iter()
+    .any(|name| header.name().wire_eq(name))
+}
+
+fn plan_initial_invite_headers(
+    contact_override: Option<String>,
+    headers: Vec<TypedHeader>,
+) -> DialogResult<InitialInviteHeaderPlan> {
+    let mut appended = Vec::with_capacity(headers.len());
+
+    for header in headers {
+        if is_stack_owned_initial_invite_header(&header) {
+            return Err(crate::errors::DialogError::protocol_error(
+                "initial INVITE application headers contain a stack-owned field",
+            ));
+        }
+        appended.push(header);
+    }
+
+    Ok(InitialInviteHeaderPlan {
+        contact_uri: contact_override,
+        appended,
+    })
+}
+
+fn append_validated_initial_invite_headers(
+    request: &mut Request,
+    authorization: Vec<TypedHeader>,
+    headers: Vec<TypedHeader>,
+) -> DialogResult<()> {
+    for header in &authorization {
+        if !matches!(
+            header.name(),
+            HeaderName::Authorization | HeaderName::ProxyAuthorization
+        ) {
+            return Err(crate::errors::DialogError::protocol_error(
+                "INVITE auth retry contains a non-authorization credential header",
+            ));
+        }
+    }
+    request.headers.extend(authorization);
+    request.headers.extend(headers);
+    rvoip_sip_core::validation::validate_wire_request(request).map_err(|_| {
+        crate::errors::DialogError::protocol_error(
+            "initial INVITE failed final wire-safety validation",
+        )
+    })
+}
+
+/// Detect a reliable provisional response per RFC 3262.
+///
+/// Returns `Some(rseq)` when the response carries both `Require: 100rel`
+/// and an `RSeq` header — meaning the UAC must PRACK it. Returns `None`
+/// for unreliable provisionals.
+pub fn detect_reliable_provisional(response: &Response) -> Option<u32> {
+    use rvoip_sip_core::types::TypedHeader;
+
+    let mut requires_100rel = false;
+    let mut rseq_value: Option<u32> = None;
+
+    for header in &response.headers {
+        match header {
+            TypedHeader::Require(req) if req.requires("100rel") => {
+                requires_100rel = true;
+            }
+            TypedHeader::RSeq(rseq) => {
+                rseq_value = Some(rseq.value);
+            }
+            _ => {}
+        }
+    }
+
+    if requires_100rel {
+        rseq_value
+    } else {
+        None
+    }
+}
+
+/// Inspect a request's `Supported`/`Require` headers for the `100rel`
+/// option tag. Returns `(supports, requires)` — `supports` is true when the
+/// tag appears in either header (i.e., the peer has indicated 100rel
+/// capability at minimum); `requires` is true only when the peer listed it
+/// in `Require` (i.e., insists on it per RFC 3262 §4).
+pub fn detect_peer_100rel_support(request: &Request) -> (bool, bool) {
+    use rvoip_sip_core::types::TypedHeader;
+
+    let mut supports = false;
+    let mut requires = false;
+    for header in &request.headers {
+        match header {
+            TypedHeader::Supported(sup) if sup.option_tags.iter().any(|t| t == "100rel") => {
+                supports = true;
+            }
+            TypedHeader::Require(req) if req.requires("100rel") => {
+                supports = true;
+                requires = true;
+            }
+            _ => {}
+        }
+    }
+    (supports, requires)
+}
+
+/// Inject the configured `100rel` option tag into an outgoing INVITE
+/// (adds to existing `Supported`/`Require` headers if present).
+///
+/// `NotSupported` is a no-op — no header is added. `Supported` appends
+/// `100rel` to any existing `Supported` header or creates one. `Required`
+/// does the same for `Require`.
+pub fn inject_100rel_policy(request: &mut Request, policy: RelUsage) {
+    use rvoip_sip_core::types::{Require, Supported, TypedHeader};
+
+    match policy {
+        RelUsage::NotSupported => {}
+        RelUsage::Supported => {
+            let mut updated = false;
+            for header in request.headers.iter_mut() {
+                if let TypedHeader::Supported(ref mut sup) = header {
+                    if !sup.option_tags.iter().any(|t| t == "100rel") {
+                        sup.option_tags.push("100rel".to_string());
+                    }
+                    updated = true;
+                    break;
+                }
+            }
+            if !updated {
+                request
+                    .headers
+                    .push(TypedHeader::Supported(Supported::new(vec![
+                        "100rel".to_string()
+                    ])));
+            }
+        }
+        RelUsage::Required => {
+            let mut updated = false;
+            for header in request.headers.iter_mut() {
+                if let TypedHeader::Require(ref mut req) = header {
+                    if !req.requires("100rel") {
+                        req.add_tag("100rel");
+                    }
+                    updated = true;
+                    break;
+                }
+            }
+            if !updated {
+                request
+                    .headers
+                    .push(TypedHeader::Require(Require::with_tag("100rel")));
+            }
+        }
+    }
+}
+
+/// Trait for transaction integration operations
+pub trait TransactionIntegration {
+    /// Send a request within a dialog using transaction-core
+    fn send_request_in_dialog(
+        &self,
+        dialog_id: &DialogId,
+        method: Method,
+        body: Option<bytes::Bytes>,
+    ) -> impl std::future::Future<Output = DialogResult<TransactionKey>> + Send;
+
+    /// Send a response using transaction-core
+    fn send_transaction_response(
+        &self,
+        transaction_id: &TransactionKey,
+        response: Response,
+    ) -> impl std::future::Future<Output = DialogResult<()>> + Send;
+}
+
+/// Trait for transaction helper operations
+pub trait TransactionHelpers {
+    /// Associate a transaction with a dialog
+    fn link_transaction_to_dialog(&self, transaction_id: &TransactionKey, dialog_id: &DialogId);
+
+    /// Create ACK for 2xx response using transaction-core helpers
+    fn create_ack_for_success_response(
+        &self,
+        original_invite_tx_id: &TransactionKey,
+        response: &Response,
+    ) -> impl std::future::Future<Output = DialogResult<Request>> + Send;
+}
+
+// Actual implementations for DialogManager
+impl TransactionIntegration for DialogManager {
+    /// Send a request within a dialog using transaction-core
+    ///
+    /// Implements proper request creation within dialogs using Phase 3 dialog functions
+    /// for significantly simplified and more maintainable code.
+    async fn send_request_in_dialog(
+        &self,
+        dialog_id: &DialogId,
+        method: Method,
+        body: Option<bytes::Bytes>,
+    ) -> DialogResult<TransactionKey> {
+        self.send_request_in_dialog_with_extras(dialog_id, method, body, Vec::new())
+            .await
+    }
+
+    /// Send a response using transaction-core
+    async fn send_transaction_response(
+        &self,
+        transaction_id: &TransactionKey,
+        response: Response,
+    ) -> DialogResult<()> {
+        Self::send_transaction_response_impl(self, transaction_id, response).await
+    }
+}
+
+impl DialogManager {
+    /// Dispatch one immutable INFO snapshot through the sole INFO
+    /// materializer and transaction path.
+    pub(crate) async fn send_info_request_snapshot(
+        &self,
+        dialog_id: &DialogId,
+        snapshot: InfoRequestSnapshot,
+    ) -> DialogResult<TransactionKey> {
+        self.send_info_request_snapshot_owned(dialog_id, snapshot)
+            .await
+            .map(|(transaction_id, _completion)| transaction_id)
+    }
+
+    async fn send_info_request_snapshot_owned(
+        &self,
+        dialog_id: &DialogId,
+        snapshot: InfoRequestSnapshot,
+    ) -> DialogResult<(
+        TransactionKey,
+        Option<crate::transaction::ClientTransactionCompletionHandle>,
+    )> {
+        let request = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+            let template = dialog.create_request_template(Method::Info);
+            let local_tag = match template.local_tag {
+                Some(tag) if !tag.is_empty() => tag,
+                _ if snapshot.generate_missing_local_tag => {
+                    let tag = dialog.generate_local_tag();
+                    dialog.local_tag = Some(tag.clone());
+                    tag
+                }
+                _ => {
+                    return Err(crate::errors::DialogError::protocol_error(
+                        "INFO requires local tag in established dialog",
+                    ));
+                }
+            };
+            let remote_tag = template
+                .remote_tag
+                .filter(|tag| !tag.is_empty())
+                .ok_or_else(|| {
+                    crate::errors::DialogError::protocol_error(
+                        "INFO requires remote tag in established dialog",
+                    )
+                })?;
+            let context = InDialogRequestMaterializationContext {
+                call_id: template.call_id,
+                local_uri: template.local_uri.to_string(),
+                local_tag,
+                remote_uri: template.remote_uri.to_string(),
+                remote_tag,
+                remote_target: template.target_uri.clone(),
+                cseq: template.cseq_number,
+                local_address: self
+                    .local_address_for_target_and_routes(&template.target_uri, &template.route_set),
+                route_set: template.route_set,
+            };
+            materialize_info_request_snapshot(&context, &snapshot)?
+        };
+
+        self.send_materialized_in_dialog_request_owned(dialog_id, Method::Info, request)
+            .await
+    }
+
+    /// Dispatch one immutable NOTIFY snapshot through the sole NOTIFY
+    /// materializer and transaction path.
+    pub(crate) async fn send_notify_request_snapshot(
+        &self,
+        dialog_id: &DialogId,
+        snapshot: NotifyRequestSnapshot,
+    ) -> DialogResult<TransactionKey> {
+        self.send_notify_request_snapshot_owned(dialog_id, snapshot)
+            .await
+            .map(|(transaction_id, _completion)| transaction_id)
+    }
+
+    async fn send_notify_request_snapshot_owned(
+        &self,
+        dialog_id: &DialogId,
+        snapshot: NotifyRequestSnapshot,
+    ) -> DialogResult<(
+        TransactionKey,
+        Option<crate::transaction::ClientTransactionCompletionHandle>,
+    )> {
+        let request = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+            let template = dialog.create_request_template(Method::Notify);
+            let local_tag = match template.local_tag {
+                Some(tag) if !tag.is_empty() => tag,
+                _ if snapshot.generate_missing_local_tag => {
+                    let tag = dialog.generate_local_tag();
+                    dialog.local_tag = Some(tag.clone());
+                    tag
+                }
+                _ => {
+                    return Err(crate::errors::DialogError::protocol_error(
+                        "NOTIFY requires local tag in established dialog",
+                    ));
+                }
+            };
+            let remote_tag = template
+                .remote_tag
+                .filter(|tag| !tag.is_empty())
+                .ok_or_else(|| {
+                    crate::errors::DialogError::protocol_error(
+                        "NOTIFY requires remote tag in established dialog",
+                    )
+                })?;
+
+            let event = snapshot.event.clone().unwrap_or_else(|| {
+                dialog
+                    .event_package
+                    .clone()
+                    .unwrap_or_else(|| "dialog".to_string())
+            });
+            let subscription_state = match &snapshot.subscription_state {
+                NotifySubscriptionState::Tracked => dialog
+                    .subscription_state
+                    .as_ref()
+                    .map(|state| state.to_header_value()),
+                NotifySubscriptionState::Explicit(state) => {
+                    if let Some(state) = state.as_deref() {
+                        dialog.subscription_state = Some(parse_notify_subscription_state(state));
+                    }
+                    state.clone()
+                }
+            };
+            let context = InDialogRequestMaterializationContext {
+                call_id: template.call_id,
+                local_uri: template.local_uri.to_string(),
+                local_tag,
+                remote_uri: template.remote_uri.to_string(),
+                remote_tag,
+                remote_target: template.target_uri.clone(),
+                cseq: template.cseq_number,
+                local_address: self
+                    .local_address_for_target_and_routes(&template.target_uri, &template.route_set),
+                route_set: template.route_set,
+            };
+            materialize_notify_request_snapshot(&context, &snapshot, event, subscription_state)?
+        };
+
+        self.send_materialized_in_dialog_request_owned(dialog_id, Method::Notify, request)
+            .await
+    }
+
+    async fn send_materialized_in_dialog_request_owned(
+        &self,
+        dialog_id: &DialogId,
+        method: Method,
+        request: Request,
+    ) -> DialogResult<(
+        TransactionKey,
+        Option<crate::transaction::ClientTransactionCompletionHandle>,
+    )> {
+        let next_hop =
+            crate::transaction::transport::multiplexed::exact_next_hop_uri_for_request(&request)
+                .map_err(|_| {
+                    crate::errors::DialogError::routing_error(
+                        "Outbound request contains an unusable Route header",
+                    )
+                })?;
+        let (observed_source, route_set_is_empty) = {
+            let dialog = self.get_dialog(dialog_id)?;
+            (dialog.last_known_remote_addr, dialog.route_set.is_empty())
+        };
+        let mut candidates = self.resolve_uri_to_candidates(&next_hop).await;
+        apply_observed_source(observed_source, route_set_is_empty, &mut candidates);
+        if candidates.is_empty() {
+            return Err(crate::errors::DialogError::routing_error(
+                "No address candidates for the exact request next hop",
+            ));
+        }
+        let wire_plan = CandidateWirePlan {
+            regenerate_stack_default_contact: request.header(&HeaderName::Contact).is_some()
+                && self.local_contact_uri().is_none(),
+        };
+        let (transaction_id, _address, completion) = self
+            .send_request_with_candidate_wire_plan_owned(
+                request,
+                candidates,
+                Some(dialog_id),
+                wire_plan,
+            )
+            .await?;
+        debug!(
+            method=%crate::transaction::safe_diagnostics::SafeMethod::new(&method),
+            dialog=%dialog_id,
+            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id),
+            "Sent request via canonical method snapshot path"
+        );
+        Ok((transaction_id, completion))
+    }
+
+    /// SIP_API_DESIGN_2 §7.2 — in-dialog request dispatch with
+    /// application-staged `extra_headers` appended after the
+    /// stack-managed slice. Used by every `send_*_with_options` path on
+    /// `UnifiedDialogApi`. The legacy `send_request_in_dialog` (no
+    /// extras) forwards to this with an empty Vec.
+    pub async fn send_request_in_dialog_with_extras(
+        &self,
+        dialog_id: &DialogId,
+        method: Method,
+        body: Option<bytes::Bytes>,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+    ) -> DialogResult<TransactionKey> {
+        self.send_request_in_dialog_with_extras_owned(dialog_id, method, body, extra_headers)
+            .await
+            .map(|(transaction_id, _completion)| transaction_id)
+    }
+
+    /// In-dialog request dispatch that returns the exact transaction
+    /// completion captured before the request can reach the wire.
+    pub(crate) async fn send_request_in_dialog_with_extras_and_completion(
+        &self,
+        dialog_id: &DialogId,
+        method: Method,
+        body: Option<bytes::Bytes>,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+    ) -> DialogResult<(
+        TransactionKey,
+        crate::transaction::ClientTransactionCompletionHandle,
+    )> {
+        let method_for_error = method.clone();
+        let (transaction_id, completion) = self
+            .send_request_in_dialog_with_extras_owned(dialog_id, method, body, extra_headers)
+            .await?;
+        let completion =
+            completion.ok_or_else(|| crate::errors::DialogError::TransactionError {
+                message: safe_method_operation_failure(
+                    "dialog_completion_capture",
+                    "missing_exact_completion",
+                    &method_for_error,
+                ),
+            })?;
+        Ok((transaction_id, completion))
+    }
+
+    async fn send_request_in_dialog_with_extras_owned(
+        &self,
+        dialog_id: &DialogId,
+        method: Method,
+        body: Option<bytes::Bytes>,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+    ) -> DialogResult<(
+        TransactionKey,
+        Option<crate::transaction::ClientTransactionCompletionHandle>,
+    )> {
+        debug!(method=%crate::transaction::safe_diagnostics::SafeMethod::new(&method), dialog=%dialog_id, "Sending request using dialog functions");
+
+        // INFO and NOTIFY have caller-visible method-specific fields that the
+        // generic String-shaped switch cannot represent. Route even legacy
+        // Method-based sends through their immutable snapshot authorities.
+        if method == Method::Info {
+            return self
+                .send_info_request_snapshot_owned(
+                    dialog_id,
+                    InfoRequestSnapshot::legacy(body, extra_headers),
+                )
+                .await;
+        }
+        if method == Method::Notify {
+            return self
+                .send_notify_request_snapshot_owned(
+                    dialog_id,
+                    NotifyRequestSnapshot::legacy(
+                        None,
+                        NotifySubscriptionState::Tracked,
+                        body,
+                        extra_headers,
+                    ),
+                )
+                .await;
+        }
+
+        // Get dialog context and build the request. Destination is resolved
+        // from the final request next hop after Route headers are present.
+        let (candidates, request, wire_plan) = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+
+            // Convert body to String if provided
+            let body_string = body.map(|b| String::from_utf8_lossy(&b).to_string());
+
+            // Create dialog template using the proper dialog method
+            let template = dialog.create_request_template(method.clone());
+
+            // Capture INVITE CSeq for later use by RAck (RFC 3262 §7.2). Applies
+            // to both initial INVITE and re-INVITE — a re-INVITE can also produce
+            // reliable provisionals, so the most recent INVITE CSeq is what counts.
+            if method == Method::Invite {
+                dialog.invite_cseq = Some(template.cseq_number);
+            }
+
+            // Generate local tag if missing (for outgoing requests we should always have a local tag)
+            let local_tag = match template.local_tag {
+                Some(tag) if !tag.is_empty() => tag,
+                _ => {
+                    let new_tag = dialog.generate_local_tag();
+                    dialog.local_tag = Some(new_tag.clone());
+                    new_tag
+                }
+            };
+
+            // Handle remote tag based on dialog state and method
+            let remote_tag = match (&template.remote_tag, dialog.state.clone()) {
+                // If we have a valid remote tag, use it
+                (Some(tag), _) if !tag.is_empty() => Some(tag.clone()),
+
+                // For certain methods in confirmed dialogs, remote tag is required
+                (_, crate::dialog::DialogState::Confirmed) => {
+                    error!(
+                        dialog=%dialog_id,
+                        method=%crate::transaction::safe_diagnostics::SafeMethod::new(&method),
+                        has_local_tag=dialog.local_tag.is_some(),
+                        has_remote_tag=dialog.remote_tag.is_some(),
+                        "Confirmed dialog is missing remote tag for request"
+                    );
+                    return Err(crate::errors::DialogError::protocol_error(
+                        &safe_method_operation_failure(
+                            "dialog_request",
+                            "missing_remote_tag",
+                            &method,
+                        ),
+                    ));
+                }
+
+                // For early/initial dialogs, remote tag may be None (will be set to None, not empty string)
+                _ => None,
+            };
+
+            let local_address =
+                self.local_address_for_target_and_routes(&template.target_uri, &template.route_set);
+
+            // SIP_API_DESIGN_2 §7.2 — applications stage headers on the
+            // builder; the dialog stack stamps Call-ID/CSeq/Via/From-tag
+            // and appends application extras after that fixed prefix.
+            // Empty Vec means legacy path (no extras to stamp).
+            let extras_opt: Option<Vec<rvoip_sip_core::types::TypedHeader>> =
+                if extra_headers.is_empty() {
+                    None
+                } else {
+                    Some(extra_headers.clone())
+                };
+
+            // Build request using Phase 3 dialog quick functions (MUCH simpler!)
+            let request = match method {
+                Method::Invite => {
+                    // Distinguish between initial INVITE and re-INVITE based on remote tag
+                    match remote_tag {
+                        Some(remote_tag) => {
+                            // re-INVITE: We have a remote tag, so this is for an established dialog
+                            // re-INVITE requires SDP content for session modification
+                            let sdp_content = body_string.ok_or_else(|| {
+                                crate::errors::DialogError::protocol_error("re-INVITE request requires SDP content for session modification")
+                            })?;
+
+                            dialog_quick::reinvite_for_dialog_with_extras(
+                                &template.call_id,
+                                &template.local_uri.to_string(),
+                                &local_tag,
+                                &template.remote_uri.to_string(),
+                                &remote_tag,
+                                &sdp_content,
+                                template.cseq_number,
+                                local_address,
+                                if template.route_set.is_empty() { None } else { Some(template.route_set.clone()) },
+                                self.local_contact_uri(),
+                                extras_opt.clone(),
+                            )
+                        },
+                        None => {
+                            // Initial INVITE: No remote tag yet, creating new dialog
+                            use crate::transaction::client::builders::InviteBuilder;
+
+                            let mut invite_builder = InviteBuilder::new()
+                                .from_detailed(
+                                    Some("User"), // Display name
+                                    template.local_uri.to_string(),
+                                    Some(&local_tag)
+                                )
+                                .to_detailed(
+                                    Some("User"), // Display name
+                                    template.remote_uri.to_string(),
+                                    None // No remote tag for initial INVITE
+                                )
+                                .call_id(&template.call_id)
+                                .cseq(template.cseq_number)
+                                .request_uri(template.target_uri.to_string())
+                                .local_address(local_address);
+
+                            // Add route set if present
+                            for route in &template.route_set {
+                                invite_builder = invite_builder.add_route(route.clone());
+                            }
+
+                            if let Some(contact) = self.local_contact_uri() {
+                                invite_builder = invite_builder.contact(contact);
+                            }
+
+                            // Add SDP content if provided
+                            if let Some(sdp_content) = body_string {
+                                invite_builder = invite_builder.with_sdp(sdp_content);
+                            }
+
+                            // SIP_API_DESIGN_2 §5.2 — extras after stack-managed prefix.
+                            invite_builder.build().map(|mut request| {
+                                for hdr in extra_headers.iter().cloned() {
+                                    request.headers.push(hdr);
+                                }
+                                request
+                            })
+                        }
+                    }
+                },
+
+                Method::Bye => {
+                    // BYE requires both tags in established dialogs
+                    let remote_tag = remote_tag.ok_or_else(|| {
+                        crate::errors::DialogError::protocol_error("BYE request requires remote tag in established dialog")
+                    })?;
+
+                    dialog_quick::bye_for_dialog_with_request_uri(
+                        &template.call_id,
+                        &template.local_uri.to_string(),
+                        &local_tag,
+                        &template.remote_uri.to_string(),
+                        &remote_tag,
+                        &template.target_uri.to_string(),
+                        template.cseq_number,
+                        local_address,
+                        if template.route_set.is_empty() { None } else { Some(template.route_set.clone()) },
+                        extras_opt.clone(),
+                    )
+                },
+
+                Method::Refer => {
+                    // REFER requires both tags in established dialogs
+                    let remote_tag = remote_tag.ok_or_else(|| {
+                        crate::errors::DialogError::protocol_error("REFER request requires remote tag in established dialog")
+                    })?;
+
+                    // Extract the target URI from the body if it's in the old format ("Refer-To: <uri>")
+                    // Otherwise use it directly as the target URI
+                    let target_uri = if let Some(body) = body_string.clone() {
+                        // Check if it's in the old format with "Refer-To: " prefix
+                        if body.starts_with("Refer-To: ") {
+                            body.trim_start_matches("Refer-To: ").trim_end_matches("\r\n").to_string()
+                        } else {
+                            body
+                        }
+                    } else {
+                        "sip:unknown".to_string()
+                    };
+
+                    dialog_quick::refer_for_dialog_with_extras(
+                        &template.call_id,
+                        &template.local_uri.to_string(),
+                        &local_tag,
+                        &template.remote_uri.to_string(),
+                        &remote_tag,
+                        &target_uri,
+                        template.cseq_number,
+                        local_address,
+                        if template.route_set.is_empty() { None } else { Some(template.route_set.clone()) },
+                        self.local_contact_uri(),
+                        extras_opt.clone(),
+                    )
+                },
+
+                Method::Update => {
+                    // UPDATE requires both tags in established dialogs
+                    let remote_tag = remote_tag.ok_or_else(|| {
+                        crate::errors::DialogError::protocol_error("UPDATE request requires remote tag in established dialog")
+                    })?;
+
+                    dialog_quick::update_for_dialog_with_extras(
+                        &template.call_id,
+                        &template.local_uri.to_string(),
+                        &local_tag,
+                        &template.remote_uri.to_string(),
+                        &remote_tag,
+                        body_string.clone(),
+                        template.cseq_number,
+                        local_address,
+                        if template.route_set.is_empty() { None } else { Some(template.route_set.clone()) },
+                        self.local_contact_uri(),
+                        extras_opt.clone(),
+                    )
+                },
+
+                Method::Info | Method::Notify => {
+                    unreachable!("INFO and NOTIFY delegate before the generic materializer")
+                },
+
+                Method::Message => {
+                    // MESSAGE requires both tags in established dialogs
+                    let remote_tag = remote_tag.ok_or_else(|| {
+                        crate::errors::DialogError::protocol_error("MESSAGE request requires remote tag in established dialog")
+                    })?;
+
+                    let content = body_string.unwrap_or_else(|| "".to_string());
+                    dialog_quick::message_for_dialog_with_extras(
+                        &template.call_id,
+                        &template.local_uri.to_string(),
+                        &local_tag,
+                        &template.remote_uri.to_string(),
+                        &remote_tag,
+                        &content,
+                        Some("text/plain".to_string()),
+                        template.cseq_number,
+                        local_address,
+                        if template.route_set.is_empty() { None } else { Some(template.route_set.clone()) },
+                        extras_opt.clone(),
+                    )
+                },
+
+                _ => {
+                    // For any other method, require established dialog
+                    let remote_tag = remote_tag.ok_or_else(|| {
+                        crate::errors::DialogError::protocol_error(
+                            &safe_method_operation_failure(
+                                "dialog_request",
+                                "missing_remote_tag",
+                                &method,
+                            ),
+                        )
+                    })?;
+
+                    let contact = if matches!(method, Method::Update | Method::Refer | Method::Subscribe | Method::Notify) {
+                        self.local_contact_uri()
+                    } else {
+                        None
+                    };
+
+                    // Use dialog template + utility function
+                    let template_struct = DialogRequestTemplate {
+                        call_id: template.call_id,
+                        from_uri: template.local_uri.to_string(),
+                        from_tag: local_tag,
+                        to_uri: template.remote_uri.to_string(),
+                        to_tag: remote_tag,
+                        request_uri: template.target_uri.to_string(),
+                        cseq: template.cseq_number,
+                        local_address,
+                        route_set: template.route_set.clone(),
+                        contact,
+                    };
+
+                    request_builder_from_dialog_template(
+                        &template_struct,
+                        method.clone(),
+                        body_string,
+                        None, // Auto-detect content type
+                        extras_opt.clone(),
+                    )
+                }
+            }.map_err(|_error| crate::errors::DialogError::InternalError {
+                message: safe_method_operation_failure(
+                    "dialog_request_build",
+                    "builder_error",
+                    &method,
+                ),
+                context: None,
+            })?;
+
+            let mut request = request;
+            // RFC 3261 §12.2.1.1: every in-dialog request's Request-URI is
+            // the remote target (the peer's Contact), not the peer's AOR.
+            // The REFER, MESSAGE, UPDATE and re-INVITE quick builders take
+            // the AOR; correct it so a transfer, message or session refresh
+            // (RFC 4028 §7.4) reaches the peer that answered rather than the
+            // host in its From/To URI. The route set (Route headers) is
+            // unchanged, and the candidate send path re-derives the top Via
+            // transport from the resolved next hop.
+            let in_dialog = dialog
+                .remote_tag
+                .as_deref()
+                .is_some_and(|tag| !tag.is_empty());
+            if in_dialog {
+                request.uri = template.target_uri.clone();
+            }
+            // RFC 3262: advertise or demand the `100rel` extension on outgoing
+            // INVITEs per dialog config. Applies to both initial and re-INVITE.
+            if method == Method::Invite {
+                inject_100rel_policy(&mut request, self.config_100rel_policy());
+                // RFC 4028: advertise session timers. Only emitted when the
+                // config has `session_timer_secs = Some(_)`.
+                if let Some((secs, min_se)) = self.config_session_timer_settings() {
+                    let in_dialog = dialog
+                        .remote_tag
+                        .as_deref()
+                        .is_some_and(|tag| !tag.is_empty());
+                    if in_dialog {
+                        // §7.4: a re-INVITE keeps the negotiated interval and
+                        // the current refresher instead of re-proposing the
+                        // configured interval with `refresher=uac`.
+                        let negotiated = dialog
+                            .session_expires_secs
+                            .map(|secs| (secs, dialog.is_session_refresher));
+                        inject_in_dialog_session_timer_headers(&mut request, negotiated, min_se);
+                    } else {
+                        inject_session_timer_headers(&mut request, secs, min_se);
+                    }
+                }
+            }
+            // RFC 4028 §7.2/§7.4: remember which in-dialog INVITE/UPDATE
+            // proposed a timer so a 2xx without Session-Expires to *that*
+            // request can turn the timer off.
+            if in_dialog
+                && matches!(method, Method::Invite | Method::Update)
+                && request
+                    .headers
+                    .iter()
+                    .any(|h| matches!(h, TypedHeader::SessionExpires(_)))
+            {
+                const MAX_TRACKED_REFRESHES: usize = 8;
+                if dialog.session_timer_request_cseqs.len() >= MAX_TRACKED_REFRESHES {
+                    dialog.session_timer_request_cseqs.remove(0);
+                }
+                dialog
+                    .session_timer_request_cseqs
+                    .push(template.cseq_number);
+            }
+
+            let next_hop =
+                crate::transaction::transport::multiplexed::exact_next_hop_uri_for_request(
+                    &request,
+                )
+                .map_err(|_| {
+                    crate::errors::DialogError::routing_error(
+                        "Outbound request contains an unusable Route header",
+                    )
+                })?;
+            let observed_source = dialog.last_known_remote_addr;
+            let route_set_is_empty = template.route_set.is_empty();
+            drop(dialog);
+            let mut candidates = self.resolve_uri_to_candidates(&next_hop).await;
+
+            // When an inbound peer supplied an unspecified Contact, dialog
+            // setup retained the exact validated packet source. Use that
+            // source only for a direct dialog (never across a Route set), and
+            // preserve the Contact-derived URI on the wire as Request-URI.
+            // Reusing the resolved candidate's transport also preserves UDP,
+            // TCP, or TLS selection without inventing transport state here.
+            apply_observed_source(observed_source, route_set_is_empty, &mut candidates);
+
+            if candidates.is_empty() {
+                return Err(crate::errors::DialogError::routing_error(
+                    "No address candidates for the exact request next hop",
+                ));
+            }
+            let wire_plan = CandidateWirePlan {
+                regenerate_stack_default_contact: request.header(&HeaderName::Contact).is_some()
+                    && self.local_contact_uri().is_none(),
+            };
+            (candidates, request, wire_plan)
+        };
+
+        // RFC 3263 §4.3 multi-candidate failover. STIR/SHAKEN signing
+        // (`pre_send_request`) and the RFC 3261 §17.1.1.3 benign-
+        // terminate-after-2xx handling both live in the helper — only
+        // INVITE gets the benign-terminate suppression so non-INVITE
+        // methods (BYE / REFER / UPDATE / etc.) still surface real
+        // transport failures.
+        let (transaction_id, _addr, completion) = self
+            .send_request_with_candidate_wire_plan_owned(
+                request,
+                candidates,
+                Some(dialog_id),
+                wire_plan,
+            )
+            .await?;
+
+        debug!(
+            method=%crate::transaction::safe_diagnostics::SafeMethod::new(&method),
+            dialog=%dialog_id,
+            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id),
+            "Sent request via candidate failover path"
+        );
+
+        Ok((transaction_id, completion))
+    }
+
+    /// Send a response using transaction-core
+    ///
+    /// Delegates response sending to transaction-core while maintaining dialog state.
+    /// Reliable-provisional wrapping (RFC 3262 §3) is applied here: a 1xx
+    /// response with a body on a dialog whose peer advertised `100rel` is
+    /// rewritten with `Require: 100rel` + `RSeq: <n>` and retransmitted with
+    /// T1 backoff until PRACK acknowledges it.
+    pub async fn send_transaction_response_impl(
+        &self,
+        transaction_id: &TransactionKey,
+        mut response: Response,
+    ) -> DialogResult<()> {
+        debug!(status=response.status_code(), transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), "Sending response");
+
+        // RFC 4028 §9: a 2xx to a session refresh request (INVITE or UPDATE)
+        // carries the negotiated Session-Expires so the UAC learns the
+        // interval and refresher. Responses to other methods (BYE, INFO, …)
+        // are not session refreshes and carry neither header.
+        let session_refresh_method =
+            matches!(transaction_id.method(), Method::Invite | Method::Update);
+        if response.status().is_success() && session_refresh_method {
+            let dialog_id = self
+                .transaction_to_dialog
+                .get(transaction_id)
+                .map(|entry| entry.value().clone());
+            let request = self
+                .transaction_manager
+                .original_request(transaction_id)
+                .await
+                .ok()
+                .flatten();
+            // §9: a 2xx to an in-dialog refresh renegotiates from *that*
+            // request — its interval, Min-SE and refresher — instead of
+            // echoing the dialog's previous values. The dialog-creating
+            // INVITE was negotiated when it arrived.
+            if let (Some(dialog_id), Some(request)) = (dialog_id.as_ref(), request.as_ref()) {
+                let in_dialog = request.to().is_some_and(|to| to.tag().is_some());
+                if in_dialog {
+                    let local = self.config_session_timer_settings();
+                    if let Ok(mut dialog) = self.get_dialog_mut(dialog_id) {
+                        let current = dialog
+                            .session_expires_secs
+                            .map(|secs| (secs, dialog.is_session_refresher));
+                        if let UasSessionTimerDecision::Accept {
+                            session_secs,
+                            uas_refreshes,
+                        } = negotiate_uas_refresh_session_timer(request, local, current)
+                        {
+                            dialog.session_expires_secs = session_secs;
+                            dialog.is_session_refresher = session_secs.is_some() && uas_refreshes;
+                        }
+                    }
+                }
+            }
+            let negotiated = dialog_id
+                .and_then(|dialog_id| self.get_dialog(&dialog_id).ok())
+                .and_then(|dialog| {
+                    dialog
+                        .session_expires_secs
+                        .map(|secs| (secs, dialog.is_session_refresher))
+                });
+            if let Some((secs, uas_refreshes)) = negotiated {
+                // §9: `Require: timer` is mandatory when the UAC refreshes and
+                // recommended when the UAS does, but only for a UAC that
+                // advertised `timer`: a response must not require an
+                // extension the request did not list as supported.
+                let peer_supports_timer = request.as_ref().is_some_and(detect_peer_timer_support);
+                apply_uas_session_timer_headers(
+                    &mut response,
+                    secs,
+                    uas_refreshes,
+                    peer_supports_timer,
+                );
+            }
+        }
+
+        let mut reliable_prepared = None;
+        if should_send_reliably(&response) {
+            if let Some(dialog_id_ref) = self.transaction_to_dialog.get(transaction_id) {
+                let dialog_id = dialog_id_ref.clone();
+                drop(dialog_id_ref);
+
+                let our_policy = self.config_100rel_policy();
+                let rseq_opt = match self.get_dialog_mut(&dialog_id) {
+                    Ok(mut dialog) => {
+                        if dialog.state != DialogState::Terminated
+                            && dialog.peer_supports_100rel
+                            && !matches!(our_policy, RelUsage::NotSupported)
+                        {
+                            Some(dialog.next_local_rseq())
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+
+                if let Some(rseq) = rseq_opt {
+                    inject_reliable_provisional_headers(&mut response, rseq);
+                    reliable_prepared = Some(
+                        crate::transaction::server::reliable_invite::prepare_reliable_provisional_retransmit(
+                            dialog_id.clone(),
+                            rseq,
+                            transaction_id.clone(),
+                            response.clone(),
+                            self.transaction_manager.clone(),
+                            self.reliable_provisional_tasks.clone(),
+                            || {
+                                self.get_dialog(&dialog_id)
+                                    .map(|dialog| dialog.state != DialogState::Terminated)
+                                    .unwrap_or(false)
+                            },
+                        )
+                        .map_err(|_error| crate::errors::DialogError::InternalError {
+                            message: safe_operation_failure(
+                                "reliable_provisional_reserve",
+                                "lifecycle_error",
+                            ),
+                            context: None,
+                        })?,
+                    );
+                    debug!(
+                        "Wrapping 18x {} as reliable (policy={:?}, rseq={})",
+                        response.status_code(),
+                        our_policy,
+                        rseq
+                    );
+                }
+            }
+        }
+
+        // A final response closes the RFC 3262 provisional phase before its
+        // own wire write. No reliable 18x task can therefore retransmit after
+        // the final response.
+        let final_invite_dialog =
+            if !response.status().is_provisional() && transaction_id.method() == &Method::Invite {
+                self.transaction_to_dialog
+                    .get(transaction_id)
+                    .map(|entry| entry.value().clone())
+            } else {
+                None
+            };
+        if let Some(dialog_id) = final_invite_dialog.as_ref() {
+            self.reliable_provisional_tasks
+                .close_transaction(dialog_id, transaction_id)
+                .await
+                .map_err(|_error| crate::errors::DialogError::InternalError {
+                    message: safe_operation_failure(
+                        "reliable_provisional_close",
+                        "lifecycle_error",
+                    ),
+                    context: None,
+                })?;
+        }
+
+        // Use transaction-core to send the response
+        if let Err(_error) = self
+            .transaction_manager
+            .send_response(transaction_id, response)
+            .await
+        {
+            if let Some(prepared) = reliable_prepared {
+                prepared.cancel().await.map_err(|_error| {
+                    crate::errors::DialogError::InternalError {
+                        message: safe_operation_failure(
+                            "reliable_provisional_cancel",
+                            "lifecycle_error",
+                        ),
+                        context: None,
+                    }
+                })?;
+            }
+            return Err(crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("transaction_response_send", "transaction_error"),
+            });
+        }
+
+        if let Some(prepared) = reliable_prepared {
+            prepared.activate().await.map_err(|_error| {
+                crate::errors::DialogError::InternalError {
+                    message: safe_operation_failure(
+                        "reliable_provisional_activate",
+                        "lifecycle_error",
+                    ),
+                    context: None,
+                }
+            })?;
+        }
+        if let Some(dialog_id) = final_invite_dialog.as_ref() {
+            self.reliable_provisional_tasks
+                .release_transaction(dialog_id, transaction_id);
+        }
+
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), "Successfully sent response");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod outward_error_redaction_tests {
+    use super::*;
+    use rvoip_sip_core::HeaderValue;
+    use std::str::FromStr;
+
+    const LOWER_ERROR_SECRET: &str = "lower-builder-parser-secret";
+    const EXTENSION_METHOD_SECRET: &str = "extension-method-secret";
+
+    #[test]
+    fn constructed_outward_errors_keep_only_operation_class_and_safe_method() {
+        let lower_result: Result<(), &str> = Err(LOWER_ERROR_SECRET);
+        let method = Method::Extension(EXTENSION_METHOD_SECRET.to_string());
+        let error = lower_result
+            .map_err(|_error| crate::errors::DialogError::InternalError {
+                message: safe_method_operation_failure("request_build", "builder_error", &method),
+                context: None,
+            })
+            .unwrap_err();
+        let rendered = format!("{error:?}");
+
+        let crate::errors::DialogError::InternalError { message, .. } = &error else {
+            panic!("internal error expected");
+        };
+        assert!(message.contains("operation=request_build"));
+        assert!(message.contains("method=extension"));
+        assert!(message.contains("error_class=builder_error"));
+        assert!(rendered.contains("class: \"internal\""));
+        assert!(!rendered.contains(LOWER_ERROR_SECRET));
+        assert!(!rendered.contains(EXTENSION_METHOD_SECRET));
+    }
+
+    #[test]
+    fn outward_dialog_error_construction_has_no_raw_lower_error_formatting() {
+        let source = include_str!("transaction_integration.rs");
+        let test_marker = "#[cfg(test)]\nmod outward_error_redaction_tests";
+        let test_start = source.find(test_marker).expect("test module marker");
+        let after_test_offset = source[test_start..]
+            .find("\nimpl DialogManager {")
+            .expect("production resumes after test module");
+        let production = format!(
+            "{}{}",
+            &source[..test_start],
+            &source[test_start + after_test_offset..]
+        );
+
+        for forbidden in [
+            "message: format!",
+            "map_err(|e| crate::errors::DialogError",
+            "DialogError::protocol_error(&format!",
+            "DialogError::routing_error(&format!",
+            "DialogError::internal_error(&format!",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "outward DialogError construction contains unsafe form: {forbidden}"
+            );
+        }
+
+        for line in production.lines().filter(|line| line.contains("message:")) {
+            assert!(
+                line.contains("safe_operation_failure")
+                    || line.contains("safe_method_operation_failure"),
+                "outward DialogError message bypasses safe construction: {line}"
+            );
+        }
+
+        let raw_lower_error_stringifications = production
+            .match_indices("e.to_string()")
+            .filter(|(index, _)| {
+                production[..*index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+            })
+            .count();
+        assert_eq!(
+            raw_lower_error_stringifications, 0,
+            "lower transaction errors must never be classified by string contents"
+        );
+    }
+
+    fn application_header(name: &str, value: &str) -> TypedHeader {
+        TypedHeader::Other(
+            HeaderName::Other(name.to_string()),
+            HeaderValue::Raw(value.as_bytes().to_vec()),
+        )
+    }
+
+    fn valid_initial_invite() -> Request {
+        crate::transaction::client::builders::InviteBuilder::new()
+            .from_detailed(Some("Alice"), "sip:alice@example.test", Some("from-tag"))
+            .to_detailed(Some("Bob"), "sip:bob@example.test", None)
+            .call_id("call-id@example.test")
+            .cseq(1)
+            .request_uri("sip:bob@example.test")
+            .local_address("127.0.0.1:5060".parse().unwrap())
+            .contact("sip:alice@127.0.0.1:5060")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn initial_invite_plan_preserves_application_order_and_duplicates() {
+        let headers = vec![
+            application_header("X-Order", "first"),
+            application_header("X-Other", "middle"),
+            application_header("x-order", "second"),
+        ];
+        let plan = plan_initial_invite_headers(None, headers).unwrap();
+        assert_eq!(plan.appended.len(), 3);
+
+        let mut request = valid_initial_invite();
+        append_validated_initial_invite_headers(&mut request, Vec::new(), plan.appended).unwrap();
+        let values = request
+            .headers
+            .iter()
+            .filter_map(|header| match header {
+                TypedHeader::Other(name, HeaderValue::Raw(value))
+                    if name.wire_eq(&HeaderName::Other("X-Order".into())) =>
+                {
+                    Some(String::from_utf8(value.clone()).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["first", "second"]);
+    }
+
+    #[test]
+    fn initial_invite_plan_rejects_contact_aliases_and_collisions() {
+        let raw_alias = application_header("m", "<sip:raw@example.test>");
+        assert!(plan_initial_invite_headers(None, vec![raw_alias]).is_err());
+
+        let contact = rvoip_sip_core::types::Contact::from_str("<sip:typed@example.test>").unwrap();
+        assert!(plan_initial_invite_headers(
+            Some("sip:override@example.test".into()),
+            vec![TypedHeader::Contact(contact.clone())],
+        )
+        .is_err());
+        assert!(plan_initial_invite_headers(
+            None,
+            vec![
+                TypedHeader::Contact(contact.clone()),
+                TypedHeader::Contact(contact),
+            ],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn outbound_proxy_precedes_registration_service_routes() {
+        let proxy: rvoip_sip_core::Uri = "sips:edge.example.test;lr".parse().unwrap();
+        let service_one: rvoip_sip_core::Uri = "sip:service-one.example.test;lr".parse().unwrap();
+        let service_two: rvoip_sip_core::Uri = "sip:service-two.example.test;lr".parse().unwrap();
+        let planned = planned_initial_invite_routes(
+            Some(&proxy),
+            &[service_one.clone(), service_two.clone()],
+        );
+        assert_eq!(planned, vec![proxy, service_one, service_two]);
+    }
+
+    #[test]
+    fn final_initial_invite_append_rejects_singleton_alias_before_send() {
+        let mut request = valid_initial_invite();
+        let duplicate = application_header("i", "other-call-id@example.test");
+        assert!(
+            append_validated_initial_invite_headers(&mut request, Vec::new(), vec![duplicate],)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn initial_invite_variants_delegate_one_materializer() {
+        fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+            let declaration = format!("\n    {signature}");
+            let start = source
+                .find(&declaration)
+                .map(|index| index + 5)
+                .expect("function signature");
+            let opening = source[start..].find('{').expect("function opening") + start;
+            let mut depth = 0usize;
+            for (offset, byte) in source[opening..].bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[start..=opening + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated function")
+        }
+
+        let source = include_str!("transaction_integration.rs");
+        let auth = function_body(source, "pub async fn send_invite_with_auth_options(");
+        let timer = function_body(
+            source,
+            "pub async fn send_invite_with_session_timer_options(",
+        );
+        let initial = function_body(
+            source,
+            "pub async fn send_initial_invite_with_extra_headers(",
+        );
+        let registered_flow = function_body(
+            source,
+            "async fn send_initial_invite_with_registered_flow_routes(",
+        );
+        let canonical = function_body(source, "async fn send_initial_invite_attempt_with_options(");
+
+        for facade in [auth, timer, registered_flow] {
+            assert!(facade.contains(".send_initial_invite_attempt_with_options("));
+            assert!(!facade.contains("InviteBuilder::new()"));
+            assert!(!facade.contains("send_request_with_candidate_wire_plan("));
+        }
+        assert!(initial.contains(".send_initial_invite_with_registered_flow_routes("));
+        assert!(!initial.contains("InviteBuilder::new()"));
+        assert!(!initial.contains("send_request_with_candidate_wire_plan("));
+        assert_eq!(canonical.matches("InviteBuilder::new()").count(), 1);
+        assert_eq!(
+            canonical
+                .matches("send_request_with_candidate_wire_plan(")
+                .count(),
+            1
+        );
+    }
+
+    fn method_snapshot_context() -> InDialogRequestMaterializationContext {
+        InDialogRequestMaterializationContext {
+            call_id: "snapshot-call@example.test".to_string(),
+            local_uri: "sip:alice@example.test".to_string(),
+            local_tag: "alice-tag".to_string(),
+            remote_uri: "sip:bob@example.test".to_string(),
+            remote_tag: "bob-tag".to_string(),
+            remote_target: "sip:bob@192.0.2.7:5070".parse().unwrap(),
+            cseq: 42,
+            local_address: "127.0.0.1:5060".parse().unwrap(),
+            route_set: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn info_notify_snapshots_preserve_auth_headers_and_exact_wire_entities() {
+        let authorization = TypedHeader::Other(
+            HeaderName::Authorization,
+            HeaderValue::Raw(b"Digest username=\"alice\", response=\"snapshot-response\"".to_vec()),
+        );
+        let info_body = bytes::Bytes::from_static(b"Signal=5\r\n\x00\xffDuration=160\r\n");
+        let info = materialize_info_request_snapshot(
+            &method_snapshot_context(),
+            &InfoRequestSnapshot::exact(
+                "application/dtmf-relay".to_string(),
+                info_body.clone(),
+                vec![authorization.clone()],
+            ),
+        )
+        .unwrap();
+        assert_eq!(info.method(), Method::Info);
+        assert_eq!(info.body(), info_body.as_ref());
+        assert!(info
+            .header(&HeaderName::ContentType)
+            .unwrap()
+            .to_string()
+            .contains("application/dtmf-relay"));
+        assert_eq!(
+            info.headers
+                .iter()
+                .filter(|header| header.name().wire_eq(&HeaderName::Authorization))
+                .count(),
+            1
+        );
+        assert!(info.to_bytes().ends_with(info_body.as_ref()));
+        rvoip_sip_core::validation::validate_wire_request(&info).unwrap();
+
+        let notify_body = bytes::Bytes::from_static(b"<presence>\x00\xff</presence>");
+        let notify_snapshot = NotifyRequestSnapshot::exact(
+            "presence".to_string(),
+            Some("active;expires=60".to_string()),
+            Some("application/pidf+xml".to_string()),
+            Some(notify_body.clone()),
+            Some("branch-a".to_string()),
+            vec![authorization],
+        );
+        let notify = materialize_notify_request_snapshot(
+            &method_snapshot_context(),
+            &notify_snapshot,
+            "presence".to_string(),
+            Some("active;expires=60".to_string()),
+        )
+        .unwrap();
+        assert_eq!(notify.method(), Method::Notify);
+        assert_eq!(notify.body(), notify_body.as_ref());
+        assert!(notify
+            .header(&HeaderName::Event)
+            .unwrap()
+            .to_string()
+            .contains("presence;id=branch-a"));
+        assert!(notify
+            .header(&HeaderName::SubscriptionState)
+            .unwrap()
+            .to_string()
+            .contains("active;expires=60"));
+        assert!(notify
+            .header(&HeaderName::ContentType)
+            .unwrap()
+            .to_string()
+            .contains("application/pidf+xml"));
+        assert_eq!(
+            notify
+                .headers
+                .iter()
+                .filter(|header| header.name().wire_eq(&HeaderName::Authorization))
+                .count(),
+            1
+        );
+        assert!(notify.to_bytes().ends_with(notify_body.as_ref()));
+        rvoip_sip_core::validation::validate_wire_request(&notify).unwrap();
+    }
+
+    #[test]
+    fn every_info_notify_facade_delegates_the_single_snapshot_authority() {
+        fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+            let declaration = format!("\n    {signature}");
+            let start = source
+                .find(&declaration)
+                .map(|index| index + 5)
+                .expect("function signature");
+            let opening = source[start..].find('{').expect("function opening") + start;
+            let mut depth = 0usize;
+            for (offset, byte) in source[opening..].bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[start..=opening + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated function")
+        }
+
+        let transaction = include_str!("transaction_integration.rs");
+        let materializers = transaction
+            .split("#[cfg(test)]\nmod outward_error_redaction_tests")
+            .next()
+            .expect("production request materializers");
+        assert_eq!(
+            materializers
+                .matches("dialog_quick::info_for_dialog_with_extras(")
+                .count(),
+            1,
+            "INFO has one request materializer"
+        );
+        assert_eq!(
+            materializers
+                .matches("dialog_quick::notify_for_dialog_with_extras(")
+                .count(),
+            1,
+            "NOTIFY has one request materializer"
+        );
+        let generic = function_body(
+            transaction,
+            "async fn send_request_in_dialog_with_extras_owned(",
+        );
+        assert!(generic.contains("send_info_request_snapshot_owned("));
+        assert!(generic.contains("send_notify_request_snapshot_owned("));
+
+        let api = include_str!("../api/unified.rs");
+        assert!(function_body(api, "pub async fn send_info_with_options(")
+            .contains(".send_info_request_snapshot("));
+        assert!(function_body(api, "pub async fn send_notify_with_options(")
+            .contains(".send_notify_request_snapshot("));
+
+        let core = include_str!("core.rs");
+        assert!(
+            function_body(core, "pub async fn send_info_with_content_type(")
+                .contains("self.send_info_request_snapshot(")
+        );
+
+        let unified = include_str!("unified.rs");
+        assert!(function_body(unified, "pub async fn send_info(")
+            .contains(".send_info_request_snapshot("));
+        assert!(function_body(unified, "pub async fn send_notify(")
+            .contains(".send_notify_request_snapshot("));
+
+        for source in [
+            include_str!("../api/common.rs"),
+            include_str!("../api/client.rs"),
+            include_str!("../api/server/sip_methods.rs"),
+        ] {
+            assert!(function_body(source, "pub async fn send_info(")
+                .contains(".send_info_request_snapshot("));
+            assert!(function_body(source, "pub async fn send_notify(")
+                .contains(".send_notify_request_snapshot("));
+        }
+    }
+}
+
+/// RFC 3261 §22.2 — resend an INVITE with an `Authorization` or
+/// `Proxy-Authorization` header after the UAS/proxy challenged with 401/407.
+///
+/// The local UAC request template is reused so the retry keeps the same
+/// `Call-ID` and `From` tag, has no remote tag, and bumps CSeq on a new client
+/// transaction. On the UAS side, the 401/407 final response terminates the
+/// early dialog, so this retry must be routed as a fresh initial INVITE rather
+/// than a re-INVITE. The caller supplies the fully-formatted auth header value.
+impl DialogManager {
+    fn invite_failover_plan_ids_for_dialog(&self, dialog_id: &DialogId) -> Vec<u64> {
+        self.invite_failover_plans_by_dialog
+            .get(dialog_id)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
+    fn invite_failover_attempt_ids_for_dialog(
+        &self,
+        dialog_id: &DialogId,
+    ) -> Vec<std::sync::Arc<TransactionKey>> {
+        self.invite_failover_attempts_by_dialog
+            .get(dialog_id)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Link a retained plan while `invite_failover_registry_lock` is held.
+    fn index_invite_failover_plan_locked(&self, dialog_id: &DialogId, plan_id: u64) {
+        let mut plan_ids = self
+            .invite_failover_plans_by_dialog
+            .entry(dialog_id.clone())
+            .or_default();
+        if !plan_ids.contains(&plan_id) {
+            plan_ids.push(plan_id);
+        }
+    }
+
+    /// Unlink a retained plan while `invite_failover_registry_lock` is held.
+    fn unindex_invite_failover_plan_locked(&self, dialog_id: &DialogId, plan_id: u64) {
+        if let Some(mut plan_ids) = self.invite_failover_plans_by_dialog.get_mut(dialog_id) {
+            plan_ids.retain(|candidate| *candidate != plan_id);
+        }
+        self.invite_failover_plans_by_dialog
+            .remove_if(dialog_id, |_, plan_ids| plan_ids.is_empty());
+    }
+
+    /// Publish an exact retained attempt and reverse owner while
+    /// `invite_failover_registry_lock` is held.
+    fn index_invite_failover_attempt_locked(
+        &self,
+        transaction_id: std::sync::Arc<TransactionKey>,
+        attempt: InviteFailoverAttemptIndex,
+    ) {
+        if let Some(previous) = self
+            .invite_failover_attempts
+            .insert(transaction_id.clone(), attempt.clone())
+        {
+            self.unindex_invite_failover_attempt_locked(
+                &previous.dialog_id,
+                transaction_id.as_ref(),
+            );
+        }
+        let mut transaction_ids = self
+            .invite_failover_attempts_by_dialog
+            .entry(attempt.dialog_id)
+            .or_default();
+        if !transaction_ids
+            .iter()
+            .any(|candidate| candidate.as_ref() == transaction_id.as_ref())
+        {
+            transaction_ids.push(transaction_id);
+        }
+    }
+
+    fn unindex_invite_failover_attempt_locked(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+    ) {
+        if let Some(mut transaction_ids) =
+            self.invite_failover_attempts_by_dialog.get_mut(dialog_id)
+        {
+            transaction_ids.retain(|candidate| candidate.as_ref() != transaction_id);
+        }
+        self.invite_failover_attempts_by_dialog
+            .remove_if(dialog_id, |_, transaction_ids| transaction_ids.is_empty());
+    }
+
+    /// Remove only the exact retained attempt expected by the caller while
+    /// `invite_failover_registry_lock` is held.
+    fn remove_invite_failover_attempt_locked(
+        &self,
+        transaction_id: &TransactionKey,
+        expected_plan_id: Option<u64>,
+    ) -> Option<InviteFailoverAttemptIndex> {
+        let expected = self
+            .invite_failover_attempts
+            .get(transaction_id)
+            .map(|entry| entry.value().clone())?;
+        if expected_plan_id.is_some_and(|plan_id| expected.plan_id != plan_id) {
+            return None;
+        }
+        let removed = self
+            .invite_failover_attempts
+            .remove_if(transaction_id, |_, current| {
+                current.plan_id == expected.plan_id
+                    && current.dialog_id == expected.dialog_id
+                    && current.candidate_index == expected.candidate_index
+            })?;
+        self.unindex_invite_failover_attempt_locked(&expected.dialog_id, transaction_id);
+        Some(removed.1)
+    }
+
+    /// True only when the exact retained wire-unknown INVITE has ended
+    /// without a 2xx. A CANCEL transaction's own final response is not
+    /// sufficient: RFC 3261 teardown completes when the original INVITE
+    /// resolves (normally 487), while a late 2xx requires the separate
+    /// ACK+BYE path.
+    ///
+    /// The plan can also settle before the upper layer hands the INVITE to
+    /// this supervisor. When the first write fails, the transaction layer
+    /// reports `TransportError` on its event stream as well as returning the
+    /// error to the sender. If the event wins, the plan closes on that
+    /// terminal outcome (RFC 3261 §8.1.3.1 treats it as a 503) and drops its
+    /// current transaction before the sender can retain it as wire-unknown.
+    /// The sender still reports the dispatch as wire-unknown, but no CANCEL
+    /// can target a closed plan, and no response can arrive to settle it, so
+    /// a closed or exhausted plan with no live successor is terminal too.
+    ///
+    /// The plan also marks an INVITE wire-unknown as soon as it hands it to
+    /// the transaction layer, which is deliberately conservative; the
+    /// transaction layer retains the INVITE only once its write boundary is
+    /// crossed. A TLS peer that rejects the handshake while the route is
+    /// being prepared leaves a wire-unknown INVITE that the transaction layer
+    /// has already forgotten, and an INVITE whose stream flow has closed can
+    /// receive no response either. Such an INVITE is settled too.
+    ///
+    /// Without these the supervisor, the exact owner, and every session
+    /// teardown waiting on that owner would wait forever.
+    pub(crate) async fn wire_unknown_invite_has_terminal_failure(
+        &self,
+        dialog_id: &DialogId,
+    ) -> bool {
+        let mut settled_without_success = false;
+        let mut unresolved = false;
+        for plan_id in self.invite_failover_plan_ids_for_dialog(dialog_id) {
+            let Some(plan) = self
+                .invite_failover_plans
+                .get(&plan_id)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
+            let transaction_id = {
+                let plan = plan.lock().await;
+                if plan.id != plan_id || &plan.dialog_id != dialog_id {
+                    continue;
+                }
+                match plan.phase {
+                    InviteFailoverPlanPhase::WireUnknown => plan.current_transaction.clone(),
+                    InviteFailoverPlanPhase::Closed | InviteFailoverPlanPhase::Exhausted => {
+                        settled_without_success = true;
+                        continue;
+                    }
+                    InviteFailoverPlanPhase::Active
+                    | InviteFailoverPlanPhase::Accepted
+                    | InviteFailoverPlanPhase::Cancelled => {
+                        unresolved = true;
+                        continue;
+                    }
+                }
+            };
+            let Some(transaction_id) = transaction_id else {
+                unresolved = true;
+                continue;
+            };
+            if self
+                .transaction_manager
+                .last_response(&transaction_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|response| response.status().as_u16() >= 300)
+            {
+                return true;
+            }
+            if self
+                .transaction_manager
+                .client_transaction_is_unreachable(&transaction_id)
+                .await
+            {
+                // No final response can ever be accepted for this INVITE and
+                // no CANCEL can be built for it, so nothing is left to wait
+                // for (see `client_transaction_is_unreachable`).
+                settled_without_success = true;
+                continue;
+            }
+            unresolved = true;
+        }
+        settled_without_success && !unresolved
+    }
+
+    /// Whether the exact dialog has emitted, or may have emitted, its sole
+    /// local CANCEL and therefore requires terminal INVITE supervision.
+    pub(crate) async fn invite_cancel_requires_terminal_supervision(
+        &self,
+        dialog_id: &DialogId,
+    ) -> bool {
+        for plan_id in self.invite_failover_plan_ids_for_dialog(dialog_id) {
+            let Some(plan) = self
+                .invite_failover_plans
+                .get(&plan_id)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
+            let plan = plan.lock().await;
+            if plan.id == plan_id
+                && &plan.dialog_id == dialog_id
+                && matches!(
+                    plan.cancel_dispatch_state,
+                    InviteCancelDispatchState::Sent | InviteCancelDispatchState::WireUnknown
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Zero-wire CANCEL failures reset the shared author to `Idle`; the
+    /// lifecycle supervisor may retry only that exact state.
+    pub(crate) async fn invite_cancel_is_retryable(&self, dialog_id: &DialogId) -> bool {
+        for plan_id in self.invite_failover_plan_ids_for_dialog(dialog_id) {
+            let Some(plan) = self
+                .invite_failover_plans
+                .get(&plan_id)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
+            let plan = plan.lock().await;
+            if plan.id == plan_id
+                && &plan.dialog_id == dialog_id
+                && matches!(
+                    plan.phase,
+                    InviteFailoverPlanPhase::Active | InviteFailoverPlanPhase::WireUnknown
+                )
+                && plan.cancel_dispatch_state == InviteCancelDispatchState::Idle
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A late INVITE 2xx racing a locally-owned CANCEL may make the dialog
+    /// Confirmed before its mandatory ACK and acknowledged session delivery
+    /// have committed. The teardown supervisor must not send BYE across that
+    /// causal boundary. The selected-success fence is the single authority
+    /// shared with retransmission handling.
+    pub(crate) async fn invite_cancel_bye_is_causally_ready(&self, dialog_id: &DialogId) -> bool {
+        for plan_id in self.invite_failover_plan_ids_for_dialog(dialog_id) {
+            let Some(plan) = self
+                .invite_failover_plans
+                .get(&plan_id)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
+            let accepted_transaction = {
+                let plan = plan.lock().await;
+                if plan.id != plan_id
+                    || &plan.dialog_id != dialog_id
+                    || plan.phase != InviteFailoverPlanPhase::WireUnknown
+                    || !matches!(
+                        plan.cancel_dispatch_state,
+                        InviteCancelDispatchState::Sent | InviteCancelDispatchState::WireUnknown
+                    )
+                {
+                    continue;
+                }
+                plan.accepted_transaction.clone()
+            };
+            let Some(accepted_transaction) = accepted_transaction else {
+                return false;
+            };
+            return self
+                .invite_failover_attempts
+                .get(accepted_transaction.as_ref())
+                .is_some_and(|attempt| attempt.selected_success_delivery.is_delivered());
+        }
+
+        // Legacy/non-retained dialogs do not have this selected-success
+        // authority. Their existing confirmed-dialog teardown behavior is
+        // unchanged.
+        true
+    }
+
+    /// Mark a non-expiring wire-unknown INVITE plan as legally torn down and
+    /// immediately release its retained CANCEL route/reservations.
+    pub(crate) async fn complete_wire_unknown_invite_for_dialog(&self, dialog_id: &DialogId) {
+        let plan_ids = self.invite_failover_plan_ids_for_dialog(dialog_id);
+        for plan_id in &plan_ids {
+            if let Some(plan) = self
+                .invite_failover_plans
+                .get(plan_id)
+                .map(|entry| entry.value().clone())
+            {
+                let mut plan = plan.lock().await;
+                if plan.id == *plan_id
+                    && &plan.dialog_id == dialog_id
+                    && plan.phase == InviteFailoverPlanPhase::WireUnknown
+                {
+                    plan.transition_to_terminal(InviteFailoverPlanPhase::Closed);
+                    self.schedule_invite_failover_plan_expiry(&mut plan, Instant::now());
+                }
+            }
+        }
+        for plan_id in plan_ids {
+            self.try_remove_invite_failover_plan(plan_id);
+        }
+    }
+
+    /// Change a retained plan's deadline/eligibility and atomically replace
+    /// its sole scheduler entry. Callers hold the plan mutex, which makes the
+    /// generation update the ordering boundary for concurrent maintenance.
+    pub(crate) fn schedule_invite_failover_plan_expiry(
+        &self,
+        plan: &mut InviteFailoverPlan,
+        expires_at: Instant,
+    ) -> bool {
+        plan.expires_at = expires_at;
+        plan.expiry_generation = plan.expiry_generation.wrapping_add(1).max(1);
+        let scheduled = self
+            .invite_failover_expiry_scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .schedule(plan.id, plan.expiry_generation, plan.expires_at, plan.phase);
+        if !scheduled {
+            error!(
+                plan_id = plan.id,
+                "Retained initial-INVITE expiry scheduler reached its hard capacity"
+            );
+        }
+        scheduled
+    }
+
+    pub(crate) async fn prune_invite_failover_state(&self) {
+        let now = Instant::now();
+        // Dialog cleanup has a reserved share of the bounded maintenance
+        // budget so sustained expiry churn cannot starve heavy-state
+        // compaction, while ordinary protocol expiry always retains the
+        // remaining share.
+        let cleanup_due = self
+            .invite_failover_expiry_scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_due_dialog_cleanup(now, INVITE_FAILOVER_DIALOG_CLEANUP_BATCH);
+        let cleanup_attempts = cleanup_due.len();
+        for cleanup in cleanup_due {
+            match self.try_apply_invite_failover_dialog_cleanup(&cleanup) {
+                InviteFailoverDialogCleanupOutcome::Busy => {
+                    let plan_id = cleanup.key.plan_id;
+                    let restored = self
+                        .invite_failover_expiry_scheduler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .restore_dialog_cleanup_after_busy(
+                            cleanup,
+                            Instant::now() + INVITE_FAILOVER_EXPIRY_BUSY_RETRY,
+                        );
+                    if !restored {
+                        error!(
+                            plan_id,
+                            "Retained initial-INVITE dialog cleanup retry reached its hard capacity"
+                        );
+                    }
+                }
+                InviteFailoverDialogCleanupOutcome::Complete
+                | InviteFailoverDialogCleanupOutcome::Stale => {}
+            }
+        }
+
+        let expiry_budget = INVITE_FAILOVER_EXPIRY_BATCH.saturating_sub(cleanup_attempts);
+        let due = self
+            .invite_failover_expiry_scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_due(now, expiry_budget);
+        for mut expiry in due {
+            match self.try_remove_scheduled_invite_failover_plan(
+                expiry.key.plan_id,
+                expiry.key.generation,
+                false,
+            ) {
+                InviteFailoverRemovalOutcome::Busy => {
+                    self.invite_failover_expiry_scheduler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .restore_after_busy(
+                            expiry,
+                            Instant::now() + INVITE_FAILOVER_EXPIRY_BUSY_RETRY,
+                        );
+                }
+                InviteFailoverRemovalOutcome::Deferred {
+                    wake_at,
+                    overflow_evictable,
+                } => {
+                    expiry.overflow_evictable = overflow_evictable;
+                    self.invite_failover_expiry_scheduler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .restore_after_busy(expiry, wake_at);
+                }
+                InviteFailoverRemovalOutcome::Removed
+                | InviteFailoverRemovalOutcome::Missing
+                | InviteFailoverRemovalOutcome::Stale
+                | InviteFailoverRemovalOutcome::NonExpiring => {}
+            }
+        }
+
+        // The registry normally cannot exceed its hard cap. Preserve the
+        // defensive overflow semantics for corrupted/restored state without
+        // scanning every plan: the scheduler has an exact ordered subset of
+        // non-active, non-wire-unknown tombstones.
+        let mut overflow_attempts = 0usize;
+        while self.invite_failover_plans.len() > self.invite_failover_plan_capacity
+            && overflow_attempts < INVITE_FAILOVER_EXPIRY_BATCH
+        {
+            let Some(mut expiry) = self
+                .invite_failover_expiry_scheduler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_oldest_overflow_evictable()
+            else {
+                break;
+            };
+            overflow_attempts += 1;
+            match self.try_remove_scheduled_invite_failover_plan(
+                expiry.key.plan_id,
+                expiry.key.generation,
+                true,
+            ) {
+                InviteFailoverRemovalOutcome::Busy => {
+                    self.invite_failover_expiry_scheduler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .restore_after_busy(expiry, now + INVITE_FAILOVER_EXPIRY_BUSY_RETRY);
+                }
+                InviteFailoverRemovalOutcome::Deferred {
+                    wake_at,
+                    overflow_evictable,
+                } => {
+                    expiry.overflow_evictable = overflow_evictable;
+                    self.invite_failover_expiry_scheduler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .restore_after_busy(expiry, wake_at);
+                }
+                InviteFailoverRemovalOutcome::Removed
+                | InviteFailoverRemovalOutcome::Missing
+                | InviteFailoverRemovalOutcome::Stale
+                | InviteFailoverRemovalOutcome::NonExpiring => {}
+            }
+        }
+    }
+
+    fn try_apply_invite_failover_dialog_cleanup(
+        &self,
+        cleanup: &InviteFailoverScheduledDialogCleanup,
+    ) -> InviteFailoverDialogCleanupOutcome {
+        let Some(expected_plan) = cleanup.plan.upgrade() else {
+            return InviteFailoverDialogCleanupOutcome::Stale;
+        };
+        let Some(registered_plan) = self
+            .invite_failover_plans
+            .get(&cleanup.key.plan_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return InviteFailoverDialogCleanupOutcome::Stale;
+        };
+        if !std::sync::Arc::ptr_eq(&registered_plan, &expected_plan) {
+            return InviteFailoverDialogCleanupOutcome::Stale;
+        }
+        let Ok(mut plan) = expected_plan.try_lock() else {
+            return InviteFailoverDialogCleanupOutcome::Busy;
+        };
+        if plan.id != cleanup.key.plan_id || plan.dialog_id != cleanup.dialog_id {
+            return InviteFailoverDialogCleanupOutcome::Stale;
+        }
+
+        // Wire-unknown teardown remains dialog-addressed and non-expiring.
+        // Consume only the retry; preserve its phase, current transaction,
+        // reverse indexes, and capacity charge for legal CANCEL/BYE recovery.
+        if plan.phase == InviteFailoverPlanPhase::WireUnknown {
+            self.schedule_invite_failover_plan_expiry(
+                &mut plan,
+                Instant::now() + INVITE_FAILOVER_PLAN_TTL,
+            );
+            return InviteFailoverDialogCleanupOutcome::Complete;
+        }
+
+        if plan.phase == InviteFailoverPlanPhase::Active {
+            plan.transition_to_terminal(InviteFailoverPlanPhase::Cancelled);
+        } else {
+            // Restored or test-injected terminal state may still carry the
+            // active-only payload. Reapplying its phase compacts idempotently.
+            let phase = plan.phase;
+            plan.transition_to_terminal(phase);
+        }
+        self.schedule_invite_failover_plan_expiry(
+            &mut plan,
+            Instant::now() + INVITE_FAILOVER_PLAN_TTL,
+        );
+        let attempts = plan.attempt_transaction_ids();
+
+        // Removing active ownership during synchronous dialog cleanup
+        // linearizes the attempt set. These exact unlinks are idempotent and
+        // ensure a captured pre-cleanup route cannot keep the dialog alive.
+        for transaction_id in &attempts {
+            self.unlink_transaction_from_dialog_indexed(transaction_id.as_ref());
+        }
+
+        let _registry = self
+            .invite_failover_registry_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let still_registered = self
+            .invite_failover_plans
+            .get(&cleanup.key.plan_id)
+            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.value(), &expected_plan));
+        if !still_registered {
+            return InviteFailoverDialogCleanupOutcome::Stale;
+        }
+        self.unindex_invite_failover_plan_locked(&cleanup.dialog_id, cleanup.key.plan_id);
+        for transaction_id in attempts {
+            if self
+                .invite_failover_attempts
+                .get(transaction_id.as_ref())
+                .is_some_and(|attempt| {
+                    attempt.plan_id == cleanup.key.plan_id && attempt.dialog_id == cleanup.dialog_id
+                })
+            {
+                self.unindex_invite_failover_attempt_locked(
+                    &cleanup.dialog_id,
+                    transaction_id.as_ref(),
+                );
+            }
+        }
+        InviteFailoverDialogCleanupOutcome::Complete
+    }
+
+    fn try_remove_invite_failover_plan(&self, plan_id: u64) {
+        let _ = self.try_remove_invite_failover_plan_inner(plan_id, None, false);
+    }
+
+    fn try_remove_scheduled_invite_failover_plan(
+        &self,
+        plan_id: u64,
+        generation: u64,
+        permit_overflow: bool,
+    ) -> InviteFailoverRemovalOutcome {
+        self.try_remove_invite_failover_plan_inner(plan_id, Some(generation), permit_overflow)
+    }
+
+    fn try_remove_invite_failover_plan_inner(
+        &self,
+        plan_id: u64,
+        expected_generation: Option<u64>,
+        permit_overflow: bool,
+    ) -> InviteFailoverRemovalOutcome {
+        let Some(plan) = self
+            .invite_failover_plans
+            .get(&plan_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return InviteFailoverRemovalOutcome::Missing;
+        };
+        let Ok(mut plan_guard) = plan.try_lock() else {
+            return InviteFailoverRemovalOutcome::Busy;
+        };
+        let _registry = self
+            .invite_failover_registry_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let still_registered = self
+            .invite_failover_plans
+            .get(&plan_id)
+            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.value(), &plan));
+        if !still_registered {
+            return InviteFailoverRemovalOutcome::Missing;
+        }
+        if expected_generation.is_some_and(|generation| generation != plan_guard.expiry_generation)
+        {
+            return InviteFailoverRemovalOutcome::Stale;
+        }
+        let expired = plan_guard.expires_at <= Instant::now();
+        if plan_guard.phase == InviteFailoverPlanPhase::WireUnknown {
+            return InviteFailoverRemovalOutcome::NonExpiring;
+        }
+        let evictable_overflow = permit_overflow
+            && plan_guard.phase.is_overflow_evictable()
+            && self.invite_failover_plans.len() > self.invite_failover_plan_capacity;
+        if !expired && !evictable_overflow {
+            return InviteFailoverRemovalOutcome::Deferred {
+                wake_at: plan_guard.expires_at,
+                overflow_evictable: plan_guard.phase.is_overflow_evictable(),
+            };
+        }
+        let dialog_id = plan_guard.dialog_id.clone();
+        let reserved_attempt_slots = plan_guard.reserved_attempt_slots;
+        let attempts = plan_guard.attempt_transaction_ids();
+
+        // The plan remains locked until every owner/index is detached and its
+        // reservation is released. A worker that captured this Arc before the
+        // prune therefore observes a non-active generation and cannot advance
+        // an orphan after capacity has been returned.
+        let terminal_phase = if plan_guard.phase == InviteFailoverPlanPhase::Active {
+            InviteFailoverPlanPhase::Closed
+        } else {
+            plan_guard.phase
+        };
+        plan_guard.transition_to_terminal(terminal_phase);
+        self.active_invite_failover_by_dialog
+            .remove_if(&dialog_id, |_, active_plan_id| *active_plan_id == plan_id);
+
+        for transaction_id in attempts {
+            self.remove_invite_failover_attempt_locked(transaction_id.as_ref(), Some(plan_id));
+            self.unlink_transaction_from_dialog_indexed(transaction_id.as_ref());
+        }
+        if self.invite_failover_plans.remove(&plan_id).is_none() {
+            return InviteFailoverRemovalOutcome::Missing;
+        }
+        self.invite_failover_expiry_scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(plan_id);
+        self.unindex_invite_failover_plan_locked(&dialog_id, plan_id);
+        Self::release_invite_failover_reservation(&self.invite_failover_plan_reservations, 1);
+        Self::release_invite_failover_reservation(
+            &self.invite_failover_attempt_reservations,
+            reserved_attempt_slots,
+        );
+        InviteFailoverRemovalOutcome::Removed
+    }
+
+    pub(crate) fn remove_invite_failover_state_for_dialog(&self, dialog_id: &DialogId) {
+        // Detach the normal dialog indexes, but deliberately retain the
+        // bounded failover tombstone. A forked 2xx can arrive after the
+        // application removes a cancelled/failed dialog and still requires
+        // an authenticated ACK followed by one BYE. Removing the active
+        // ownership entry prevents any further candidate advancement. The
+        // retained reverse indexes make this work proportional only to this
+        // dialog, even when its plan mutex is temporarily busy.
+        let (plan_ids, attempts) = {
+            let _registry = self
+                .invite_failover_registry_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.active_invite_failover_by_dialog.remove(dialog_id);
+            (
+                self.invite_failover_plan_ids_for_dialog(dialog_id),
+                self.invite_failover_attempt_ids_for_dialog(dialog_id),
+            )
+        };
+        // Ordinary terminal plans remain reachable by their exact transaction
+        // keys for late/forked 2xx processing. Once the dialog itself is
+        // detached, retaining the two dialog-keyed reverse indexes duplicates
+        // every plan/attempt key for the full failover TTL without serving a
+        // protocol lookup. Wire-unknown plans are the exception: their
+        // cancellation/recovery API is deliberately dialog-addressed, so they
+        // keep both reverse indexes until exact teardown completes.
+        let mut terminal_reverse_indexes = Vec::new();
+        for plan_id in plan_ids {
+            if let Some(plan) = self
+                .invite_failover_plans
+                .get(&plan_id)
+                .map(|entry| entry.value().clone())
+            {
+                if let Ok(mut plan) = plan.try_lock() {
+                    if plan.phase == InviteFailoverPlanPhase::Active {
+                        plan.transition_to_terminal(InviteFailoverPlanPhase::Cancelled);
+                    }
+                    self.schedule_invite_failover_plan_expiry(
+                        &mut plan,
+                        Instant::now() + INVITE_FAILOVER_PLAN_TTL,
+                    );
+                    if plan.phase != InviteFailoverPlanPhase::WireUnknown {
+                        terminal_reverse_indexes.push((plan.id, plan.attempt_transaction_ids()));
+                    }
+                } else {
+                    // Dialog removal is synchronous and must never await a
+                    // candidate worker that owns this plan. Publish one exact,
+                    // bounded retry while the registry is stable; the manager
+                    // maintenance task will compact it after the lock is free.
+                    let scheduled = {
+                        let _registry = self
+                            .invite_failover_registry_lock
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let still_registered = self
+                            .invite_failover_plans
+                            .get(&plan_id)
+                            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.value(), &plan));
+                        let still_indexed = self
+                            .invite_failover_plans_by_dialog
+                            .get(dialog_id)
+                            .is_some_and(|plan_ids| plan_ids.contains(&plan_id));
+                        if self.is_accepting_work() && still_registered && still_indexed {
+                            self.invite_failover_expiry_scheduler
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .schedule_dialog_cleanup(
+                                    plan_id,
+                                    dialog_id,
+                                    std::sync::Arc::downgrade(&plan),
+                                    Instant::now(),
+                                )
+                        } else {
+                            true
+                        }
+                    };
+                    if !scheduled {
+                        error!(
+                            plan_id,
+                            "Retained initial-INVITE dialog cleanup retry reached its hard capacity"
+                        );
+                    }
+                }
+            }
+        }
+        for transaction_id in &attempts {
+            self.transaction_to_dialog
+                .remove_if(transaction_id, |_, mapped| mapped == dialog_id);
+        }
+
+        if !terminal_reverse_indexes.is_empty() {
+            let _registry = self
+                .invite_failover_registry_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (plan_id, transaction_ids) in terminal_reverse_indexes {
+                self.unindex_invite_failover_plan_locked(dialog_id, plan_id);
+                for transaction_id in transaction_ids {
+                    self.unindex_invite_failover_attempt_locked(dialog_id, transaction_id.as_ref());
+                }
+            }
+        }
+    }
+
+    fn invite_failover_event_transaction_id(event: &TransactionEvent) -> Option<&TransactionKey> {
+        match event {
+            TransactionEvent::ProvisionalResponse { transaction_id, .. }
+            | TransactionEvent::SuccessResponse { transaction_id, .. }
+            | TransactionEvent::FailureResponse { transaction_id, .. }
+            | TransactionEvent::TransactionTimeout { transaction_id }
+            | TransactionEvent::TransportError { transaction_id }
+            | TransactionEvent::TransactionTerminated { transaction_id }
+            | TransactionEvent::StateChanged { transaction_id, .. } => Some(transaction_id),
+            TransactionEvent::Error {
+                transaction_id: Some(transaction_id),
+                ..
+            } => Some(transaction_id),
+            _ => None,
+        }
+    }
+
+    async fn emit_invite_internal_failure(
+        &self,
+        dialog_id: DialogId,
+        transaction_id: TransactionKey,
+    ) {
+        if self.get_session_id(&dialog_id).is_none() {
+            return;
+        }
+        if let Err(error) = self
+            .notify_session_layer(SessionCoordinationEvent::RequestFailed {
+                dialog_id: Some(dialog_id),
+                transaction_id,
+                status_code: 500,
+                reason_phrase: "Local transaction processing failed".to_string(),
+                method: Method::Invite.to_string(),
+            })
+            .await
+        {
+            warn!(
+                error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&error),
+                "Failed to deliver exact initial-INVITE internal failure"
+            );
+        }
+    }
+
+    fn close_active_invite_failover_plan(
+        &self,
+        plan: &mut InviteFailoverPlan,
+        phase: InviteFailoverPlanPhase,
+    ) {
+        plan.transition_to_terminal(phase);
+        self.schedule_invite_failover_plan_expiry(plan, Instant::now() + INVITE_FAILOVER_PLAN_TTL);
+        let _registry = self
+            .invite_failover_registry_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.active_invite_failover_by_dialog
+            .remove_if(&plan.dialog_id, |_, active_plan_id| {
+                *active_plan_id == plan.id
+            });
+    }
+
+    async fn advance_invite_failover_plan(
+        &self,
+        plan: &std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+        completed_transaction: &TransactionKey,
+        outcome: InviteFailoverAttemptOutcome,
+    ) -> bool {
+        let Some(_operation) = self.enter_invite_failover_operation() else {
+            let mut plan = plan.lock().await;
+            if plan.phase == InviteFailoverPlanPhase::Active {
+                self.close_active_invite_failover_plan(&mut plan, InviteFailoverPlanPhase::Closed);
+            }
+            return false;
+        };
+        {
+            let mut plan = plan.lock().await;
+            let owner_is_current = self
+                .active_invite_failover_by_dialog
+                .get(&plan.dialog_id)
+                .is_some_and(|owner| *owner.value() == plan.id);
+            if plan.phase != InviteFailoverPlanPhase::Active
+                || !owner_is_current
+                || plan.current_transaction.as_deref() != Some(completed_transaction)
+            {
+                return false;
+            }
+            Self::set_invite_attempt_outcome(&mut plan, completed_transaction, outcome);
+            plan.current_transaction = None;
+            if let Some(active) = plan.active_payload.as_mut() {
+                active.current_candidate_index = None;
+                active.current_send_generation = None;
+            }
+        }
+
+        let candidate_index = {
+            let mut plan = plan.lock().await;
+            if plan.phase != InviteFailoverPlanPhase::Active {
+                return false;
+            }
+            let next_candidate_index = plan
+                .active_payload
+                .as_ref()
+                .map_or(0, |active| active.next_candidate_index);
+            if next_candidate_index >= plan.candidate_count() {
+                self.close_active_invite_failover_plan(
+                    &mut plan,
+                    InviteFailoverPlanPhase::Exhausted,
+                );
+                return false;
+            }
+            next_candidate_index
+        };
+        match self.send_invite_failover_candidate(plan).await {
+            Ok((transaction_id, destination)) => {
+                let plan_id = plan.lock().await.id;
+                debug!(
+                    plan_id,
+                    candidate_index,
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id),
+                    %destination,
+                    "Advanced retained initial-INVITE failover plan"
+                );
+                true
+            }
+            Err(InviteCandidateSendError::Fatal(error)) => {
+                let plan_id = plan.lock().await.id;
+                warn!(
+                    plan_id,
+                    candidate_index,
+                    error_class = error.diagnostic_class(),
+                    "Retained initial-INVITE failover stopped on non-transport failure"
+                );
+                false
+            }
+            Err(InviteCandidateSendError::WireUnknown(error)) => {
+                let plan_id = plan.lock().await.id;
+                warn!(
+                    plan_id,
+                    candidate_index,
+                    error_class = error.diagnostic_class(),
+                    "Retained initial-INVITE failover stopped with wire outcome unknown"
+                );
+                false
+            }
+        }
+    }
+
+    fn local_sent_by_for_request(request: &Request) -> Option<SocketAddr> {
+        request.first_via().and_then(|via| {
+            via.0.first().and_then(|via_header| {
+                let Host::Address(address) = via_header.host() else {
+                    return None;
+                };
+                let default_port = if via_header
+                    .sent_protocol
+                    .transport
+                    .eq_ignore_ascii_case("TLS")
+                {
+                    5061
+                } else {
+                    5060
+                };
+                Some(SocketAddr::new(
+                    *address,
+                    via_header.port().unwrap_or(default_port),
+                ))
+            })
+        })
+    }
+
+    async fn start_bye_for_late_invite_success(
+        &self,
+        invite_transaction: &TransactionKey,
+        response: &Response,
+    ) -> DialogResult<TransactionKey> {
+        let ack = self
+            .transaction_manager
+            .create_ack_for_2xx(invite_transaction, response)
+            .await
+            .map_err(|_| crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("late_invite_bye_template", "transaction_error"),
+            })?;
+        let from = ack.from().ok_or_else(|| {
+            crate::errors::DialogError::routing_error("late 2xx ACK missing From")
+        })?;
+        let to = ack
+            .to()
+            .ok_or_else(|| crate::errors::DialogError::routing_error("late 2xx ACK missing To"))?;
+        let call_id = ack.call_id().ok_or_else(|| {
+            crate::errors::DialogError::routing_error("late 2xx ACK missing Call-ID")
+        })?;
+        let cseq = ack
+            .cseq()
+            .and_then(|cseq| cseq.seq.checked_add(1))
+            .ok_or_else(|| crate::errors::DialogError::routing_error("late 2xx CSeq overflow"))?;
+        let local_address = Self::local_sent_by_for_request(&ack).ok_or_else(|| {
+            crate::errors::DialogError::routing_error("late 2xx ACK has no numeric Via sent-by")
+        })?;
+        let from_tag = from.tag().ok_or_else(|| {
+            crate::errors::DialogError::routing_error("late 2xx ACK missing From tag")
+        })?;
+        let to_tag = to.tag().ok_or_else(|| {
+            crate::errors::DialogError::routing_error("late 2xx ACK missing To tag")
+        })?;
+
+        let mut bye = ByeBuilder::from_dialog_enhanced(
+            call_id.as_str(),
+            from.address().uri.to_string(),
+            from_tag,
+            to.address().uri.to_string(),
+            to_tag,
+            ack.uri().to_string(),
+            cseq,
+            local_address,
+            Vec::new(),
+        )
+        .via_transport(ack.first_via_transport().unwrap_or("UDP"))
+        .build()
+        .map_err(|_| crate::errors::DialogError::TransactionError {
+            message: safe_operation_failure("late_invite_bye_build", "transaction_error"),
+        })?;
+        bye.headers.extend(
+            ack.headers
+                .iter()
+                .filter(|header| header.name().wire_eq(&HeaderName::Route))
+                .cloned(),
+        );
+
+        let mut route = self
+            .transaction_manager
+            .transaction_route(invite_transaction)
+            .await
+            .ok_or_else(|| crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("late_invite_bye_route", "transaction_not_found"),
+            })?;
+        let next_hop =
+            crate::transaction::transport::multiplexed::exact_next_hop_uri_for_request(&bye)
+                .map_err(|_| crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("late_invite_bye_route", "invalid_route"),
+                })?;
+        let next_hop_authority = match &next_hop.host {
+            Host::Domain(domain) => rvoip_sip_transport::TransportAuthority::dns(domain.clone())
+                .map_err(|_| crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("late_invite_bye_route", "invalid_authority"),
+                })?,
+            Host::Address(address) => rvoip_sip_transport::TransportAuthority::ip(*address),
+        };
+        if let Some(destination) =
+            crate::transaction::manager::utils::socket_addr_from_uri(&next_hop)
+        {
+            if route.destination != destination {
+                route.destination = destination;
+                route.flow_id = None;
+                route.authority = Some(next_hop_authority);
+            }
+        } else {
+            let same_authority = route.authority.as_ref() == Some(&next_hop_authority);
+            let same_explicit_port = next_hop
+                .port
+                .is_none_or(|port| port == route.destination.port());
+            if !same_authority || !same_explicit_port {
+                let target = self
+                    .resolve_uri_to_candidates(&next_hop)
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| crate::errors::DialogError::TransactionError {
+                        message: safe_operation_failure("late_invite_bye_route", "no_candidates"),
+                    })?;
+                route.destination = target.addr;
+                route.transport_type = Some(target.transport);
+                route.authority = target.authority.or(Some(next_hop_authority));
+                route.flow_id = None;
+            }
+        }
+
+        let bye_transaction = self
+            .transaction_manager
+            .create_client_transaction_on_route(bye, route)
+            .await
+            .map_err(|_| crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("late_invite_bye_create", "transaction_error"),
+            })?;
+        if self
+            .transaction_manager
+            .send_request(&bye_transaction)
+            .await
+            .is_err()
+        {
+            let _ = self
+                .transaction_manager
+                .terminate_transaction(&bye_transaction)
+                .await;
+            return Err(crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("late_invite_bye_send", "transport_error"),
+            });
+        }
+
+        Ok(bye_transaction)
+    }
+
+    async fn wait_for_late_invite_bye_success(
+        &self,
+        bye_transaction: &TransactionKey,
+    ) -> DialogResult<()> {
+        // `send_request` confirms the exact first transport write; it does not
+        // mean that the remote fork accepted the BYE. Wait on the
+        // transaction-keyed completion authority rather than allocating a
+        // global observational subscription. The completion is retained past
+        // runner removal, so both response-before-wait and
+        // response-versus-removal races are covered.
+        let completion_deadline = self
+            .transaction_manager
+            .timer_settings()
+            .transaction_timeout
+            .saturating_add(Duration::from_millis(100));
+        let outcome = self
+            .transaction_manager
+            .wait_for_client_transaction_outcome(bye_transaction, completion_deadline)
+            .await
+            .map_err(|_| crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("late_invite_bye_completion", "transaction_error"),
+            })?;
+
+        match outcome {
+            Some(crate::transaction::ClientTransactionOutcome::FinalResponse(response))
+                if (200..300).contains(&response.status().as_u16()) =>
+            {
+                Ok(())
+            }
+            Some(crate::transaction::ClientTransactionOutcome::FinalResponse(_)) => {
+                Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure(
+                        "late_invite_bye_completion",
+                        "non_success_response",
+                    ),
+                })
+            }
+            Some(crate::transaction::ClientTransactionOutcome::Failure(_)) => {
+                Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure(
+                        "late_invite_bye_completion",
+                        "terminal_failure",
+                    ),
+                })
+            }
+            None => {
+                // The transaction timer should normally publish its typed
+                // failure before this guard expires. If it does not, force
+                // local cleanup and leave the fork tag uncommitted so a
+                // retransmitted late 2xx can retry ACK-then-BYE.
+                let _ = self
+                    .transaction_manager
+                    .terminate_transaction(bye_transaction)
+                    .await;
+                Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("late_invite_bye_completion", "timeout"),
+                })
+            }
+        }
+    }
+
+    async fn acknowledge_and_cleanup_late_invite_success(
+        &self,
+        plan_arc: &std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+        plan: &mut InviteFailoverPlan,
+        transaction_id: &TransactionKey,
+        response: &Response,
+    ) {
+        if let Err(error) = self
+            .transaction_manager
+            .send_ack_for_2xx(transaction_id, response)
+            .await
+        {
+            warn!(
+                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&error),
+                "Failed to ACK late or duplicate initial-INVITE success"
+            );
+            // RFC 3261 requires the 2xx ACK before terminating a
+            // non-selected fork. Leave the tag unmarked so a retransmitted
+            // 2xx serially retries the complete ACK-then-BYE cleanup.
+            return;
+        }
+
+        let Some(to_tag) = response.to().and_then(|to| to.tag()).map(str::to_owned) else {
+            warn!(
+                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                "Cannot terminate late initial-INVITE fork without a To tag"
+            );
+            return;
+        };
+        if plan.is_cleaned_fork(&to_tag) {
+            return;
+        }
+        if plan.is_fork_cleanup_in_flight(&to_tag) {
+            // Every retransmitted 2xx still receives the ACK above. The
+            // existing BYE owns cleanup until its exact final outcome is
+            // known; do not create a parallel transaction for the same fork.
+            return;
+        }
+
+        let Some(cleanup_operation) = self.enter_invite_failover_operation() else {
+            return;
+        };
+        plan.mark_fork_cleanup_in_flight(to_tag.clone());
+
+        // Start the compensating BYE before returning from the authoritative
+        // late-2xx handler. This preserves the event-path ordering contract:
+        // once handling completes, the exact BYE transaction is registered
+        // and its first transport write has either succeeded or cleanup has
+        // already been left retryable. Only the potentially long final-response
+        // wait runs in the drain-tracked background operation.
+        let bye_transaction = match self
+            .start_bye_for_late_invite_success(transaction_id, response)
+            .await
+        {
+            Ok(transaction_id) => transaction_id,
+            Err(error) => {
+                plan.clear_fork_cleanup_in_flight(&to_tag);
+                warn!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    error_class = error.diagnostic_class(),
+                    "Failed to start termination of a non-selected initial-INVITE fork"
+                );
+                return;
+            }
+        };
+
+        let manager = self.clone();
+        let plan_arc = plan_arc.clone();
+        let invite_transaction = transaction_id.clone();
+        tokio::spawn(async move {
+            let _cleanup_operation = cleanup_operation;
+            let result = manager
+                .wait_for_late_invite_bye_success(&bye_transaction)
+                .await;
+            let mut plan = plan_arc.lock().await;
+            plan.clear_fork_cleanup_in_flight(&to_tag);
+
+            match result {
+                Ok(()) => {
+                    plan.mark_cleaned_fork(to_tag);
+                    info!(
+                        invite_transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&invite_transaction),
+                        bye_transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&bye_transaction),
+                        "ACKed and terminated a non-selected initial-INVITE fork"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&invite_transaction),
+                        error_class = error.diagnostic_class(),
+                        "Failed to terminate a non-selected initial-INVITE fork"
+                    );
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn handle_invite_failover_event(
+        &self,
+        event: &TransactionEvent,
+    ) -> InviteFailoverEventDisposition {
+        let Some(transaction_id) = Self::invite_failover_event_transaction_id(event) else {
+            return InviteFailoverEventDisposition::Continue;
+        };
+        let Some(attempt_index) = self
+            .invite_failover_attempts
+            .get(transaction_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return InviteFailoverEventDisposition::Continue;
+        };
+        let Some(plan_arc) = self
+            .invite_failover_plans
+            .get(&attempt_index.plan_id)
+            .map(|entry| entry.value().clone())
+        else {
+            let _registry = self
+                .invite_failover_registry_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.unindex_invite_failover_plan_locked(
+                &attempt_index.dialog_id,
+                attempt_index.plan_id,
+            );
+            self.remove_invite_failover_attempt_locked(transaction_id, Some(attempt_index.plan_id));
+            return InviteFailoverEventDisposition::Continue;
+        };
+        let mut plan = plan_arc.lock().await;
+        // The exact transaction-keyed attempt map is authoritative. Keeping
+        // and scanning a second candidate/outcome history in every terminal
+        // plan added duplicate ownership without strengthening this check.
+        if plan.id != attempt_index.plan_id || plan.dialog_id != attempt_index.dialog_id {
+            let _registry = self
+                .invite_failover_registry_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.remove_invite_failover_attempt_locked(transaction_id, Some(attempt_index.plan_id));
+            return InviteFailoverEventDisposition::Continue;
+        }
+
+        let is_current = plan.current_transaction.as_deref() == Some(transaction_id);
+        let plan_is_active = plan.phase == InviteFailoverPlanPhase::Active
+            && self
+                .active_invite_failover_by_dialog
+                .get(&plan.dialog_id)
+                .is_some_and(|active_plan_id| *active_plan_id.value() == plan.id);
+        match event {
+            TransactionEvent::ProvisionalResponse { .. } => {
+                if plan_is_active && is_current {
+                    if let Some(active) = plan.active_payload.as_mut() {
+                        active.provisional_seen = true;
+                    }
+                    InviteFailoverEventDisposition::Continue
+                } else {
+                    InviteFailoverEventDisposition::Consumed
+                }
+            }
+            TransactionEvent::SuccessResponse { response, .. } => {
+                let response_tag = response.to().and_then(|to| to.tag()).map(str::to_owned);
+                if plan.phase == InviteFailoverPlanPhase::WireUnknown
+                    && is_current
+                    && plan.accepted_transaction.is_none()
+                    && matches!(
+                        plan.cancel_dispatch_state,
+                        InviteCancelDispatchState::Sent | InviteCancelDispatchState::WireUnknown
+                    )
+                {
+                    // A 2xx racing a locally-owned CANCEL wins the SIP dialog
+                    // race but not teardown intent. Route the exact selected
+                    // response through the canonical ACK/lifecycle path; the
+                    // retained teardown supervisor observes Confirmed and
+                    // emits the sole BYE. Other To-tags remain fork cleanup.
+                    plan.accepted_candidate_index = Some(attempt_index.candidate_index);
+                    plan.accepted_transaction = Some(std::sync::Arc::new(transaction_id.clone()));
+                    plan.accepted_to_tag = response_tag.clone();
+                    if let Some(claim) = attempt_index.selected_success_delivery.claim() {
+                        return InviteFailoverEventDisposition::ContinueSelectedSuccess(claim);
+                    }
+                }
+                if plan_is_active && is_current {
+                    Self::set_invite_attempt_outcome(
+                        &mut plan,
+                        transaction_id,
+                        InviteFailoverAttemptOutcome::Accepted,
+                    );
+                    plan.accepted_candidate_index = Some(attempt_index.candidate_index);
+                    plan.accepted_transaction = plan.current_transaction.clone();
+                    plan.accepted_to_tag = response_tag;
+                    self.close_active_invite_failover_plan(
+                        &mut plan,
+                        InviteFailoverPlanPhase::Accepted,
+                    );
+                    if let Some(claim) = attempt_index.selected_success_delivery.claim() {
+                        return InviteFailoverEventDisposition::ContinueSelectedSuccess(claim);
+                    }
+                    if let Err(error) = self
+                        .transaction_manager
+                        .send_ack_for_2xx(transaction_id, response)
+                        .await
+                    {
+                        warn!(
+                            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                            error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&error),
+                            "Failed to re-ACK concurrently selected initial-INVITE success"
+                        );
+                    }
+                    InviteFailoverEventDisposition::Consumed
+                } else if plan.accepted_to_tag == response_tag
+                    && (response_tag.is_some()
+                        || plan.accepted_transaction.as_deref() == Some(transaction_id))
+                {
+                    // A failed ACK write or failed acknowledged session
+                    // delivery releases the exact selected attempt back to
+                    // Pending. Let the identical retransmission traverse the
+                    // canonical response path again until both have committed.
+                    if plan.accepted_transaction.as_deref() == Some(transaction_id) {
+                        if let Some(claim) = attempt_index.selected_success_delivery.claim() {
+                            return InviteFailoverEventDisposition::ContinueSelectedSuccess(claim);
+                        }
+                    }
+
+                    // While another worker owns delivery, or after delivery
+                    // has committed, retransmitted 2xx still require an ACK
+                    // but must not re-enter the application lifecycle. The
+                    // same non-empty To-tag on an older failover transaction
+                    // is the already-selected dialog, not a new fork; it is
+                    // likewise re-ACKed without a compensating BYE.
+                    if let Err(error) = self
+                        .transaction_manager
+                        .send_ack_for_2xx(transaction_id, response)
+                        .await
+                    {
+                        warn!(
+                            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                            error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&error),
+                            "Failed to re-ACK duplicate selected initial-INVITE success"
+                        );
+                    }
+                    InviteFailoverEventDisposition::Consumed
+                } else {
+                    self.acknowledge_and_cleanup_late_invite_success(
+                        &plan_arc,
+                        &mut plan,
+                        transaction_id,
+                        response,
+                    )
+                    .await;
+                    InviteFailoverEventDisposition::Consumed
+                }
+            }
+            TransactionEvent::FailureResponse { response, .. } => {
+                // A locally initiated CANCEL retains the exact current INVITE
+                // while its send receipt is classified, so failover, 487, and
+                // late 2xx serialize on this same plan mutex. The matching 487
+                // still belongs to the selected INVITE and must reach normal
+                // dialog processing, which publishes the terminal outcome.
+                // Its exact-attempt delivery claim suppresses retransmission
+                // duplicates but reopens if authoritative session routing
+                // fails. Legacy Cancelled plans retire the current slot here;
+                // lifecycle-owned WireUnknown plans keep it until the terminal
+                // supervisor releases the exact owner.
+                if matches!(
+                    plan.phase,
+                    InviteFailoverPlanPhase::Cancelled | InviteFailoverPlanPhase::WireUnknown
+                ) && is_current
+                    && response.status_code() == 487
+                {
+                    if plan.phase == InviteFailoverPlanPhase::Cancelled {
+                        plan.current_transaction = None;
+                    }
+                    return attempt_index
+                        .cancel_terminal_delivery
+                        .claim()
+                        .map_or(InviteFailoverEventDisposition::Consumed, |claim| {
+                            InviteFailoverEventDisposition::ContinueCancelTerminal(claim)
+                        });
+                }
+
+                if !plan_is_active || !is_current {
+                    return InviteFailoverEventDisposition::Consumed;
+                }
+
+                let (provisional_seen, next_candidate_index) =
+                    plan.active_payload.as_ref().map_or((true, 0), |active| {
+                        (active.provisional_seen, active.next_candidate_index)
+                    });
+                if response.status_code() == 503 && !provisional_seen {
+                    if next_candidate_index < plan.candidate_count() {
+                        drop(plan);
+                        if self
+                            .advance_invite_failover_plan(
+                                &plan_arc,
+                                transaction_id,
+                                InviteFailoverAttemptOutcome::ServiceUnavailable,
+                            )
+                            .await
+                        {
+                            return InviteFailoverEventDisposition::Consumed;
+                        }
+                        return InviteFailoverEventDisposition::Continue;
+                    }
+                    Self::set_invite_attempt_outcome(
+                        &mut plan,
+                        transaction_id,
+                        InviteFailoverAttemptOutcome::ServiceUnavailable,
+                    );
+                    self.close_active_invite_failover_plan(
+                        &mut plan,
+                        InviteFailoverPlanPhase::Exhausted,
+                    );
+                } else {
+                    Self::set_invite_attempt_outcome(
+                        &mut plan,
+                        transaction_id,
+                        InviteFailoverAttemptOutcome::FinalResponse,
+                    );
+                    self.close_active_invite_failover_plan(
+                        &mut plan,
+                        InviteFailoverPlanPhase::Closed,
+                    );
+                }
+                InviteFailoverEventDisposition::Continue
+            }
+            TransactionEvent::TransactionTimeout { .. }
+            | TransactionEvent::TransportError { .. } => {
+                if !plan_is_active || !is_current {
+                    return InviteFailoverEventDisposition::Consumed;
+                }
+                let outcome = if matches!(event, TransactionEvent::TransactionTimeout { .. }) {
+                    InviteFailoverAttemptOutcome::TransactionTimeout
+                } else {
+                    InviteFailoverAttemptOutcome::TransportError
+                };
+                let (provisional_seen, next_candidate_index) =
+                    plan.active_payload.as_ref().map_or((true, 0), |active| {
+                        (active.provisional_seen, active.next_candidate_index)
+                    });
+                if INVITE_TIMEOUT_FAILOVER_ENABLED
+                    && !provisional_seen
+                    && next_candidate_index < plan.candidate_count()
+                {
+                    drop(plan);
+                    if self
+                        .advance_invite_failover_plan(&plan_arc, transaction_id, outcome)
+                        .await
+                    {
+                        InviteFailoverEventDisposition::Consumed
+                    } else {
+                        InviteFailoverEventDisposition::Continue
+                    }
+                } else {
+                    Self::set_invite_attempt_outcome(&mut plan, transaction_id, outcome);
+                    self.close_active_invite_failover_plan(
+                        &mut plan,
+                        InviteFailoverPlanPhase::Closed,
+                    );
+                    InviteFailoverEventDisposition::Continue
+                }
+            }
+            TransactionEvent::Error {
+                transaction_id: Some(error_transaction_id),
+                ..
+            } if error_transaction_id == transaction_id => {
+                if !plan_is_active || !is_current {
+                    return InviteFailoverEventDisposition::Consumed;
+                }
+
+                let (provisional_seen, next_candidate_index) =
+                    plan.active_payload.as_ref().map_or((true, 0), |active| {
+                        (active.provisional_seen, active.next_candidate_index)
+                    });
+                if !provisional_seen && next_candidate_index < plan.candidate_count() {
+                    drop(plan);
+                    if self
+                        .advance_invite_failover_plan(
+                            &plan_arc,
+                            transaction_id,
+                            InviteFailoverAttemptOutcome::InternalError,
+                        )
+                        .await
+                    {
+                        return InviteFailoverEventDisposition::Consumed;
+                    }
+
+                    // A zero-wire failure while preparing the replacement may
+                    // have closed the plan. Surface one deterministic call
+                    // failure in that case. WireUnknown keeps its exact route
+                    // alive for a later final response and must not fail early.
+                    let terminal_dialog = {
+                        let plan = plan_arc.lock().await;
+                        matches!(
+                            plan.phase,
+                            InviteFailoverPlanPhase::Closed | InviteFailoverPlanPhase::Exhausted
+                        )
+                        .then(|| plan.dialog_id.clone())
+                    };
+                    if let Some(dialog_id) = terminal_dialog {
+                        self.emit_invite_internal_failure(dialog_id, transaction_id.clone())
+                            .await;
+                    }
+                    return InviteFailoverEventDisposition::Consumed;
+                }
+
+                Self::set_invite_attempt_outcome(
+                    &mut plan,
+                    transaction_id,
+                    InviteFailoverAttemptOutcome::InternalError,
+                );
+                let dialog_id = plan.dialog_id.clone();
+                let phase = if next_candidate_index >= plan.candidate_count() {
+                    InviteFailoverPlanPhase::Exhausted
+                } else {
+                    // A provisional response makes another resolver candidate
+                    // unsafe: the old branch may still establish a dialog.
+                    InviteFailoverPlanPhase::Closed
+                };
+                self.close_active_invite_failover_plan(&mut plan, phase);
+                drop(plan);
+                self.emit_invite_internal_failure(dialog_id, transaction_id.clone())
+                    .await;
+                InviteFailoverEventDisposition::Consumed
+            }
+            TransactionEvent::TransactionTerminated { .. }
+            | TransactionEvent::StateChanged {
+                new_state: TransactionState::Terminated,
+                ..
+            } => InviteFailoverEventDisposition::Consumed,
+            _ => InviteFailoverEventDisposition::Continue,
+        }
+    }
+
+    /// Find the newest outbound INVITE transaction for a dialog.
+    ///
+    /// A challenged initial INVITE (401/407) and its authenticated retry share
+    /// the same dialog record but are different transactions. RFC 3261 CANCEL
+    /// must target the currently pending INVITE transaction, so prefer the
+    /// mapped INVITE with the highest CSeq instead of returning an arbitrary
+    /// DashMap entry.
+    pub async fn find_latest_invite_transaction_for_dialog(
+        &self,
+        dialog_id: &DialogId,
+    ) -> Option<TransactionKey> {
+        use rvoip_sip_core::types::cseq::CSeq;
+
+        if let Some(plan_id) = self
+            .active_invite_failover_by_dialog
+            .get(dialog_id)
+            .map(|entry| *entry.value())
+        {
+            if let Some(plan) = self
+                .invite_failover_plans
+                .get(&plan_id)
+                .map(|entry| entry.value().clone())
+            {
+                let plan = plan.lock().await;
+                if plan.phase == InviteFailoverPlanPhase::Active {
+                    if let Some(transaction_id) = plan.current_transaction.clone() {
+                        debug!(
+                            plan_id,
+                            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id),
+                            dialog=%dialog_id,
+                            "Selected current retained initial-INVITE attempt for CANCEL"
+                        );
+                        return Some(transaction_id.as_ref().clone());
+                    }
+                }
+            }
+        }
+
+        let candidates: Vec<TransactionKey> = self
+            .dialog_invite_transactions
+            .get(dialog_id)
+            .map(|entry| {
+                entry
+                    .iter()
+                    .filter(|tx_key| {
+                        !tx_key.is_server()
+                            && self
+                                .transaction_to_dialog
+                                .get(tx_key)
+                                .is_some_and(|mapped| mapped.value() == dialog_id)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut best: Option<(u32, TransactionKey)> = None;
+        for tx_key in candidates {
+            let cseq = self
+                .transaction_manager
+                .original_request(&tx_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|request| request.typed_header::<CSeq>().map(|cseq| cseq.seq))
+                .unwrap_or_default();
+
+            match &best {
+                Some((best_cseq, _)) if cseq < *best_cseq => {}
+                _ => best = Some((cseq, tx_key)),
+            }
+        }
+
+        if let Some((cseq, tx_key)) = best {
+            debug!(
+                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_key),
+                dialog=%dialog_id,
+                cseq,
+                "Selected latest INVITE transaction for dialog"
+            );
+            Some(tx_key)
+        } else {
+            debug!(
+                "No outbound INVITE transaction found for dialog {}",
+                dialog_id
+            );
+            None
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_invite_with_auth(
+        &self,
+        dialog_id: &DialogId,
+        body: Option<bytes::Bytes>,
+        auth_header_name: &str,
+        auth_header_value: String,
+        extras: Vec<rvoip_sip_core::types::TypedHeader>,
+        from_display: Option<String>,
+        contact_override: Option<String>,
+    ) -> DialogResult<TransactionKey> {
+        let header_name = rvoip_sip_core::validation::authorization_header_name(auth_header_name)
+            .map_err(|_| {
+            crate::errors::DialogError::protocol_error(
+                "unsupported INVITE authorization header name",
+            )
+        })?;
+        let authorization = rvoip_sip_core::validation::validated_authorization_header(
+            header_name,
+            auth_header_value,
+        )
+        .map_err(|_| {
+            crate::errors::DialogError::protocol_error(
+                "INVITE authorization failed wire-safety validation",
+            )
+        })?;
+        self.send_invite_with_auth_options(
+            dialog_id,
+            crate::api::unified::InviteAuthRetryOptions {
+                sdp: body.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                authorization_headers: vec![authorization],
+                extra_headers: extras,
+                from_display,
+                contact_uri: contact_override,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// RFC 3261 §22.2 — authenticated retry of an initial INVITE.
+    ///
+    /// The caller's retained request options pass through unchanged, so the
+    /// retry keeps every structural choice of the first attempt: body,
+    /// application headers, Contact, outbound proxy, 100rel and the exact
+    /// RFC 5626 registered-flow routes. A challenged INVITE to a registered
+    /// contact must leave on the same flow as the original; re-resolving the
+    /// Request-URI would send it to an address behind the client's NAT.
+    pub async fn send_invite_with_auth_options(
+        &self,
+        dialog_id: &DialogId,
+        opts: crate::api::unified::InviteAuthRetryOptions,
+    ) -> DialogResult<TransactionKey> {
+        self.send_initial_invite_attempt_with_options(
+            dialog_id,
+            opts,
+            InitialInviteTimerPolicy::Configured,
+        )
+        .await
+    }
+
+    /// RFC 4028 §6 — resend an INVITE with a per-call `Session-Expires` /
+    /// `Min-SE` override after the peer replied 422 Session Interval Too
+    /// Small. The peer's `Min-SE` header dictates the required floor; callers
+    /// pass it here together with the desired `Session-Expires` (typically
+    /// set to `min_se` so the retry passes the first check).
+    ///
+    /// Mirrors `send_invite_with_auth` — reuses the original dialog's
+    /// `Call-ID` + `From` tag, rebuilds as an initial INVITE (422 was a final
+    /// response that did *not* establish a dialog), bumps CSeq via
+    /// `Dialog::create_request_template`. The timer headers use the supplied
+    /// overrides instead of the global `DialogManagerConfig` values.
+    pub async fn send_invite_with_session_timer_override(
+        &self,
+        dialog_id: &DialogId,
+        body: Option<bytes::Bytes>,
+        session_secs: u32,
+        min_se: u32,
+    ) -> DialogResult<TransactionKey> {
+        self.send_invite_with_session_timer_options(
+            dialog_id,
+            crate::api::unified::InviteAuthRetryOptions {
+                sdp: body.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                ..Default::default()
+            },
+            session_secs,
+            min_se,
+        )
+        .await
+    }
+
+    /// Structural 422 retry that retains the initial INVITE's routing,
+    /// application headers, accumulated credentials and exact body.
+    pub async fn send_invite_with_session_timer_options(
+        &self,
+        dialog_id: &DialogId,
+        opts: crate::api::unified::InviteAuthRetryOptions,
+        session_secs: u32,
+        min_se: u32,
+    ) -> DialogResult<TransactionKey> {
+        self.send_initial_invite_attempt_with_options(
+            dialog_id,
+            opts,
+            InitialInviteTimerPolicy::Override {
+                session_secs,
+                min_se,
+            },
+        )
+        .await
+    }
+
+    /// Canonical initial-INVITE materializer. The first send, authentication
+    /// retries and 422 retries differ only in credentials and session-timer
+    /// policy; validation, dialog mutation, route planning, construction and
+    /// wire dispatch are deliberately shared.
+    async fn send_initial_invite_attempt_with_options(
+        &self,
+        dialog_id: &DialogId,
+        opts: crate::api::unified::InviteAuthRetryOptions,
+        timer_policy: InitialInviteTimerPolicy,
+    ) -> DialogResult<TransactionKey> {
+        use crate::transaction::client::builders::InviteBuilder;
+
+        for header in &opts.authorization_headers {
+            if !matches!(
+                header.name(),
+                HeaderName::Authorization | HeaderName::ProxyAuthorization
+            ) {
+                return Err(crate::errors::DialogError::protocol_error(
+                    "Initial INVITE contains a non-authorization credential header",
+                ));
+            }
+        }
+        let preview_dialog = self.get_dialog(dialog_id)?;
+        let mut preview_headers = opts.authorization_headers.clone();
+        preview_headers.extend(opts.extra_headers.iter().cloned());
+        crate::api::unified::validate_initial_invite_options(
+            &crate::api::unified::InviteRequestOptions {
+                from_uri: preview_dialog.local_uri.to_string(),
+                to_uri: preview_dialog.remote_uri.to_string(),
+                sdp: opts.sdp.clone(),
+                call_id: Some(preview_dialog.call_id.clone()),
+                from_display: opts.from_display.clone(),
+                contact_uri: opts.contact_uri.clone(),
+                precomputed_authorization: None,
+                outbound_proxy_uri: opts.outbound_proxy_uri.clone(),
+                supported_100rel: opts.supported_100rel,
+                registered_flow_routes: opts.registered_flow_routes.clone(),
+                extra_headers: preview_headers,
+            },
+        )
+        .map_err(|_| {
+            crate::errors::DialogError::protocol_error("initial INVITE failed preflight validation")
+        })?;
+        let InitialInviteHeaderPlan {
+            contact_uri,
+            appended,
+        } = plan_initial_invite_headers(opts.contact_uri, opts.extra_headers)?;
+        let wire_plan = CandidateWirePlan {
+            regenerate_stack_default_contact: contact_uri.is_none()
+                && self.local_contact_uri().is_none(),
+        };
+
+        debug!(dialog=%dialog_id, ?timer_policy, "Sending initial INVITE through canonical path");
+
+        let (candidates, request) = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+
+            let template = dialog.create_request_template(Method::Invite);
+            dialog.invite_cseq = Some(template.cseq_number);
+
+            let local_tag = match template.local_tag.clone() {
+                Some(tag) if !tag.is_empty() => tag,
+                _ => {
+                    let new_tag = dialog.generate_local_tag();
+                    dialog.local_tag = Some(new_tag.clone());
+                    new_tag
+                }
+            };
+
+            let planned_routes = planned_initial_invite_routes(
+                opts.outbound_proxy_uri.as_ref(),
+                &template.route_set,
+            );
+            let local_address =
+                self.local_address_for_target_and_routes(&template.target_uri, &planned_routes);
+            let mut invite_builder = InviteBuilder::new()
+                .from_detailed(
+                    opts.from_display.as_deref().or(Some("User")),
+                    template.local_uri.to_string(),
+                    Some(&local_tag),
+                )
+                .to_detailed(Some("User"), template.remote_uri.to_string(), None)
+                .call_id(&template.call_id)
+                .cseq(template.cseq_number)
+                .request_uri(template.target_uri.to_string())
+                .local_address(local_address);
+
+            for route in &planned_routes {
+                invite_builder = invite_builder.add_route(route.clone());
+            }
+
+            if let Some(contact) = contact_uri {
+                invite_builder = invite_builder.contact(contact);
+            } else if let Some(contact) = self.local_contact_uri() {
+                invite_builder = invite_builder.contact(contact);
+            }
+
+            if let Some(sdp_content) = opts.sdp {
+                invite_builder = invite_builder.with_sdp(sdp_content);
+            }
+
+            let mut request = invite_builder.build().map_err(|_error| {
+                crate::errors::DialogError::InternalError {
+                    message: safe_operation_failure(
+                        "initial_invite_attempt_build",
+                        "builder_error",
+                    ),
+                    context: None,
+                }
+            })?;
+
+            inject_100rel_policy(&mut request, self.config_100rel_policy());
+            if opts.supported_100rel {
+                inject_100rel_policy(&mut request, RelUsage::Supported);
+            }
+            match timer_policy {
+                InitialInviteTimerPolicy::Configured => {
+                    if let Some((session_secs, min_se)) = self.config_session_timer_settings() {
+                        inject_session_timer_headers(&mut request, session_secs, min_se);
+                    }
+                }
+                InitialInviteTimerPolicy::Override {
+                    session_secs,
+                    min_se,
+                } => inject_session_timer_headers(&mut request, session_secs, min_se),
+            }
+            append_validated_initial_invite_headers(
+                &mut request,
+                opts.authorization_headers,
+                appended,
+            )?;
+
+            let next_hop =
+                crate::transaction::transport::multiplexed::exact_next_hop_uri_for_request(
+                    &request,
+                )
+                .map_err(|_| {
+                    crate::errors::DialogError::routing_error(
+                        "Initial INVITE contains an unusable Route header",
+                    )
+                })?;
+            drop(dialog);
+            let candidates = if opts.registered_flow_routes.is_empty() {
+                self.resolve_uri_to_candidates(&next_hop).await
+            } else {
+                opts.registered_flow_routes
+                    .iter()
+                    .map(|route| rvoip_sip_transport::ResolvedTarget {
+                        addr: route.destination,
+                        transport: route
+                            .transport_type
+                            .expect("registered-flow route validated before dispatch"),
+                        authority: route.authority.clone(),
+                        flow_id: route.flow_id,
+                        expires: None,
+                    })
+                    .collect()
+            };
+
+            if candidates.is_empty() {
+                return Err(crate::errors::DialogError::routing_error(
+                    "No address candidates for the exact initial-INVITE next hop",
+                ));
+            }
+            (candidates, request)
+        };
+
+        // RFC 3263 §4.3 multi-candidate failover. STIR/SHAKEN re-signs per
+        // attempt inside the helper because every attempt carries a new CSeq.
+        let (transaction_id, _addr) = self
+            .send_request_with_candidate_wire_plan(request, candidates, Some(dialog_id), wire_plan)
+            .await?;
+
+        debug!(dialog=%dialog_id, transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id), ?timer_policy, "Initial INVITE sent via candidate failover path");
+        Ok(transaction_id)
+    }
+
+    /// Send an *initial* INVITE on a freshly-created outgoing dialog, with
+    /// caller-supplied extra headers appended to the wire request.
+    ///
+    /// Mirrors `send_invite_with_auth` / `send_invite_with_session_timer_override`
+    /// in construction shape (rebuild the INVITE via `InviteBuilder`, inject
+    /// global policy headers, send via `create_invite_client_transaction`)
+    /// but is intended for the *first* transmission rather than a retry.
+    /// Callers go through `crate::manager::unified::UnifiedManager::make_call_with_extra_headers`
+    /// rather than calling this directly; this method is the layer that
+    /// actually puts the bytes on the wire.
+    ///
+    /// `extra_headers` is validated and appended in exact caller order after
+    /// stack-managed fields. Repeatable application fields retain duplicates;
+    /// singleton collisions and unstructured Contact aliases are rejected.
+    /// Typical contents:
+    /// - `TypedHeader::PAssertedIdentity(...)` (RFC 3325) for trunk identity
+    /// - `TypedHeader::PPreferredIdentity(...)` (RFC 3325) for asserted-identity preference
+    /// - any other carrier-specific headers (`P-Charging-Vector`, etc.) the
+    ///   application has already constructed.
+    pub async fn send_initial_invite_with_extra_headers(
+        &self,
+        dialog_id: &DialogId,
+        body: Option<bytes::Bytes>,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+        from_display: Option<String>,
+        contact_override: Option<String>,
+        outbound_proxy_uri: Option<rvoip_sip_core::types::uri::Uri>,
+        supported_100rel: bool,
+    ) -> DialogResult<TransactionKey> {
+        self.send_initial_invite_with_registered_flow_routes(
+            dialog_id,
+            body,
+            extra_headers,
+            from_display,
+            contact_override,
+            outbound_proxy_uri,
+            supported_100rel,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_initial_invite_with_registered_flow_routes(
+        &self,
+        dialog_id: &DialogId,
+        body: Option<bytes::Bytes>,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+        from_display: Option<String>,
+        contact_override: Option<String>,
+        outbound_proxy_uri: Option<rvoip_sip_core::types::uri::Uri>,
+        supported_100rel: bool,
+        registered_flow_routes: Vec<rvoip_sip_transport::TransportRoute>,
+    ) -> DialogResult<TransactionKey> {
+        self.send_initial_invite_attempt_with_options(
+            dialog_id,
+            crate::api::unified::InviteAuthRetryOptions {
+                sdp: body.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                authorization_headers: Vec::new(),
+                extra_headers,
+                from_display,
+                contact_uri: contact_override,
+                outbound_proxy_uri,
+                supported_100rel,
+                registered_flow_routes,
+            },
+            InitialInviteTimerPolicy::Configured,
+        )
+        .await
+    }
+
+    /// Initial-INVITE send with an explicit lower-layer wire-boundary receipt.
+    ///
+    /// This preserves the legacy method above while giving lifecycle-aware
+    /// callers enough information to distinguish exact local rollback from a
+    /// required signaling teardown.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_initial_invite_with_wire_receipt(
+        &self,
+        dialog_id: &DialogId,
+        body: Option<bytes::Bytes>,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+        from_display: Option<String>,
+        contact_override: Option<String>,
+        outbound_proxy_uri: Option<rvoip_sip_core::types::uri::Uri>,
+        supported_100rel: bool,
+        registered_flow_routes: Vec<rvoip_sip_transport::TransportRoute>,
+    ) -> Result<TransactionKey, InitialInviteSendFailure> {
+        match self
+            .send_initial_invite_with_registered_flow_routes(
+                dialog_id,
+                body,
+                extra_headers,
+                from_display,
+                contact_override,
+                outbound_proxy_uri,
+                supported_100rel,
+                registered_flow_routes,
+            )
+            .await
+        {
+            Ok(transaction_id) => Ok(transaction_id),
+            Err(error) => {
+                for plan_id in self.invite_failover_plan_ids_for_dialog(dialog_id) {
+                    let Some(plan) = self
+                        .invite_failover_plans
+                        .get(&plan_id)
+                        .map(|entry| entry.value().clone())
+                    else {
+                        continue;
+                    };
+                    let plan = plan.lock().await;
+                    if plan.id == plan_id && &plan.dialog_id == dialog_id && plan.wire_attempted {
+                        return Err(InitialInviteSendFailure::Unknown(error));
+                    }
+                }
+                Err(InitialInviteSendFailure::ZeroWire(error))
+            }
+        }
+    }
+
+    async fn register_invite_failover_plan(
+        &self,
+        dialog_id: &DialogId,
+        request: Request,
+        candidates: Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+        wire_plan: CandidateWirePlan,
+    ) -> DialogResult<std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>> {
+        // Retained plans are already reaped by the manager's one-second
+        // maintenance task and by the bounded insert cadence below. Scanning
+        // and cloning the complete 90-second retention set for every INVITE
+        // makes admission O(retained calls) and turns sustained CPS into
+        // quadratic work. Only force an admission-side reap when the retained
+        // capacity is actually full, so expired entries get one final chance
+        // to free a slot before overload is reported.
+        if self.invite_failover_plans.len() >= self.invite_failover_plan_capacity {
+            self.prune_invite_failover_state().await;
+        }
+        let (plan, inserts) = {
+            // Registration is one linearized ownership transition. Two callers
+            // cannot both replace the active owner for one dialog, and drain
+            // cannot begin between admission and index publication.
+            let _registry = self
+                .invite_failover_registry_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !self.is_accepting_work() {
+                return Err(crate::errors::DialogError::InvalidState {
+                    expected: "dialog manager running".to_string(),
+                    actual: "dialog manager draining or stopped".to_string(),
+                });
+            }
+            if self
+                .active_invite_failover_by_dialog
+                .contains_key(dialog_id)
+            {
+                return Err(crate::errors::DialogError::InvalidState {
+                    expected: "no active initial INVITE operation".to_string(),
+                    actual: "active initial INVITE operation".to_string(),
+                });
+            }
+            if self.active_invite_failover_by_dialog.len()
+                >= self.invite_failover_active_plan_capacity
+                || self.invite_failover_plans.len() >= self.invite_failover_plan_capacity
+            {
+                return Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("invite_failover_admission", "capacity"),
+                });
+            }
+
+            if !Self::try_reserve_invite_failover_capacity(
+                &self.invite_failover_plan_reservations,
+                1,
+                self.invite_failover_plan_capacity,
+            ) {
+                return Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("invite_failover_admission", "capacity"),
+                });
+            }
+            if !Self::try_reserve_invite_failover_capacity(
+                &self.invite_failover_attempt_reservations,
+                candidates.len(),
+                self.invite_failover_attempt_capacity,
+            ) {
+                Self::release_invite_failover_reservation(
+                    &self.invite_failover_plan_reservations,
+                    1,
+                );
+                return Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("invite_failover_admission", "capacity"),
+                });
+            }
+
+            let plan_id = self
+                .next_invite_failover_plan_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let now = Instant::now();
+            let setup_deadline = now
+                + self
+                    .transaction_manager
+                    .timer_settings()
+                    .transaction_timeout;
+            let expires_at = setup_deadline + INVITE_FAILOVER_PLAN_TTL;
+            let expiry_generation = 1;
+            let reserved_candidate_count = candidates.len();
+            let plan = std::sync::Arc::new(tokio::sync::Mutex::new(InviteFailoverPlan {
+                id: plan_id,
+                dialog_id: dialog_id.clone(),
+                active_payload: Some(Box::new(InviteFailoverActivePayload::new(
+                    request,
+                    candidates,
+                    wire_plan,
+                    setup_deadline,
+                ))),
+                reserved_attempt_slots: reserved_candidate_count,
+                current_transaction: None,
+                wire_attempted: false,
+                phase: InviteFailoverPlanPhase::Active,
+                retained_attempts: Box::new([]),
+                accepted_candidate_index: None,
+                accepted_transaction: None,
+                accepted_to_tag: None,
+                cancel_dispatch_state: InviteCancelDispatchState::Idle,
+                cancel_transaction: None,
+                fork_cleanup: None,
+                expires_at,
+                expiry_generation,
+            }));
+            self.invite_failover_plans.insert(plan_id, plan.clone());
+            if !self
+                .invite_failover_expiry_scheduler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .schedule(
+                    plan_id,
+                    expiry_generation,
+                    expires_at,
+                    InviteFailoverPlanPhase::Active,
+                )
+            {
+                self.invite_failover_plans.remove(&plan_id);
+                Self::release_invite_failover_reservation(
+                    &self.invite_failover_plan_reservations,
+                    1,
+                );
+                Self::release_invite_failover_reservation(
+                    &self.invite_failover_attempt_reservations,
+                    reserved_candidate_count,
+                );
+                return Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("invite_failover_admission", "expiry_capacity"),
+                });
+            }
+            self.index_invite_failover_plan_locked(dialog_id, plan_id);
+            self.active_invite_failover_by_dialog
+                .insert(dialog_id.clone(), plan_id);
+            let inserts = self
+                .invite_failover_insert_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            (plan, inserts)
+        };
+        if inserts % INVITE_FAILOVER_PRUNE_INTERVAL == 0 {
+            self.prune_invite_failover_state().await;
+        }
+        Ok(plan)
+    }
+
+    fn try_reserve_invite_failover_capacity(
+        reservations: &std::sync::atomic::AtomicUsize,
+        amount: usize,
+        capacity: usize,
+    ) -> bool {
+        reservations
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| current.checked_add(amount).filter(|next| *next <= capacity),
+            )
+            .is_ok()
+    }
+
+    fn release_invite_failover_reservation(
+        reservations: &std::sync::atomic::AtomicUsize,
+        amount: usize,
+    ) {
+        let _ = reservations.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| Some(current.saturating_sub(amount)),
+        );
+    }
+
+    fn set_invite_attempt_outcome(
+        plan: &mut InviteFailoverPlan,
+        transaction_id: &TransactionKey,
+        outcome: InviteFailoverAttemptOutcome,
+    ) {
+        if let Some(active) = plan.active_payload.as_mut() {
+            if let Some(attempt) = active
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.transaction_id.as_ref() == transaction_id)
+            {
+                attempt.outcome = outcome;
+            }
+        }
+    }
+
+    fn invite_setup_timeout(operation: &'static str) -> crate::errors::DialogError {
+        crate::errors::DialogError::TimeoutError {
+            operation: safe_operation_failure(operation, "setup_deadline"),
+        }
+    }
+
+    fn abandon_invite_candidate_generation_locked(
+        &self,
+        plan: &mut InviteFailoverPlan,
+        generation: u64,
+        transaction_hint: Option<&TransactionKey>,
+    ) -> Option<TransactionKey> {
+        let owns_pending = plan
+            .active_payload
+            .as_ref()
+            .and_then(|active| active.pending_candidate)
+            .is_some_and(|(pending_generation, _)| pending_generation == generation);
+        let owns_current = plan
+            .active_payload
+            .as_ref()
+            .is_some_and(|active| active.current_send_generation == Some(generation));
+        if !owns_pending && !owns_current {
+            // A transaction created just before another operation cancelled
+            // the pending generation was never published in the plan. It
+            // still needs compensation, whereas an indexed attempt now owned
+            // by a response/failover path must be left alone.
+            return transaction_hint
+                .filter(|transaction_id| {
+                    !plan
+                        .active_payload
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|active| active.attempts.iter())
+                        .any(|attempt| attempt.transaction_id.as_ref() == *transaction_id)
+                })
+                .cloned();
+        }
+
+        let _registry = self
+            .invite_failover_registry_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transaction_id = if owns_current {
+            plan.current_transaction
+                .as_deref()
+                .cloned()
+                .or_else(|| transaction_hint.cloned())
+        } else {
+            transaction_hint.cloned()
+        };
+        if let Some(transaction_id) = transaction_id.as_ref() {
+            Self::set_invite_attempt_outcome(
+                plan,
+                transaction_id,
+                InviteFailoverAttemptOutcome::TransportError,
+            );
+        }
+        if owns_pending {
+            if let Some(active) = plan.active_payload.as_mut() {
+                active.pending_candidate = None;
+            }
+        }
+        if owns_current {
+            plan.current_transaction = None;
+            if let Some(active) = plan.active_payload.as_mut() {
+                active.current_candidate_index = None;
+                active.current_send_generation = None;
+            }
+        }
+        if plan.phase == InviteFailoverPlanPhase::Active {
+            plan.transition_to_terminal(InviteFailoverPlanPhase::Closed);
+            self.schedule_invite_failover_plan_expiry(
+                plan,
+                Instant::now() + INVITE_FAILOVER_PLAN_TTL,
+            );
+        }
+        self.active_invite_failover_by_dialog
+            .remove_if(&plan.dialog_id, |_, active_plan_id| {
+                *active_plan_id == plan.id
+            });
+        if let Some(transaction_id) = transaction_id.as_ref() {
+            self.remove_invite_failover_attempt_locked(transaction_id, Some(plan.id));
+            self.unlink_transaction_from_dialog_indexed(transaction_id);
+        }
+        transaction_id
+    }
+
+    async fn abandon_invite_candidate_generation(
+        &self,
+        plan: &std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+        generation: u64,
+        transaction_hint: Option<&TransactionKey>,
+    ) {
+        let terminate = {
+            let mut plan = plan.lock().await;
+            self.abandon_invite_candidate_generation_locked(&mut plan, generation, transaction_hint)
+        };
+        if let Some(transaction_id) = terminate {
+            self.compensate_invite_candidate_transaction(&transaction_id, false)
+                .await;
+        }
+    }
+
+    async fn close_pending_invite_candidate(
+        &self,
+        plan: &std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+        generation: u64,
+        phase: InviteFailoverPlanPhase,
+    ) {
+        let mut plan = plan.lock().await;
+        if plan
+            .active_payload
+            .as_ref()
+            .and_then(|active| active.pending_candidate)
+            .is_some_and(|(pending_generation, _)| pending_generation == generation)
+        {
+            if let Some(active) = plan.active_payload.as_mut() {
+                active.pending_candidate = None;
+            }
+            if plan.phase == InviteFailoverPlanPhase::Active {
+                self.close_active_invite_failover_plan(&mut plan, phase);
+            }
+        }
+    }
+
+    async fn compensate_invite_candidate_transaction(
+        &self,
+        transaction_id: &TransactionKey,
+        unlink_attempt: bool,
+    ) {
+        if unlink_attempt {
+            let _registry = self
+                .invite_failover_registry_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.remove_invite_failover_attempt_locked(transaction_id, None);
+            self.unlink_transaction_from_dialog_indexed(transaction_id);
+        }
+        if tokio::time::timeout(
+            INVITE_CANDIDATE_COMPENSATION_TIMEOUT,
+            self.transaction_manager
+                .terminate_transaction(transaction_id),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                "Timed out compensating an incomplete initial-INVITE candidate"
+            );
+        }
+    }
+
+    async fn retain_wire_unknown_invite_candidate(
+        &self,
+        plan: &std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+        generation: u64,
+        transaction_id: &TransactionKey,
+        outcome: InviteFailoverAttemptOutcome,
+    ) -> bool {
+        let mut plan = plan.lock().await;
+        if !plan
+            .active_payload
+            .as_ref()
+            .is_some_and(|active| active.current_send_generation == Some(generation))
+            || plan.current_transaction.as_deref() != Some(transaction_id)
+        {
+            return false;
+        }
+        Self::set_invite_attempt_outcome(&mut plan, transaction_id, outcome);
+        // Preserve current_transaction plus tx→dialog/request route indexes so
+        // a compatibility cleanup supervisor can construct the exact CANCEL.
+        self.close_active_invite_failover_plan(&mut plan, InviteFailoverPlanPhase::WireUnknown);
+        true
+    }
+
+    async fn send_invite_failover_candidate(
+        &self,
+        plan: &std::sync::Arc<tokio::sync::Mutex<InviteFailoverPlan>>,
+    ) -> Result<(TransactionKey, SocketAddr), InviteCandidateSendError> {
+        use crate::manager::RequestLifecycle;
+
+        let lease = {
+            let mut plan = plan.lock().await;
+            let owner_is_current = self
+                .active_invite_failover_by_dialog
+                .get(&plan.dialog_id)
+                .is_some_and(|owner| *owner.value() == plan.id);
+            if !self.is_accepting_work()
+                || plan.phase != InviteFailoverPlanPhase::Active
+                || !owner_is_current
+            {
+                return Err(InviteCandidateSendError::Fatal(
+                    crate::errors::DialogError::InvalidState {
+                        expected: "active initial INVITE plan on a running manager".to_string(),
+                        actual: "inactive plan or draining manager".to_string(),
+                    },
+                ));
+            }
+            if plan
+                .active_payload
+                .as_ref()
+                .is_some_and(|active| active.pending_candidate.is_some())
+                || plan.current_transaction.is_some()
+            {
+                return Err(InviteCandidateSendError::Fatal(
+                    crate::errors::DialogError::InvalidState {
+                        expected: "idle initial INVITE candidate slot".to_string(),
+                        actual: "candidate operation already active".to_string(),
+                    },
+                ));
+            }
+            let plan_id = plan.id;
+            let dialog_id = plan.dialog_id.clone();
+            let Some(active_payload) = plan.active_payload.as_mut() else {
+                self.close_active_invite_failover_plan(&mut plan, InviteFailoverPlanPhase::Closed);
+                return Err(InviteCandidateSendError::Fatal(
+                    crate::errors::DialogError::InvalidState {
+                        expected: "active initial INVITE payload".to_string(),
+                        actual: "compacted initial INVITE plan".to_string(),
+                    },
+                ));
+            };
+            if active_payload.setup_deadline <= Instant::now() {
+                self.close_active_invite_failover_plan(
+                    &mut plan,
+                    InviteFailoverPlanPhase::Exhausted,
+                );
+                return Err(InviteCandidateSendError::Fatal(Self::invite_setup_timeout(
+                    "invite_candidate_reserve",
+                )));
+            }
+            let candidate_index = active_payload.next_candidate_index;
+            let Some(target) = active_payload.candidates.get(candidate_index).cloned() else {
+                self.close_active_invite_failover_plan(
+                    &mut plan,
+                    InviteFailoverPlanPhase::Exhausted,
+                );
+                return Err(InviteCandidateSendError::Fatal(
+                    crate::errors::DialogError::routing_error("INVITE candidate missing"),
+                ));
+            };
+            let request = active_payload.request.clone();
+            let wire_plan = active_payload.wire_plan;
+            let remaining_candidate_count = active_payload
+                .candidates
+                .len()
+                .saturating_sub(candidate_index)
+                .max(1);
+            let generation = active_payload.next_send_generation.wrapping_add(1).max(1);
+            active_payload.next_send_generation = generation;
+            active_payload.next_candidate_index = candidate_index + 1;
+            active_payload.pending_candidate = Some((generation, candidate_index));
+            InviteCandidateSendLease {
+                plan_id,
+                dialog_id,
+                generation,
+                candidate_index,
+                target,
+                request,
+                wire_plan,
+                setup_deadline: active_payload.setup_deadline,
+                remaining_candidate_count,
+            }
+        };
+        let mut cancellation_guard =
+            InviteCandidateCancellationGuard::new(self, plan, lease.generation);
+
+        let mut request = match finalize_request_for_candidate(
+            self,
+            &lease.request,
+            &lease.target,
+            lease.wire_plan,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.close_pending_invite_candidate(
+                    plan,
+                    lease.generation,
+                    InviteFailoverPlanPhase::Closed,
+                )
+                .await;
+                return Err(InviteCandidateSendError::Fatal(error));
+            }
+        };
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(lease.setup_deadline),
+            self.pre_send_request(&mut request, lease.target.addr),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.close_pending_invite_candidate(
+                    plan,
+                    lease.generation,
+                    InviteFailoverPlanPhase::Closed,
+                )
+                .await;
+                return Err(InviteCandidateSendError::Fatal(error));
+            }
+            Err(_) => {
+                self.close_pending_invite_candidate(
+                    plan,
+                    lease.generation,
+                    InviteFailoverPlanPhase::Exhausted,
+                )
+                .await;
+                return Err(InviteCandidateSendError::Fatal(Self::invite_setup_timeout(
+                    "invite_candidate_pre_send",
+                )));
+            }
+        }
+
+        let sent_request = request.clone();
+        let request_key = crate::manager::core::outbound_request_key(&sent_request);
+        let request_route = transport_route_for_invite_candidate(&lease.target);
+        let Some(remaining_setup_budget) = lease
+            .setup_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            self.close_pending_invite_candidate(
+                plan,
+                lease.generation,
+                InviteFailoverPlanPhase::Exhausted,
+            )
+            .await;
+            return Err(InviteCandidateSendError::Fatal(Self::invite_setup_timeout(
+                "invite_candidate_transaction_create",
+            )));
+        };
+        let attempt_timeout = remaining_setup_budget / (lease.remaining_candidate_count as u32);
+        let transaction_id = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(lease.setup_deadline),
+            self.transaction_manager
+                .create_client_transaction_on_route_with_timeout_and_owner(
+                    request,
+                    request_route,
+                    attempt_timeout,
+                ),
+        )
+        .await
+        {
+            Ok(Ok(allocation)) => allocation,
+            Ok(Err(_)) => {
+                self.close_pending_invite_candidate(
+                    plan,
+                    lease.generation,
+                    InviteFailoverPlanPhase::Closed,
+                )
+                .await;
+                return Err(InviteCandidateSendError::Fatal(
+                    crate::errors::DialogError::TransactionError {
+                        message: safe_operation_failure(
+                            "invite_candidate_transaction_create",
+                            "transaction_error",
+                        ),
+                    },
+                ));
+            }
+            Err(_) => {
+                self.close_pending_invite_candidate(
+                    plan,
+                    lease.generation,
+                    InviteFailoverPlanPhase::Exhausted,
+                )
+                .await;
+                return Err(InviteCandidateSendError::Fatal(Self::invite_setup_timeout(
+                    "invite_candidate_transaction_create",
+                )));
+            }
+        };
+        let (transaction_id, failover_admission_owner) = transaction_id;
+        cancellation_guard.set_transaction(&transaction_id);
+
+        let committed = {
+            let mut plan = plan.lock().await;
+            let _registry = self
+                .invite_failover_registry_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let owner_is_current = self
+                .active_invite_failover_by_dialog
+                .get(&lease.dialog_id)
+                .is_some_and(|owner| *owner.value() == lease.plan_id);
+            if self.is_accepting_work()
+                && owner_is_current
+                && plan.id == lease.plan_id
+                && plan.phase == InviteFailoverPlanPhase::Active
+                && plan.active_payload.as_ref().is_some_and(|active| {
+                    active.pending_candidate == Some((lease.generation, lease.candidate_index))
+                        && active.setup_deadline > Instant::now()
+                })
+            {
+                self.link_outbound_transaction_to_dialog_indexed(
+                    &transaction_id,
+                    &lease.dialog_id,
+                    &sent_request,
+                );
+                let retained_transaction = std::sync::Arc::new(transaction_id.clone());
+                self.index_invite_failover_attempt_locked(
+                    retained_transaction.clone(),
+                    InviteFailoverAttemptIndex {
+                        plan_id: lease.plan_id,
+                        dialog_id: lease.dialog_id.clone(),
+                        candidate_index: lease.candidate_index,
+                        selected_success_delivery: SelectedInviteSuccessDelivery::default(),
+                        cancel_terminal_delivery: SelectedInviteSuccessDelivery::default(),
+                        _admission_owner: Some(failover_admission_owner),
+                    },
+                );
+                plan.current_transaction = Some(retained_transaction.clone());
+                let active = plan
+                    .active_payload
+                    .as_mut()
+                    .expect("active payload validated above");
+                active.pending_candidate = None;
+                active.current_candidate_index = Some(lease.candidate_index);
+                active.current_send_generation = Some(lease.generation);
+                active.provisional_seen = false;
+                active.attempts.push(InviteFailoverAttempt {
+                    transaction_id: retained_transaction,
+                    outcome: InviteFailoverAttemptOutcome::Active,
+                });
+                true
+            } else {
+                false
+            }
+        };
+        if !committed {
+            self.close_pending_invite_candidate(
+                plan,
+                lease.generation,
+                InviteFailoverPlanPhase::Closed,
+            )
+            .await;
+            self.compensate_invite_candidate_transaction(&transaction_id, false)
+                .await;
+            return Err(InviteCandidateSendError::Fatal(
+                crate::errors::DialogError::InvalidState {
+                    expected: "current admitted initial INVITE generation".to_string(),
+                    actual: "stale generation or draining manager".to_string(),
+                },
+            ));
+        }
+
+        let stale_before_wire = {
+            let mut plan = plan.lock().await;
+            if !plan
+                .active_payload
+                .as_ref()
+                .is_some_and(|active| active.current_send_generation == Some(lease.generation))
+                || plan.current_transaction.as_deref() != Some(&transaction_id)
+            {
+                // This transaction was committed to the retained indexes but
+                // this lease has not crossed the wire boundary yet. A
+                // concurrent cancel/drain may have compacted the plan and
+                // invalidated the generation; detach the zero-wire attempt so
+                // it cannot occupy a retained route until TTL. The guard stays
+                // armed across async compensation and retries termination if
+                // this future is itself cancelled.
+                if plan.current_transaction.as_deref() == Some(&transaction_id) {
+                    plan.current_transaction = None;
+                    if let Some(active) = plan.active_payload.as_mut() {
+                        active.current_candidate_index = None;
+                    }
+                }
+                if let Some(active) = plan.active_payload.as_mut() {
+                    active
+                        .attempts
+                        .retain(|attempt| attempt.transaction_id.as_ref() != &transaction_id);
+                }
+                true
+            } else {
+                // Monotonic boundary: after this store, even an immediate
+                // transport error is conservatively wire-unknown.
+                plan.wire_attempted = true;
+                false
+            }
+        };
+        if stale_before_wire {
+            self.compensate_invite_candidate_transaction(&transaction_id, true)
+                .await;
+            cancellation_guard.disarm();
+            return Err(InviteCandidateSendError::Fatal(
+                crate::errors::DialogError::InvalidState {
+                    expected: "current committed INVITE wire lease".to_string(),
+                    actual: "stale INVITE wire lease".to_string(),
+                },
+            ));
+        }
+
+        let result = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(lease.setup_deadline),
+            self.transaction_manager.send_request(&transaction_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                self.record_outbound_transport_context(
+                    &transaction_id,
+                    request_key,
+                    lease.target.transport,
+                    lease.target.addr,
+                );
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(lease.setup_deadline),
+                    self.post_send_request(&sent_request, lease.target.addr),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Ok((transaction_id, lease.target.addr)),
+                    Ok(Err(error)) => {
+                        let still_current = self
+                            .retain_wire_unknown_invite_candidate(
+                                plan,
+                                lease.generation,
+                                &transaction_id,
+                                InviteFailoverAttemptOutcome::TransportError,
+                            )
+                            .await;
+                        if still_current {
+                            Err(InviteCandidateSendError::WireUnknown(error))
+                        } else {
+                            Ok((transaction_id, lease.target.addr))
+                        }
+                    }
+                    Err(_) => {
+                        let still_current = self
+                            .retain_wire_unknown_invite_candidate(
+                                plan,
+                                lease.generation,
+                                &transaction_id,
+                                InviteFailoverAttemptOutcome::TransactionTimeout,
+                            )
+                            .await;
+                        if still_current {
+                            Err(InviteCandidateSendError::WireUnknown(
+                                Self::invite_setup_timeout("invite_candidate_post_send"),
+                            ))
+                        } else {
+                            Ok((transaction_id, lease.target.addr))
+                        }
+                    }
+                }
+            }
+            Ok(Err(_error)) => {
+                self.retain_wire_unknown_invite_candidate(
+                    plan,
+                    lease.generation,
+                    &transaction_id,
+                    InviteFailoverAttemptOutcome::ImmediateTransportFailure,
+                )
+                .await;
+                Err(InviteCandidateSendError::WireUnknown(
+                    crate::errors::DialogError::TransactionError {
+                        message: safe_operation_failure("invite_candidate_send", "wire_unknown"),
+                    },
+                ))
+            }
+            Err(_) => {
+                self.retain_wire_unknown_invite_candidate(
+                    plan,
+                    lease.generation,
+                    &transaction_id,
+                    InviteFailoverAttemptOutcome::TransactionTimeout,
+                )
+                .await;
+                Err(InviteCandidateSendError::WireUnknown(
+                    Self::invite_setup_timeout("invite_candidate_send"),
+                ))
+            }
+        };
+        if result.is_ok() || matches!(&result, Err(error) if error.retains_wire_owner()) {
+            cancellation_guard.disarm();
+        }
+        result
+    }
+
+    async fn send_initial_invite_plan(
+        &self,
+        dialog_id: &DialogId,
+        request: Request,
+        candidates: Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+        wire_plan: CandidateWirePlan,
+    ) -> DialogResult<(TransactionKey, SocketAddr)> {
+        let plan = self
+            .register_invite_failover_plan(dialog_id, request, candidates, wire_plan)
+            .await?;
+        match self.send_invite_failover_candidate(&plan).await {
+            Ok(sent) => Ok(sent),
+            Err(error) => Err(error.into_dialog_error()),
+        }
+    }
+
+    /// Send a freshly-built request via a new client transaction,
+    /// retrying with the next `ResolvedTarget` on transport-level
+    /// failure (RFC 3263 §4.3).
+    ///
+    /// On a recoverable transport error from `send_request` (the
+    /// transaction terminated immediately, transport error event, or
+    /// general transport failure), the helper destroys the failed
+    /// transaction by leaving it for the normal cleanup path and
+    /// creates a fresh client transaction targeted at the next
+    /// candidate. Non-transport errors (parse failures, state-machine
+    /// errors, signer errors) fail fast — retrying on a different
+    /// candidate would not help.
+    ///
+    /// For INVITE specifically, fires
+    /// `RequestLifecycle::pre_send_request` once per attempt so the
+    /// installed signer sees the per-attempt request (Via / branch
+    /// differ across attempts).
+    ///
+    /// Returns the transaction key of the first attempt that
+    /// successfully reached `send_request`-Ok, along with the
+    /// [`SocketAddr`] that succeeded. Caller is responsible for
+    /// registering it into `transaction_to_dialog`.
+    ///
+    /// An empty candidate set fails closed. The caller must resolve the exact
+    /// next-hop URI (top Route when present, otherwise Request-URI); falling
+    /// back to an independently resolved remote target could bypass a proxy.
+    /// RFC 3261 §17.1.1.3 normal-termination after 2xx on a fast loopback is
+    /// treated as success.
+    ///
+    /// `tx_to_dialog`, when supplied, is the dialog id to register
+    /// against the freshly-created transaction *before* `send_request`
+    /// fires. Critical for paths whose response handling (e.g.,
+    /// 401-driven auth retry, dialog state transitions) looks the
+    /// dialog up via `transaction_to_dialog`: registering AFTER send
+    /// would race with a fast response and the dialog would be
+    /// unreachable. Pass `None` for stateless sends (e.g. the
+    /// proxy's per-leg failover).
+    pub async fn send_request_with_candidate_failover(
+        &self,
+        request: rvoip_sip_core::Request,
+        candidates: Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+        tx_to_dialog: Option<&DialogId>,
+    ) -> DialogResult<(TransactionKey, std::net::SocketAddr)> {
+        self.send_request_with_candidate_wire_plan(
+            request,
+            candidates,
+            tx_to_dialog,
+            CandidateWirePlan::default(),
+        )
+        .await
+    }
+
+    /// Candidate failover with explicit ownership of stack-generated wire
+    /// fields. Application-authored Contact values must use the default plan.
+    pub async fn send_request_with_candidate_wire_plan(
+        &self,
+        request: rvoip_sip_core::Request,
+        candidates: Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+        tx_to_dialog: Option<&DialogId>,
+        wire_plan: CandidateWirePlan,
+    ) -> DialogResult<(TransactionKey, std::net::SocketAddr)> {
+        self.send_request_with_candidate_wire_plan_owned(
+            request,
+            candidates,
+            tx_to_dialog,
+            wire_plan,
+        )
+        .await
+        .map(|(transaction_id, destination, _completion)| (transaction_id, destination))
+    }
+
+    async fn send_request_with_candidate_wire_plan_owned(
+        &self,
+        request: rvoip_sip_core::Request,
+        candidates: Vec<rvoip_sip_transport::resolver::ResolvedTarget>,
+        tx_to_dialog: Option<&DialogId>,
+        wire_plan: CandidateWirePlan,
+    ) -> DialogResult<(
+        TransactionKey,
+        std::net::SocketAddr,
+        Option<crate::transaction::ClientTransactionCompletionHandle>,
+    )> {
+        use crate::manager::RequestLifecycle;
+
+        let _operation = self.enter_invite_failover_operation().ok_or_else(|| {
+            crate::errors::DialogError::InvalidState {
+                expected: "dialog manager running".to_string(),
+                actual: "dialog manager draining or stopped".to_string(),
+            }
+        })?;
+        let method = request.method();
+        if candidates.is_empty() {
+            return Err(crate::errors::DialogError::routing_error(
+                "No address candidates for the exact request next hop",
+            ));
+        }
+
+        let is_initial_invite = method == Method::Invite
+            && request
+                .to()
+                .is_some_and(|to_header| to_header.tag().is_none());
+        if let (true, Some(dialog_id)) = (is_initial_invite, tx_to_dialog) {
+            // Keep the retained-plan state machine off callers' concrete
+            // async frames. Several high-level state machines await this
+            // helper from large match expressions; embedding the complete
+            // failover future there can exhaust Tokio's default worker stack
+            // even when the runtime takes a different match arm.
+            return Box::pin(
+                self.send_initial_invite_plan(dialog_id, request, candidates, wire_plan),
+            )
+            .await
+            .map(|(transaction_id, destination)| (transaction_id, destination, None));
+        }
+
+        // Direct-peer compatibility keeps in-dialog requests on the exact
+        // TLS flow that formed this dialog. A dead flow fails explicitly;
+        // never silently reconnect or downgrade, and never override Route.
+        // Off by default, so check the manager-wide opt-in before touching the
+        // dialog map. The map guard is dropped before any await, and a dialog
+        // removed concurrently (e.g. BYE racing teardown) keeps normal routing.
+        let mut candidates = candidates;
+        let pinned_route = match tx_to_dialog {
+            Some(dialog_id) if !is_initial_invite && self.tls_contact_compatibility_enabled() => {
+                self.dialogs
+                    .get(dialog_id)
+                    .and_then(|dialog| dialog.compatible_tls_contact_route(&request))
+            }
+            _ => None,
+        };
+        if let Some(route) = pinned_route {
+            let mut target = candidates[0].clone();
+            target.addr = route.destination;
+            target.transport = rvoip_sip_transport::transport::TransportType::Tls;
+            target.flow_id = route.flow_id;
+            candidates = vec![target];
+        }
+
+        let total = candidates.len();
+        let mut last_err: Option<crate::errors::DialogError> = None;
+
+        for (idx, target) in candidates.iter().enumerate() {
+            let attempt = idx + 1;
+            let mut req = finalize_request_for_candidate(self, &request, target, wire_plan)?;
+
+            if method == Method::Invite {
+                if let Err(e) = self.pre_send_request(&mut req, target.addr).await {
+                    return Err(e);
+                }
+            }
+
+            let sent_request = req.clone();
+            let request_key = crate::manager::core::outbound_request_key(&sent_request);
+
+            let mut request_route = rvoip_sip_transport::TransportRoute::new(target.addr)
+                .with_transport_type(target.transport);
+            if let Some(authority) = target.authority.clone() {
+                request_route.authority = Some(authority);
+            }
+            request_route.flow_id = target.flow_id;
+            let tx_result = self
+                .transaction_manager
+                .create_client_transaction_on_route_with_completion(req, request_route)
+                .await;
+            let (tx_id, completion) = match tx_result {
+                Ok(created) => created,
+                Err(_error) => {
+                    last_err = Some(crate::errors::DialogError::TransactionError {
+                        message: safe_method_operation_failure(
+                            "candidate_transaction_create",
+                            "transaction_error",
+                            &method,
+                        ),
+                    });
+                    continue;
+                }
+            };
+
+            // Register tx→dialog mapping BEFORE send so a fast
+            // response (e.g. 401 hitting loopback before send_request
+            // returns) can locate the dialog. Removed on failed
+            // attempts so the next candidate's tx replaces it.
+            if let Some(dialog_id) = tx_to_dialog {
+                self.link_outbound_transaction_to_dialog_indexed(&tx_id, dialog_id, &sent_request);
+            }
+
+            match self.transaction_manager.send_request(&tx_id).await {
+                Ok(()) => {
+                    self.record_outbound_transport_context(
+                        &tx_id,
+                        request_key,
+                        target.transport,
+                        target.addr,
+                    );
+                    self.post_send_request(&sent_request, target.addr).await?;
+                    if attempt > 1 {
+                        debug!(
+                            "RFC 3263 §4.3: candidate {}/{} ({}) succeeded after {} prior failure(s)",
+                            attempt,
+                            total,
+                            target.addr,
+                            attempt - 1
+                        );
+                    }
+                    return Ok((tx_id, target.addr, Some(completion)));
+                }
+                Err(e) => {
+                    let is_transport_failure =
+                        matches!(&e, crate::transaction::error::Error::TransportError { .. });
+                    if is_transport_failure && idx + 1 < total {
+                        debug!(
+                            attempt,
+                            total,
+                            destination=%target.addr,
+                            error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&e),
+                            "Candidate failed with transport error; trying next"
+                        );
+                        // Drop the failed-leg mapping so the next
+                        // attempt's tx is the canonical one for this
+                        // dialog.
+                        if tx_to_dialog.is_some() {
+                            self.unlink_transaction_from_dialog_indexed(&tx_id);
+                        }
+                        if let Err(_cleanup_error) =
+                            self.transaction_manager.terminate_transaction(&tx_id).await
+                        {
+                            debug!(
+                                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id),
+                                "Failed candidate transaction was already retired"
+                            );
+                        }
+                        last_err = Some(crate::errors::DialogError::TransactionError {
+                            message: safe_method_operation_failure(
+                                "candidate_request_send",
+                                "transport_error",
+                                &method,
+                            ),
+                        });
+                        continue;
+                    }
+
+                    if tx_to_dialog.is_some() {
+                        self.unlink_transaction_from_dialog_indexed(&tx_id);
+                    }
+                    if let Err(_cleanup_error) =
+                        self.transaction_manager.terminate_transaction(&tx_id).await
+                    {
+                        debug!(
+                            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id),
+                            "Failed client transaction was already retired"
+                        );
+                    }
+
+                    return Err(crate::errors::DialogError::TransactionError {
+                        message: safe_method_operation_failure(
+                            "candidate_request_send",
+                            "transaction_error",
+                            &method,
+                        ),
+                    });
+                }
+            }
+        }
+
+        Err(
+            last_err.unwrap_or_else(|| crate::errors::DialogError::TransactionError {
+                message: safe_method_operation_failure("candidate_failover", "exhausted", &method),
+            }),
+        )
+    }
+}
+
+/// A response qualifies for RFC 3262 reliable-provisional wrapping when it
+/// is a non-100 provisional (101–199) and carries a body (typically SDP
+/// early media). 100 Trying is hop-by-hop and never reliable; bodiless
+/// 180/183 are still sent unreliably since there's nothing to protect.
+pub fn should_send_reliably(response: &Response) -> bool {
+    let code = response.status_code();
+    (101..200).contains(&code) && !response.body().is_empty()
+}
+
+/// Append RFC 4028 session-timer headers to an outgoing INVITE: a
+/// `Session-Expires: <secs>;refresher=uac` (caller-side refresh by default —
+/// keeps NAT pinholes alive on the UAC), a `Min-SE: <min_se>`, and the
+/// `timer` option tag in `Supported`. No-op if `secs` is 0.
+pub fn inject_session_timer_headers(request: &mut Request, secs: u32, min_se: u32) {
+    use rvoip_sip_core::types::min_se::MinSE;
+    use rvoip_sip_core::types::session_expires::{Refresher, SessionExpires};
+    use rvoip_sip_core::types::TypedHeader;
+
+    if secs == 0 {
+        return;
+    }
+
+    // Headers already staged by the caller (a 422 retry or an explicit
+    // refresh) are authoritative; never emit a second copy.
+    if !request
+        .headers
+        .iter()
+        .any(|h| matches!(h, TypedHeader::SessionExpires(_)))
+    {
+        request
+            .headers
+            .push(TypedHeader::SessionExpires(SessionExpires::new(
+                secs,
+                Some(Refresher::Uac),
+            )));
+    }
+    if !request
+        .headers
+        .iter()
+        .any(|h| matches!(h, TypedHeader::MinSE(_)))
+    {
+        request.headers.push(TypedHeader::MinSE(MinSE::new(min_se)));
+    }
+    ensure_supported_timer(request);
+}
+
+/// RFC 4028 §7.4 headers for an in-dialog re-INVITE. With a negotiated
+/// timer the request carries the current interval and keeps the current
+/// refresher (`uac` when this side refreshes, `uas` when the peer does);
+/// without one it only advertises `timer`. Headers already staged by the
+/// caller (an explicit refresh) win.
+pub fn inject_in_dialog_session_timer_headers(
+    request: &mut Request,
+    negotiated: Option<(u32, bool)>,
+    min_se: u32,
+) {
+    use rvoip_sip_core::types::min_se::MinSE;
+    use rvoip_sip_core::types::session_expires::{Refresher, SessionExpires};
+    use rvoip_sip_core::types::TypedHeader;
+
+    if let Some((secs, local_refreshes)) = negotiated {
+        if !request
+            .headers
+            .iter()
+            .any(|h| matches!(h, TypedHeader::SessionExpires(_)))
+        {
+            let refresher = if local_refreshes {
+                Refresher::Uac
+            } else {
+                Refresher::Uas
+            };
+            request
+                .headers
+                .push(TypedHeader::SessionExpires(SessionExpires::new(
+                    secs,
+                    Some(refresher),
+                )));
+        }
+        if !request
+            .headers
+            .iter()
+            .any(|h| matches!(h, TypedHeader::MinSE(_)))
+        {
+            request
+                .headers
+                .push(TypedHeader::MinSE(MinSE::new(min_se.min(secs))));
+        }
+    }
+    ensure_supported_timer(request);
+}
+
+fn ensure_supported_timer(request: &mut Request) {
+    use rvoip_sip_core::types::{Supported, TypedHeader};
+
+    let mut found = false;
+    for header in request.headers.iter_mut() {
+        if let TypedHeader::Supported(ref mut sup) = header {
+            if !sup.option_tags.iter().any(|t| t == "timer") {
+                sup.option_tags.push("timer".to_string());
+            }
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        request
+            .headers
+            .push(TypedHeader::Supported(Supported::new(vec![
+                "timer".to_string()
+            ])));
+    }
+}
+
+/// Whether a request advertises the RFC 4028 `timer` extension, in either
+/// `Supported` or `Require`. RFC 4028 §9 keys both the refresher choice and
+/// the `Require: timer` answer on this.
+pub fn detect_peer_timer_support(request: &Request) -> bool {
+    use rvoip_sip_core::types::TypedHeader;
+
+    request.headers.iter().any(|header| match header {
+        TypedHeader::Supported(sup) => sup
+            .option_tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("timer")),
+        TypedHeader::Require(req) => req
+            .option_tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("timer")),
+        _ => false,
+    })
+}
+
+/// Add the RFC 4028 §9 UAS headers to a 2xx answering a session refresh
+/// request: `Session-Expires` with the refresher named, plus `Require: timer`
+/// only when the request advertised `timer`. An existing `Session-Expires` set
+/// by the application is preserved.
+pub fn apply_uas_session_timer_headers(
+    response: &mut Response,
+    session_secs: u32,
+    uas_refreshes: bool,
+    peer_supports_timer: bool,
+) {
+    use rvoip_sip_core::types::session_expires::{Refresher, SessionExpires};
+    use rvoip_sip_core::types::{Require, TypedHeader};
+
+    let refresher = if uas_refreshes {
+        Refresher::Uas
+    } else {
+        Refresher::Uac
+    };
+    if !response
+        .headers
+        .iter()
+        .any(|h| matches!(h, TypedHeader::SessionExpires(_)))
+    {
+        response
+            .headers
+            .push(TypedHeader::SessionExpires(SessionExpires::new(
+                session_secs,
+                Some(refresher),
+            )));
+    }
+    if !peer_supports_timer {
+        return;
+    }
+    let mut has_timer = false;
+    for header in response.headers.iter_mut() {
+        if let TypedHeader::Require(require) = header {
+            if !require.requires("timer") {
+                require.option_tags.push("timer".to_string());
+            }
+            has_timer = true;
+            break;
+        }
+    }
+    if !has_timer {
+        response
+            .headers
+            .push(TypedHeader::Require(Require::with_tag("timer")));
+    }
+}
+
+/// UAS-side RFC 4028 §9 decision for a dialog-creating INVITE.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UasSessionTimerDecision {
+    /// Accept the INVITE. `session_secs` is the interval to answer with in
+    /// the 2xx `Session-Expires` (or `None` when no timer applies), and
+    /// `uas_refreshes` is whether this UAS is the refresher.
+    Accept {
+        session_secs: Option<u32>,
+        uas_refreshes: bool,
+    },
+    /// Reject with 422 Session Interval Too Small carrying `Min-SE: min_se`.
+    Reject422 { min_se: u32 },
+}
+
+/// Negotiate the session interval and refresher for an inbound initial INVITE
+/// per RFC 4028 §9 (Table 2).
+///
+/// - A UAC that did not advertise `timer` cannot refresh and cannot parse a
+///   422, so the UAS may still run the timer but must be the refresher.
+/// - A UAC that advertised `timer` and asked for an interval below the local
+///   `min_se` is rejected with 422 + `Min-SE`.
+/// - The answered interval may be reduced to the local preference but never
+///   below the request's `Min-SE`.
+/// - An explicit `refresher=` from a supporting UAC is honored; without one
+///   the UAC refreshes when it proposed an interval, the UAS when it did not.
+pub fn negotiate_uas_session_timer(
+    request: &Request,
+    local: Option<(u32, u32)>,
+) -> UasSessionTimerDecision {
+    use rvoip_sip_core::types::session_expires::Refresher;
+    use rvoip_sip_core::types::TypedHeader;
+
+    let Some((local_secs, local_min_se)) = local else {
+        return UasSessionTimerDecision::Accept {
+            session_secs: None,
+            uas_refreshes: false,
+        };
+    };
+    let peer_supports = detect_peer_timer_support(request);
+    let peer_session_expires = request.headers.iter().find_map(|h| match h {
+        TypedHeader::SessionExpires(se) => Some(se),
+        _ => None,
+    });
+    let peer_min_se = request
+        .headers
+        .iter()
+        .find_map(|h| match h {
+            TypedHeader::MinSE(min) => Some(min.delta_seconds),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    match peer_session_expires {
+        Some(se) => {
+            if peer_supports && se.delta_seconds < local_min_se {
+                return UasSessionTimerDecision::Reject422 {
+                    min_se: local_min_se,
+                };
+            }
+            let uas_refreshes = !peer_supports || matches!(se.refresher, Some(Refresher::Uas));
+            // §9: the answer may reduce the interval but never below the
+            // request's Min-SE, and never below this UAS's own floor (§5:
+            // at least 90 s; `local_min_se` is validated against it). A
+            // caller without timer support cannot be sent a 422, so a
+            // proxy-inserted interval below the floor is raised instead.
+            UasSessionTimerDecision::Accept {
+                session_secs: Some(
+                    se.delta_seconds
+                        .min(local_secs)
+                        .max(peer_min_se)
+                        .max(local_min_se),
+                ),
+                uas_refreshes,
+            }
+        }
+        None => UasSessionTimerDecision::Accept {
+            session_secs: Some(local_secs.max(peer_min_se).max(local_min_se)),
+            uas_refreshes: true,
+        },
+    }
+}
+
+/// UAS-side RFC 4028 §9 decision for an in-dialog session refresh
+/// (re-INVITE or UPDATE) received on a dialog whose current timer is
+/// `current` (`(interval, this side refreshes)`).
+///
+/// A refresh that carries `Session-Expires` is negotiated exactly like the
+/// dialog-creating INVITE, so the 2xx answers the *request's* interval and
+/// refresher and a timer-capable peer asking for less than the local Min-SE
+/// gets 422. A refresh without `Session-Expires` keeps a running timer at its
+/// current interval: a timer-capable peer that was refreshing stays the
+/// refresher, otherwise this UAS takes the job (`refresher=uas`). Such a
+/// request never starts a timer the dialog did not have.
+pub fn negotiate_uas_refresh_session_timer(
+    request: &Request,
+    local: Option<(u32, u32)>,
+    current: Option<(u32, bool)>,
+) -> UasSessionTimerDecision {
+    use rvoip_sip_core::types::TypedHeader;
+
+    let has_session_expires = request
+        .headers
+        .iter()
+        .any(|h| matches!(h, TypedHeader::SessionExpires(_)));
+    if has_session_expires {
+        return negotiate_uas_session_timer(request, local);
+    }
+    match current {
+        Some((secs, local_refreshes)) => UasSessionTimerDecision::Accept {
+            session_secs: Some(secs),
+            uas_refreshes: local_refreshes || !detect_peer_timer_support(request),
+        },
+        None => UasSessionTimerDecision::Accept {
+            session_secs: None,
+            uas_refreshes: false,
+        },
+    }
+}
+
+/// RFC 4028 §7.2/§7.4 UAC-side result of a 2xx to this side's in-dialog
+/// INVITE or UPDATE: `(interval, this side refreshes)`, or `None` when the
+/// session timer is now off.
+///
+/// The 2xx `Session-Expires` is authoritative: its interval replaces the
+/// negotiated one and `refresher=uac` names this side (the refresh
+/// transaction's UAC), `refresher=uas` the peer. A 2xx without
+/// `Session-Expires` to a request that proposed one means "no session
+/// expiration"; a 2xx to a request that never proposed a timer leaves the
+/// current timer as it was.
+pub fn uac_refresh_response_session_timer(
+    response: &Response,
+    request_proposed_timer: bool,
+    current: Option<(u32, bool)>,
+) -> Option<(u32, bool)> {
+    use rvoip_sip_core::types::session_expires::Refresher;
+    use rvoip_sip_core::types::TypedHeader;
+
+    let session_expires = response.headers.iter().find_map(|h| match h {
+        TypedHeader::SessionExpires(se) => Some(se),
+        _ => None,
+    });
+    match session_expires {
+        Some(se) if se.delta_seconds > 0 => Some((
+            se.delta_seconds,
+            !matches!(se.refresher, Some(Refresher::Uas)),
+        )),
+        Some(_) => None,
+        None if request_proposed_timer => None,
+        None => current,
+    }
+}
+
+/// RFC 3261 §20.5: whether a message's `Allow` header lists UPDATE, or
+/// `None` when it carries no `Allow` header (which says nothing about what
+/// the sender supports).
+pub fn allow_lists_update(headers: &[TypedHeader]) -> Option<bool> {
+    let mut seen = false;
+    let mut allows = false;
+    for header in headers {
+        if let TypedHeader::Allow(allow) = header {
+            seen = true;
+            allows |= allow.allows(&Method::Update);
+        }
+    }
+    seen.then_some(allows)
+}
+
+/// The `Min-SE` value of a 422 response (RFC 4028 §6).
+pub fn response_min_se(response: &Response) -> Option<u32> {
+    response.headers.iter().find_map(|h| match h {
+        TypedHeader::MinSE(min) => Some(min.delta_seconds),
+        _ => None,
+    })
+}
+
+/// Retire the tracked RFC 4028 proposal matching a final response's CSeq,
+/// returning whether that request carried `Session-Expires`.
+fn take_session_timer_request(dialog: &mut crate::dialog::Dialog, response: &Response) -> bool {
+    let Some(seq) = response.cseq().map(|cseq| cseq.seq) else {
+        return false;
+    };
+    let before = dialog.session_timer_request_cseqs.len();
+    dialog
+        .session_timer_request_cseqs
+        .retain(|tracked| *tracked != seq);
+    dialog.session_timer_request_cseqs.len() != before
+}
+
+/// Append `Require: 100rel` and `RSeq: <rseq>` to an outgoing 18x. Creates
+/// the `Require` header if absent, appends the tag otherwise.
+pub fn inject_reliable_provisional_headers(response: &mut Response, rseq: u32) {
+    use rvoip_sip_core::types::rseq::RSeq;
+    use rvoip_sip_core::types::{Require, TypedHeader};
+
+    let mut updated = false;
+    for header in response.headers.iter_mut() {
+        if let TypedHeader::Require(ref mut req) = header {
+            if !req.requires("100rel") {
+                req.add_tag("100rel");
+            }
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        response
+            .headers
+            .push(TypedHeader::Require(Require::with_tag("100rel")));
+    }
+    response.headers.push(TypedHeader::RSeq(RSeq::new(rseq)));
+}
+
+impl TransactionHelpers for DialogManager {
+    /// Associate a transaction with a dialog
+    ///
+    /// Creates the mapping between transactions and dialogs for proper message routing.
+    fn link_transaction_to_dialog(&self, transaction_id: &TransactionKey, dialog_id: &DialogId) {
+        self.link_transaction_to_dialog_indexed(transaction_id, dialog_id);
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), dialog=%dialog_id, "Linked transaction to dialog");
+    }
+
+    /// Create ACK for 2xx response using transaction-core helpers
+    ///
+    /// Uses transaction-core's ACK creation helpers while maintaining dialog-core concerns.
+    async fn create_ack_for_success_response(
+        &self,
+        original_invite_tx_id: &TransactionKey,
+        response: &Response,
+    ) -> DialogResult<Request> {
+        debug!("Creating ACK for 2xx response using transaction-core helpers");
+
+        // Use transaction-core's helper method to create ACK for 2xx response
+        // This ensures proper ACK construction according to RFC 3261
+        let ack_request = self
+            .transaction_manager
+            .create_ack_for_2xx(original_invite_tx_id, response)
+            .await
+            .map_err(|_error| crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("ack_for_success_build", "transaction_error"),
+            })?;
+
+        debug!("Successfully created ACK for 2xx response");
+        Ok(ack_request)
+    }
+}
+
+// Transaction Event Processing Implementation
+impl DialogManager {
+    /// Resolve the exact Request-URI owned by an outbound client transaction.
+    ///
+    /// Authentication retries must sign the URI that actually crossed the
+    /// wire. Dialog targets and session metadata may already have changed, so
+    /// they are deliberately not used as fallbacks. A method mismatch is a
+    /// correlation failure and therefore fails closed.
+    pub(crate) async fn exact_outbound_request_uri(
+        &self,
+        transaction_id: &TransactionKey,
+    ) -> Option<rvoip_sip_core::Uri> {
+        if transaction_id.is_server() {
+            return None;
+        }
+        match self
+            .transaction_manager
+            .original_request(transaction_id)
+            .await
+        {
+            Ok(Some(request)) if &request.method() == transaction_id.method() => {
+                Some(request.uri.clone())
+            }
+            Ok(Some(_)) => {
+                warn!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    "Original outbound request method did not match transaction key"
+                );
+                None
+            }
+            Ok(None) | Err(_) => {
+                if let Some(request_uri) = self
+                    .transaction_manager
+                    .auth_challenge_request_uri(transaction_id)
+                {
+                    return Some(request_uri);
+                }
+                warn!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    "Exact original outbound request was unavailable"
+                );
+                None
+            }
+        }
+    }
+
+    async fn emit_outbound_request_completed(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+        outcome: OutboundRequestOutcome,
+    ) {
+        if transaction_id.is_server()
+            || (transaction_id.method() != &rvoip_sip_core::Method::Invite
+                && !tracks_generic_outbound_request_completion(transaction_id.method()))
+        {
+            return;
+        }
+        self.emit_session_coordination_event(SessionCoordinationEvent::OutboundRequestCompleted {
+            dialog_id: dialog_id.clone(),
+            transaction_id: transaction_id.clone(),
+            method: transaction_id.method().clone(),
+            outcome,
+        })
+        .await;
+    }
+
+    /// Process a transaction event and update dialog state accordingly
+    ///
+    /// This is the core event-driven state management for dialogs based on
+    /// transaction layer events. It implements proper RFC 3261 dialog state transitions.
+    pub async fn process_transaction_event(
+        &self,
+        transaction_id: &TransactionKey,
+        dialog_id: &DialogId,
+        event: TransactionEvent,
+    ) -> DialogResult<()> {
+        self.process_transaction_event_with_causal_delivery(
+            transaction_id,
+            dialog_id,
+            event,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Internal event ingress carrying exact initial-INVITE response delivery
+    /// claims. The public API remains unchanged; only global routing can
+    /// obtain these authorities from the failover index.
+    pub(crate) async fn process_transaction_event_with_causal_delivery(
+        &self,
+        transaction_id: &TransactionKey,
+        dialog_id: &DialogId,
+        event: TransactionEvent,
+        selected_success_delivery: Option<SelectedInviteSuccessDeliveryClaim>,
+        cancel_terminal_delivery: Option<SelectedInviteSuccessDeliveryClaim>,
+    ) -> DialogResult<()> {
+        debug!(
+            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+            %dialog_id,
+            event=?crate::transaction::safe_diagnostics::SafeTransactionEvent::new(&event),
+            "Processing transaction event"
+        );
+
+        match event {
+            TransactionEvent::StateChanged {
+                previous_state,
+                new_state,
+                ..
+            } => {
+                self.handle_transaction_state_change(
+                    dialog_id,
+                    transaction_id,
+                    previous_state,
+                    new_state,
+                )
+                .await
+            }
+
+            TransactionEvent::SuccessResponse { response, .. } => {
+                self.handle_transaction_success_response(
+                    dialog_id,
+                    transaction_id,
+                    response,
+                    selected_success_delivery,
+                )
+                .await
+            }
+
+            TransactionEvent::FailureResponse { response, .. } => {
+                self.handle_transaction_failure_response(
+                    dialog_id,
+                    transaction_id,
+                    response,
+                    cancel_terminal_delivery,
+                )
+                .await
+            }
+
+            TransactionEvent::ProvisionalResponse { response, .. } => {
+                self.handle_transaction_provisional_response(dialog_id, transaction_id, response)
+                    .await
+            }
+
+            TransactionEvent::TransactionTerminated { .. } => {
+                self.handle_transaction_terminated(dialog_id, transaction_id)
+                    .await
+            }
+
+            TransactionEvent::TransactionTimeout { .. } => {
+                self.emit_outbound_request_completed(
+                    dialog_id,
+                    transaction_id,
+                    OutboundRequestOutcome::Timeout,
+                )
+                .await;
+                Ok(())
+            }
+
+            TransactionEvent::TransportError { .. } => {
+                self.emit_outbound_request_completed(
+                    dialog_id,
+                    transaction_id,
+                    OutboundRequestOutcome::TransportFailure,
+                )
+                .await;
+                Ok(())
+            }
+
+            TransactionEvent::Error {
+                transaction_id: Some(error_transaction_id),
+                ..
+            } if error_transaction_id == *transaction_id => {
+                // A transaction-scoped generic error is published only after
+                // the runner has fenced the exact transaction as Terminated /
+                // Destroyed. Treat its exact key as the earliest authoritative
+                // release observation for tracked INFO/REFER/NOTIFY/UPDATE.
+                // The later TransactionTerminated observation is safe because
+                // session-core removes only the exact current tracker owner.
+                self.emit_outbound_request_completed(
+                    dialog_id,
+                    transaction_id,
+                    OutboundRequestOutcome::TransportFailure,
+                )
+                .await;
+                Ok(())
+            }
+
+            TransactionEvent::Error {
+                transaction_id: Some(error_transaction_id),
+                ..
+            } => {
+                warn!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    error_transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&error_transaction_id),
+                    "Ignoring mismatched transaction error correlation"
+                );
+                Ok(())
+            }
+
+            TransactionEvent::Error {
+                transaction_id: None,
+                ..
+            } => Ok(()),
+
+            TransactionEvent::TimerTriggered { timer, .. } => {
+                debug!(
+                    timer_len=timer.len(),
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    %dialog_id,
+                    "Transaction timer triggered"
+                );
+                Ok(()) // Most timer events don't require dialog-level action
+            }
+
+            TransactionEvent::AckRequest { request, .. } => {
+                self.handle_ack_received_event(dialog_id, transaction_id, request)
+                    .await
+            }
+
+            TransactionEvent::AckReceived { .. } => {
+                // Non-2xx ACK is transaction-owned and only confirms receipt
+                // of a failed final response. It must not start UAS media or
+                // emit the session-layer 2xx ACK notification.
+                debug!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    %dialog_id,
+                    "Observed transaction-owned non-2xx ACK"
+                );
+                Ok(())
+            }
+
+            TransactionEvent::CancelReceived { .. } => {
+                // RFC 3261 §9.2. The transaction layer has already handled
+                // the wire responses for this matched UAS-side CANCEL
+                // (200 to CANCEL, 487 to INVITE). Dialog-core still owns the
+                // dialog/session lifecycle notification.
+                self.terminate_dialog_for_tx_and_emit_cancelled_authoritative(
+                    transaction_id,
+                    "CANCEL received",
+                )
+                .await
+            }
+
+            _ => {
+                debug!(
+                    %dialog_id,
+                    event=?crate::transaction::safe_diagnostics::SafeTransactionEvent::new(&event),
+                    "Unhandled transaction event type for dialog"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Handle transaction state changes and update dialog state accordingly
+    async fn handle_transaction_state_change(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+        previous_state: TransactionState,
+        new_state: TransactionState,
+    ) -> DialogResult<()> {
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), ?previous_state, ?new_state, dialog=%dialog_id, "Transaction state changed");
+
+        // Update dialog state based on transaction state changes
+        match new_state {
+            TransactionState::Completed => {
+                debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), dialog=%dialog_id, "Transaction completed");
+                // Transaction completed successfully - dialog remains active
+            }
+
+            TransactionState::Terminated => {
+                debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), dialog=%dialog_id, "Transaction terminated");
+                // Every transaction emits the explicit terminal observation
+                // after this state transition. Retain both the dialog mapping
+                // and route hash until then so sharded Timer/State/Terminal
+                // delivery cannot reorder or lose BYE terminal association.
+            }
+
+            _ => {
+                // Other state changes are informational
+                debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), ?new_state, dialog=%dialog_id, "Transaction state observed");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle successful responses from transactions
+    async fn handle_transaction_success_response(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+        response: Response,
+        selected_success_delivery: Option<SelectedInviteSuccessDeliveryClaim>,
+    ) -> DialogResult<()> {
+        info!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), status=response.status_code(), reason_len=response.reason_phrase().len(), dialog=%dialog_id, "Transaction received success response");
+
+        // Update dialog state based on successful response
+        let dialog_state_changed = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+            let old_state = dialog.state.clone();
+
+            // Update dialog with response information (remote tag, etc.)
+            if let Some(to_header) = response.to() {
+                if let Some(to_tag) = to_header.tag() {
+                    info!(dialog=%dialog_id, remote_tag_len=to_tag.len(), "Updating remote tag for dialog");
+                    dialog.set_remote_tag(to_tag.to_string());
+                } else {
+                    warn!("200 OK response has no To tag for dialog {}", dialog_id);
+                }
+            } else {
+                warn!("200 OK response has no To header for dialog {}", dialog_id);
+            }
+
+            // RFC 3261 §12.2.1.2: a successful target-refresh INVITE
+            // replaces the dialog's remote target with the response Contact.
+            // The authenticated initial-INVITE retry reuses the prepared
+            // dialog, so merely updating its tag/state leaves BYE and other
+            // later in-dialog requests aimed at the original Request-URI.
+            // Apply the Contact before publishing confirmation. The dialog
+            // enforces the SIPS downgrade invariant in `update_remote_target`.
+            if response.status().is_success()
+                && transaction_id.method() == &rvoip_sip_core::Method::Invite
+            {
+                match response.header(&HeaderName::Contact) {
+                    Some(TypedHeader::Contact(contacts)) => match contacts
+                        .0
+                        .first()
+                        .and_then(|contact| extract_uri_from_contact(contact).ok())
+                    {
+                        Some(remote_target) => {
+                            let contact_scheme = safe_uri_scheme_class(&remote_target);
+                            let contact_transport = safe_uri_transport_class(&remote_target);
+                            if !dialog.update_remote_target(remote_target) {
+                                warn!(
+                                    dialog=%dialog_id,
+                                    contact_scheme,
+                                    contact_transport,
+                                    required_scheme = "sips",
+                                    "Rejected insecure Contact target refresh for secure dialog"
+                                );
+                            }
+                        }
+                        None => warn!(
+                            dialog=%dialog_id,
+                            "Successful INVITE response contains an unusable Contact"
+                        ),
+                    },
+                    _ => warn!(
+                        dialog=%dialog_id,
+                        "Successful INVITE response has no Contact target refresh"
+                    ),
+                }
+            }
+
+            // RFC 3261 §20.5: track whether the peer allows UPDATE so RFC
+            // 4028 refreshes can skip straight to re-INVITE (§7.4).
+            if response.status().is_success()
+                && matches!(
+                    transaction_id.method(),
+                    rvoip_sip_core::Method::Invite | rvoip_sip_core::Method::Update
+                )
+            {
+                if let Some(allows) = allow_lists_update(&response.headers) {
+                    dialog.peer_allows_update = Some(allows);
+                }
+            }
+
+            // RFC 4028 §7.2/§7.4: a 2xx to this side's in-dialog re-INVITE or
+            // UPDATE renegotiates the session timer. The dialog-creating
+            // INVITE's 2xx is handled with the confirmation below.
+            let in_dialog_refresh_response = response.status().is_success()
+                && match transaction_id.method() {
+                    rvoip_sip_core::Method::Update => true,
+                    rvoip_sip_core::Method::Invite => {
+                        dialog.state == crate::dialog::DialogState::Confirmed
+                    }
+                    _ => false,
+                };
+            if in_dialog_refresh_response {
+                let proposed_timer = take_session_timer_request(&mut dialog, &response);
+                let current = dialog
+                    .session_expires_secs
+                    .map(|secs| (secs, dialog.is_session_refresher));
+                let next = uac_refresh_response_session_timer(&response, proposed_timer, current);
+                if next != current {
+                    info!(
+                        dialog=%dialog_id,
+                        expires=?next.map(|(secs, _)| secs),
+                        we_refresh=next.is_some_and(|(_, local)| local),
+                        "RFC 4028 refresh response renegotiated the session timer"
+                    );
+                }
+                dialog.session_expires_secs = next.map(|(secs, _)| secs);
+                dialog.is_session_refresher = next.is_some_and(|(_, local)| local);
+            }
+
+            // Update dialog state based on response status and current state
+            let state_changed = if response.status().is_success()
+                && transaction_id.method() == &rvoip_sip_core::Method::Invite
+            {
+                match dialog.state {
+                    crate::dialog::DialogState::Initial | crate::dialog::DialogState::Early => {
+                        dialog.state = crate::dialog::DialogState::Confirmed;
+
+                        // RFC 3261 §12.1.2: the UAC route set comes from the
+                        // dialog-forming 2xx's Record-Route, reversed, URI
+                        // parameters preserved. Overlays any RFC 3608
+                        // Service-Route preload; a 2xx without Record-Route
+                        // keeps that preload. Deliberately NOT re-learned on
+                        // re-INVITE 2xxs (§12.2 fixes the set for the
+                        // dialog's lifetime — see the Confirmed arm below).
+                        // Without this, BYE and every other in-dialog request
+                        // bypasses record-routing proxies and goes straight
+                        // to the peer Contact.
+                        let learned =
+                            crate::dialog::dialog_impl::route_set_from_response_for_uac(&response);
+                        if !learned.is_empty() {
+                            dialog.route_set = learned;
+                        }
+
+                        // CRITICAL FIX: Update dialog lookup now that we have both tags
+                        if let Some(tuple) = dialog.dialog_id_tuple() {
+                            let key = crate::manager::utils::DialogUtils::create_lookup_key(
+                                &tuple.0, &tuple.1, &tuple.2,
+                            );
+                            self.dialog_lookup.insert(key, dialog_id.clone());
+                            info!("Updated dialog lookup for confirmed dialog {}", dialog_id);
+                        }
+
+                        // RFC 4028 UAC: capture negotiated Session-Expires
+                        // from the 2xx. The refresher is whoever the peer
+                        // named; if the peer omitted `refresher=`, RFC 4028
+                        // §7.1 default for a UAC that originally requested
+                        // `refresher=uac` is that the UAC refreshes.
+                        use rvoip_sip_core::types::session_expires::Refresher;
+                        use rvoip_sip_core::types::TypedHeader;
+                        if let Some(se) = response.headers.iter().find_map(|h| {
+                            if let TypedHeader::SessionExpires(se) = h {
+                                Some(se)
+                            } else {
+                                None
+                            }
+                        }) {
+                            dialog.session_expires_secs = Some(se.delta_seconds);
+                            dialog.is_session_refresher =
+                                matches!(se.refresher, None | Some(Refresher::Uac),);
+                            info!(
+                                "UAC session timer negotiated: expires={}s, we_refresh={}",
+                                se.delta_seconds, dialog.is_session_refresher
+                            );
+                        }
+
+                        true
+                    }
+                    // A successful re-INVITE refreshes the existing dialog's
+                    // target above but never emits a second confirmation.
+                    crate::dialog::DialogState::Confirmed => false,
+                    crate::dialog::DialogState::Recovering
+                    | crate::dialog::DialogState::Terminated => false,
+                }
+            } else {
+                false
+            };
+
+            if state_changed {
+                Some((old_state, dialog.state.clone()))
+            } else {
+                None
+            }
+        };
+
+        // Emit dialog events for session-core
+        if let Some((old_state, new_state)) = dialog_state_changed {
+            self.emit_dialog_event(DialogEvent::StateChanged {
+                dialog_id: dialog_id.clone(),
+                old_state,
+                new_state,
+            })
+            .await;
+        }
+
+        let session_id_for_diag = self.get_session_id(dialog_id);
+        // SDP-bearing INVITE 2xx responses owned by session-core are ACKed
+        // only after that layer validates and applies the exact answer (or
+        // creates the delayed-offer ACK answer). Bodyless refresh responses
+        // and standalone dialog users retain automatic ACK behavior.
+        let deferred_session_ack = session_id_for_diag.is_some()
+            && transaction_id.method() == &rvoip_sip_core::Method::Invite
+            && response.status().is_success()
+            && !response.body().is_empty();
+
+        // Handle specific successful response types
+        match response.status_code() {
+            status if (200..300).contains(&status) => {
+                // Every 2xx to INVITE is ACKed by the UAC core (RFC 3261
+                // §13.2.2.4), including a direct final response with no 1xx.
+                if transaction_id.method() == &rvoip_sip_core::Method::Invite {
+                    crate::diagnostics::record_uac_invite_2xx_response();
+                    if let Some(session_id) = session_id_for_diag.as_deref() {
+                        crate::diagnostics::record_call_timing_uac_invite_2xx_response(session_id);
+                    }
+                    info!(status, dialog=%dialog_id, deferred_session_ack, "Received successful INVITE response");
+
+                    if !deferred_session_ack {
+                        crate::diagnostics::record_uac_invite_2xx_ack_attempt();
+                        if let Some(session_id) = session_id_for_diag.as_deref() {
+                            crate::diagnostics::record_call_timing_uac_ack_attempt(session_id);
+                        }
+                        match self
+                            .transaction_manager
+                            .send_ack_for_2xx(transaction_id, &response)
+                            .await
+                        {
+                            Ok(_) => {
+                                crate::diagnostics::record_uac_invite_2xx_ack_success();
+                                if let Some(session_id) = session_id_for_diag.as_deref() {
+                                    crate::diagnostics::record_call_timing_uac_ack_success(
+                                        session_id,
+                                    );
+                                }
+                                info!(status, "Successfully sent automatic ACK for INVITE 2xx");
+                            }
+                            Err(e) => {
+                                crate::diagnostics::record_uac_invite_2xx_ack_failure();
+                                if let Some(session_id) = session_id_for_diag.as_deref() {
+                                    crate::diagnostics::record_call_timing_uac_ack_failure(
+                                        session_id,
+                                    );
+                                }
+                                warn!(error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&e), status, "Failed to send automatic ACK for INVITE 2xx");
+                                return Err(crate::errors::DialogError::TransactionError {
+                                    message: safe_operation_failure(
+                                        "automatic_invite_2xx_ack",
+                                        "transaction_error",
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Any successful final response to BYE completes the
+                // transaction-layer wire exchange. ResponseReceived is
+                // converted into the exact typed session-lifecycle input; the
+                // completion handle remains a caller-facing receipt only.
+                if transaction_id.method() == &rvoip_sip_core::Method::Bye {
+                    info!(status, dialog=%dialog_id, "Received successful BYE response; exact completion owner will finalize the session");
+                }
+            }
+            _ => {
+                debug!(
+                    "Other successful response {} for dialog {}",
+                    response.status_code(),
+                    dialog_id
+                );
+            }
+        }
+
+        // A session-owned final response is causal input, not an observer
+        // notification. For INVITE 2xx this happens only after the mandatory
+        // ACK write succeeds, so the YAML transition cannot mark the call
+        // active ahead of the wire. Standalone dialog users have no session
+        // owner and therefore complete without event infrastructure.
+        if session_id_for_diag.is_some() {
+            self.notify_session_layer(SessionCoordinationEvent::ResponseReceived {
+                dialog_id: dialog_id.clone(),
+                response: response.clone(),
+                transaction_id: transaction_id.clone(),
+                request_uri: None,
+            })
+            .await?;
+        }
+
+        if deferred_session_ack {
+            crate::diagnostics::record_uac_invite_2xx_ack_attempt();
+            crate::diagnostics::record_uac_invite_2xx_ack_success();
+            if let Some(session_id) = session_id_for_diag.as_deref() {
+                crate::diagnostics::record_call_timing_uac_ack_attempt(session_id);
+                crate::diagnostics::record_call_timing_uac_ack_success(session_id);
+            }
+        }
+
+        // Commit immediately after the mandatory ACK write and acknowledged
+        // lifecycle delivery. Everything below is observational bookkeeping;
+        // cancellation or observer backpressure there must not make the same
+        // selected success application-visible twice.
+        if let Some(claim) = selected_success_delivery {
+            claim.commit();
+        }
+
+        // Initial INVITEs have no in-dialog request-tracker owner and the
+        // session layer ignores this exact completion. A re-INVITE does have
+        // one, so the same typed outcome closes auth/timeout ownership without
+        // manufacturing a second response parser. Tracked non-INVITE final
+        // responses are projected once from ResponseReceived above.
+        if transaction_id.method() == &rvoip_sip_core::Method::Invite {
+            self.emit_outbound_request_completed(
+                dialog_id,
+                transaction_id,
+                OutboundRequestOutcome::FinalResponse {
+                    status_code: response.status_code(),
+                },
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Handle failure responses from transactions
+    async fn handle_transaction_failure_response(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+        response: Response,
+        cancel_terminal_delivery: Option<SelectedInviteSuccessDeliveryClaim>,
+    ) -> DialogResult<()> {
+        if response.status_code() == 487
+            && transaction_id.method() == &rvoip_sip_core::Method::Invite
+        {
+            info!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), status=response.status_code(), reason_len=response.reason_phrase().len(), dialog=%dialog_id, "Transaction received CANCEL terminal response");
+        } else {
+            warn!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), status=response.status_code(), reason_len=response.reason_phrase().len(), dialog=%dialog_id, "Transaction received failure response");
+        }
+
+        let request_uri = if response_has_auth_challenge(&response) {
+            self.exact_outbound_request_uri(transaction_id).await
+        } else {
+            None
+        };
+
+        // RFC 4028 §7.4: a 422 to an in-dialog refresh names the peer's
+        // floor; every later refresh must carry at least that Min-SE.
+        if matches!(
+            transaction_id.method(),
+            rvoip_sip_core::Method::Invite | rvoip_sip_core::Method::Update
+        ) {
+            if let Ok(mut dialog) = self.get_dialog_mut(dialog_id) {
+                take_session_timer_request(&mut dialog, &response);
+                if response.status_code() == 422
+                    && dialog.state == crate::dialog::DialogState::Confirmed
+                {
+                    if let Some(min_se) = response_min_se(&response) {
+                        dialog.session_timer_peer_min_se = Some(
+                            dialog
+                                .session_timer_peer_min_se
+                                .map_or(min_se, |seen| seen.max(min_se)),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Handle specific failure cases and emit appropriate events
+        match response.status_code() {
+            487 if transaction_id.method() == &rvoip_sip_core::Method::Invite => {
+                // RFC 3261 §15.1.2 — the one ResponseReceived delivery below
+                // maps this exact INVITE outcome to cancellation. Do not
+                // manufacture a second CallCancelled lifecycle event.
+                info!("Call cancelled for dialog {}", dialog_id);
+            }
+
+            status
+                if transaction_id.method() == &rvoip_sip_core::Method::Bye
+                    && matches!(status, 408 | 481) =>
+            {
+                // RFC 3261 BYE terminates this endpoint's participation in
+                // the dialog. A 481 means the peer no longer has the dialog;
+                // 408 means the request timed out. Both are terminal for our
+                // local session state, but the exact session coordinator owns
+                // the terminal decision after observing this transaction
+                // outcome. Dialog-core must not create a competing lifecycle
+                // event.
+                debug!(status, dialog=%dialog_id, "BYE failure is retained for the exact completion owner");
+            }
+
+            status if status >= 400 && status < 500 && !response_has_auth_challenge(&response) => {
+                warn!(
+                    "Client error {} for dialog {}; canonical response delivery owns the outcome",
+                    status, dialog_id
+                );
+            }
+
+            status if matches!(status, 401 | 407) => {
+                debug!(
+                    "Auth challenge {} for dialog {} - deferring terminal failure handling",
+                    status, dialog_id
+                );
+            }
+
+            status if status >= 500 => {
+                warn!(
+                    "Server error {} for dialog {}; canonical response delivery owns the outcome",
+                    status, dialog_id
+                );
+            }
+
+            _ => {
+                debug!(
+                    "Other failure response {} for dialog {}",
+                    response.status_code(),
+                    dialog_id
+                );
+            }
+        }
+
+        // Deliver one exact final-response outcome to an attached session.
+        // Standalone dialog users deliberately have no session/event owner.
+        if self.get_session_id(dialog_id).is_some() {
+            self.notify_session_layer(SessionCoordinationEvent::ResponseReceived {
+                dialog_id: dialog_id.clone(),
+                response: response.clone(),
+                transaction_id: transaction_id.clone(),
+                request_uri,
+            })
+            .await?;
+        }
+
+        // Commit only after the exact terminal response reached its
+        // authoritative session route. A routing failure drops the claim back
+        // to Pending so an identical retransmission can retry; committed
+        // delivery makes every later copy observational only.
+        if let Some(claim) = cancel_terminal_delivery {
+            claim.commit();
+        }
+
+        // Preserve a challenged INVITE's exact tracker for authentication
+        // retry. Every other final re-INVITE outcome releases that immutable
+        // snapshot; tracked non-INVITE final responses are projected once from
+        // ResponseReceived above.
+        if transaction_id.method() == &rvoip_sip_core::Method::Invite
+            && !response_has_auth_challenge(&response)
+        {
+            self.emit_outbound_request_completed(
+                dialog_id,
+                transaction_id,
+                OutboundRequestOutcome::FinalResponse {
+                    status_code: response.status_code(),
+                },
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Handle provisional responses from transactions
+    async fn handle_transaction_provisional_response(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+        response: Response,
+    ) -> DialogResult<()> {
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), status=response.status_code(), reason_len=response.reason_phrase().len(), dialog=%dialog_id, "Transaction received provisional response");
+
+        // Update dialog state for early dialogs
+        let dialog_created = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+            let old_state = dialog.state.clone();
+
+            // For provisional responses with to-tag, create early dialog
+            if let Some(to_header) = response.to() {
+                if let Some(to_tag) = to_header.tag() {
+                    if dialog.remote_tag.is_none() {
+                        dialog.set_remote_tag(to_tag.to_string());
+                        // RFC 3261 §12.1.2: the early dialog's remote target
+                        // is the 18x Contact, so PRACK (RFC 3262) and early
+                        // UPDATE reach the UA that answered. A 2xx Contact
+                        // replaces it again on confirmation.
+                        if let Some(TypedHeader::Contact(contacts)) =
+                            response.header(&HeaderName::Contact)
+                        {
+                            if let Some(remote_target) = contacts
+                                .0
+                                .first()
+                                .and_then(|contact| extract_uri_from_contact(contact).ok())
+                            {
+                                if !dialog.update_remote_target(remote_target) {
+                                    debug!(
+                                        dialog=%dialog_id,
+                                        "Rejected insecure early-dialog Contact target"
+                                    );
+                                }
+                            }
+                        }
+                        if dialog.state == crate::dialog::DialogState::Initial {
+                            dialog.state = crate::dialog::DialogState::Early;
+                            Some((old_state, dialog.state.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        // Emit dialog state change if early dialog was created
+        if let Some((old_state, new_state)) = dialog_created {
+            self.emit_dialog_event(DialogEvent::StateChanged {
+                dialog_id: dialog_id.clone(),
+                old_state,
+                new_state,
+            })
+            .await;
+        }
+
+        // RFC 3262: auto-PRACK reliable provisionals.
+        // Only applies to 18x (101..200), and only when the response carries
+        // both Require: 100rel and an RSeq header.
+        let status = response.status_code();
+        if (101..200).contains(&status) {
+            if let Some(rseq_value) = detect_reliable_provisional(&response) {
+                let should_send = {
+                    let mut dialog = self.get_dialog_mut(dialog_id)?;
+                    match dialog.last_rseq_acked {
+                        Some(prev) if rseq_value <= prev => {
+                            debug!(
+                                "Ignoring duplicate/out-of-order reliable {}: dialog {} already acked RSeq {} (got {})",
+                                status, dialog_id, prev, rseq_value
+                            );
+                            false
+                        }
+                        _ => {
+                            dialog.last_rseq_acked = Some(rseq_value);
+                            true
+                        }
+                    }
+                };
+
+                if should_send {
+                    if let Err(e) = self.send_prack(dialog_id, rseq_value).await {
+                        warn!(dialog=%dialog_id, rseq=rseq_value, error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&e), "Auto-PRACK failed");
+                        // Roll back the ack record so a retransmit can re-trigger.
+                        if let Ok(mut dialog) = self.get_dialog_mut(dialog_id) {
+                            // Only roll back if we're still the most recent acker.
+                            if dialog.last_rseq_acked == Some(rseq_value) {
+                                dialog.last_rseq_acked = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle one role-specific provisional outcome. Attached sessions use
+        // acknowledged causal delivery; standalone dialog users deliberately
+        // do not require event infrastructure.
+        let has_session_owner = self.get_session_id(dialog_id).is_some();
+        match response.status_code() {
+            180 => {
+                info!("Call ringing for dialog {}", dialog_id);
+                if has_session_owner {
+                    self.notify_session_layer(SessionCoordinationEvent::CallRinging {
+                        dialog_id: dialog_id.clone(),
+                    })
+                    .await?;
+                }
+            }
+
+            183 => {
+                info!("Session progress for dialog {}", dialog_id);
+
+                // Check for early media (SDP in 183)
+                if !response.body().is_empty() {
+                    let sdp = String::from_utf8_lossy(response.body()).to_string();
+                    if has_session_owner {
+                        self.notify_session_layer(SessionCoordinationEvent::EarlyMedia {
+                            dialog_id: dialog_id.clone(),
+                            sdp,
+                        })
+                        .await?;
+                    }
+                } else if has_session_owner {
+                    self.notify_session_layer(SessionCoordinationEvent::CallProgress {
+                        dialog_id: dialog_id.clone(),
+                        status_code: response.status_code(),
+                        reason_phrase: response.reason_phrase().to_string(),
+                    })
+                    .await?;
+                }
+            }
+
+            _ => {
+                debug!(
+                    "Other provisional response {} for dialog {}",
+                    response.status_code(),
+                    dialog_id
+                );
+
+                if has_session_owner {
+                    self.notify_session_layer(SessionCoordinationEvent::CallProgress {
+                        dialog_id: dialog_id.clone(),
+                        status_code: response.status_code(),
+                        reason_phrase: response.reason_phrase().to_string(),
+                    })
+                    .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle transaction termination
+    async fn handle_transaction_terminated(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+    ) -> DialogResult<()> {
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), dialog=%dialog_id, "Transaction terminated for dialog");
+
+        // A UAS-side INVITE transaction can reach its transaction terminal
+        // observation before the end-to-end ACK is dispatched through
+        // dialog-core.  The ACK is correlated by transaction-core's retained
+        // server-INVITE dialog index, but its authoritative session delivery
+        // still requires this exact transaction -> dialog binding.  Removing
+        // the binding here makes terminal-vs-ACK queue ordering observable:
+        // a lightly loaded worker usually sees ACK first, while a burst can
+        // process TransactionTerminated first and then drop a valid ACK.
+        //
+        // Keep server INVITE ownership until the ACK handler completes or the
+        // dialog lifecycle removes all of its indexed transactions.  This is
+        // not a second lookup path: transaction_to_dialog remains the sole
+        // dialog-core binding, and dialog cleanup is its bounded no-ACK
+        // retirement owner.
+        if transaction_id.is_server() && transaction_id.method() == &rvoip_sip_core::Method::Invite
+        {
+            debug!(
+                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                dialog=%dialog_id,
+                "Retaining server INVITE dialog binding until ACK or dialog cleanup"
+            );
+            return Ok(());
+        }
+
+        // Clean up transaction-dialog association
+        self.unlink_transaction_from_dialog_indexed_preserving_route(transaction_id);
+
+        // Note: Other methods do not automatically terminate dialogs when
+        // transactions terminate because dialogs can have multiple
+        // transactions. Dialog termination is handled by higher-level logic
+        // (session-core) or explicit BYE requests.
+
+        Ok(())
+    }
+
+    /// Handle ACK received event (RFC 3261 compliant media start point for UAS)
+    pub(crate) async fn handle_ack_received_event(
+        &self,
+        dialog_id: &DialogId,
+        transaction_id: &TransactionKey,
+        request: rvoip_sip_core::Request,
+    ) -> DialogResult<()> {
+        if !transaction_id.is_server() || transaction_id.method() != &rvoip_sip_core::Method::Invite
+        {
+            return Err(DialogError::routing_error(
+                "ACK owner is not a server INVITE transaction",
+            ));
+        }
+
+        let mapped_dialog_id = self
+            .find_dialog_for_transaction(transaction_id)
+            .map_err(|_| {
+                DialogError::routing_error(
+                    "ACK server INVITE transaction has no exact dialog binding",
+                )
+            })?;
+        if mapped_dialog_id != *dialog_id {
+            return Err(DialogError::routing_error(
+                "ACK server INVITE transaction is bound to a different dialog",
+            ));
+        }
+
+        if self
+            .get_dialog_state(dialog_id)
+            .map(|state| state.is_terminated())
+            .unwrap_or(false)
+        {
+            debug!(dialog=%dialog_id, transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), "Ignoring ACK for terminated dialog");
+            return Ok(());
+        }
+
+        info!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), dialog=%dialog_id, "ACK received; media may start on UAS side");
+
+        // Extract any SDP from the ACK (though typically ACK doesn't have SDP for 2xx responses)
+        let negotiated_sdp = if !request.body().is_empty() {
+            let sdp = String::from_utf8_lossy(request.body()).to_string();
+            info!(body_len = request.body().len(), "ACK contains SDP body");
+            Some(sdp)
+        } else {
+            info!("ACK has no SDP body (normal for 2xx ACK)");
+            None
+        };
+
+        info!(
+            "🔔 About to emit AckReceived event for dialog {}",
+            dialog_id
+        );
+
+        // ACK is a causal signaling input: completion means the authoritative
+        // session handler accepted it, not merely that an observational bus
+        // publication was attempted.
+        self.notify_session_layer(SessionCoordinationEvent::AckReceived {
+            dialog_id: dialog_id.clone(),
+            transaction_id: transaction_id.clone(),
+            negotiated_sdp,
+        })
+        .await?;
+
+        // The first authoritatively delivered ACK closes dialog-core's need
+        // for the server INVITE binding.  Preserve the dispatch-route fence
+        // until a queued TransactionTerminated event has crossed the same
+        // shard; exact dialog cleanup also remains an idempotent fallback.
+        self.unlink_transaction_from_dialog_indexed_preserving_route(transaction_id);
+
+        info!("🚀 RFC 3261: Emitted AckReceived event for UAS side media creation");
+        Ok(())
+    }
+}
+
+// Additional transaction integration methods for DialogManager
+impl DialogManager {
+    /// Create server transaction for incoming request
+    ///
+    /// Helper to create server transactions with proper error handling.
+    pub async fn create_server_transaction_for_request(
+        &self,
+        request: Request,
+        source: SocketAddr,
+    ) -> DialogResult<TransactionKey> {
+        debug!(
+            method=%crate::transaction::safe_diagnostics::SafeMethod::new(&request.method()),
+            %source,
+            "Creating server transaction for request"
+        );
+
+        let server_transaction = self
+            .transaction_manager
+            .create_server_transaction(request, source)
+            .await
+            .map_err(|_error| crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("server_transaction_create", "transaction_error"),
+            })?;
+
+        let transaction_id = server_transaction.id().clone();
+
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id), "Created server transaction for request");
+        Ok(transaction_id)
+    }
+
+    /// Create client transaction for outgoing request
+    ///
+    /// Helper to create client transactions with method-specific handling.
+    pub async fn create_client_transaction_for_request(
+        &self,
+        request: Request,
+        destination: SocketAddr,
+        method: &Method,
+    ) -> DialogResult<TransactionKey> {
+        debug!(method=%crate::transaction::safe_diagnostics::SafeMethod::new(method), %destination, "Creating client transaction for request");
+
+        // STIR/SHAKEN (RFC 8224) — fire the request lifecycle for
+        // INVITE so the installed PASSporTSigner attaches an
+        // `Identity:` header. Generic helper paths land here when
+        // dialog-core's bespoke per-method send paths can't be used
+        // (e.g. raw out-of-dialog INVITE injection from upper layers).
+        let mut request = request;
+        if *method == Method::Invite {
+            use crate::manager::RequestLifecycle;
+            self.pre_send_request(&mut request, destination).await?;
+        }
+
+        let transaction_id = if *method == Method::Invite {
+            self.transaction_manager
+                .create_invite_client_transaction(request, destination)
+                .await
+        } else {
+            self.transaction_manager
+                .create_non_invite_client_transaction(request, destination)
+                .await
+        }
+        .map_err(|_error| crate::errors::DialogError::TransactionError {
+            message: safe_method_operation_failure(
+                "client_transaction_create",
+                "transaction_error",
+                method,
+            ),
+        })?;
+
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id), method=%crate::transaction::safe_diagnostics::SafeMethod::new(method), "Created client transaction for request");
+        Ok(transaction_id)
+    }
+
+    /// Terminate the dialog associated with an INVITE transaction and
+    /// optionally emit a `CallCancelled` session-coordination event.
+    ///
+    /// UAC and UAS CANCEL differ:
+    /// - UAC-side user cancel sends CANCEL and waits for the INVITE's final
+    ///   outcome before session-core publishes `CallCancelled`.
+    /// - UAS-side inbound CANCEL is already terminal for the pending INVITE
+    ///   once 200(CANCEL)/487(INVITE) has been sent, so dialog-core must
+    ///   publish `CallCancelled` to session-core.
+    async fn dialog_id_for_invite_tx(&self, invite_tx_id: &TransactionKey) -> Option<DialogId> {
+        if let Some(dialog_id) = self
+            .transaction_to_dialog
+            .get(invite_tx_id)
+            .map(|d| d.clone())
+        {
+            return Some(dialog_id);
+        } else {
+            match self
+                .transaction_manager
+                .get_server_transaction_request(invite_tx_id)
+                .await
+            {
+                Ok(request) => match self.find_dialog_for_request(&request).await {
+                    Some(dialog_id) => return Some(dialog_id),
+                    None => {
+                        warn!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(invite_tx_id), "Cannot emit CallCancelled: no dialog mapping or request match");
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    warn!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(invite_tx_id), error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&e), "Cannot emit CallCancelled: failed to fetch INVITE request");
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub async fn terminate_dialog_for_tx(&self, invite_tx_id: &TransactionKey, _reason: &str) {
+        let Some(dialog_id) = self.dialog_id_for_invite_tx(invite_tx_id).await else {
+            return;
+        };
+
+        if let Ok(mut dialog) = self.get_dialog_mut(&dialog_id) {
+            dialog.terminate();
+            debug!("Terminated dialog {} due to INVITE cancellation", dialog_id);
+        }
+    }
+
+    pub async fn terminate_dialog_for_tx_and_emit_cancelled(
+        &self,
+        invite_tx_id: &TransactionKey,
+        reason: &str,
+    ) {
+        if let Err(error) = self
+            .terminate_dialog_for_tx_and_emit_cancelled_authoritative(invite_tx_id, reason)
+            .await
+        {
+            warn!(
+                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(invite_tx_id),
+                error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&error),
+                "CANCEL compatibility facade could not deliver exact session lifecycle"
+            );
+        }
+    }
+
+    pub(crate) async fn terminate_dialog_for_tx_and_emit_cancelled_authoritative(
+        &self,
+        invite_tx_id: &TransactionKey,
+        reason: &str,
+    ) -> DialogResult<()> {
+        let Some(dialog_id) = self.dialog_id_for_invite_tx(invite_tx_id).await else {
+            return Err(crate::errors::DialogError::routing_error(
+                "CANCEL has no exact INVITE dialog owner",
+            ));
+        };
+
+        if let Ok(mut dialog) = self.get_dialog_mut(&dialog_id) {
+            dialog.terminate();
+            debug!("Terminated dialog {} due to INVITE cancellation", dialog_id);
+        }
+
+        if self.get_session_id(&dialog_id).is_some() {
+            self.notify_session_layer(SessionCoordinationEvent::CallCancelled {
+                dialog_id,
+                reason: reason.to_string(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Cancel an INVITE transaction using transaction-core
+    ///
+    /// Properly cancels INVITE transactions while updating associated dialogs.
+    pub async fn cancel_invite_transaction_with_dialog(
+        &self,
+        invite_tx_id: &TransactionKey,
+    ) -> DialogResult<TransactionKey> {
+        self.cancel_invite_transaction_with_dialog_and_extras(invite_tx_id, Vec::new())
+            .await
+    }
+
+    /// CANCEL with application extras. The transaction-manager helper
+    /// builds the wire CANCEL from the targeted INVITE (RFC 3261 §9.1
+    /// — same Call-ID/From/To/CSeq-num/Via-branch/Route). When extras
+    /// are supplied, they are appended to that wire form after the
+    /// stack-managed slice; the resulting CANCEL is sent on its own
+    /// new non-INVITE client transaction.
+    pub async fn cancel_invite_transaction_with_dialog_and_extras(
+        &self,
+        invite_tx_id: &TransactionKey,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+    ) -> DialogResult<TransactionKey> {
+        let operation = self.enter_invite_failover_operation().ok_or_else(|| {
+            crate::errors::DialogError::InvalidState {
+                expected: "dialog manager running".to_string(),
+                actual: "dialog manager draining or stopped".to_string(),
+            }
+        })?;
+        let manager = self.clone();
+        let invite_tx_id = invite_tx_id.clone();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let result = manager
+                .cancel_invite_transaction_with_dialog_and_extras_owned(
+                    &invite_tx_id,
+                    extra_headers,
+                )
+                .await;
+            let _ = completion_tx.send(result);
+        });
+        completion_rx.await.unwrap_or_else(|_| {
+            Err(crate::errors::DialogError::TransactionError {
+                message: safe_operation_failure("invite_cancel", "owned_task_failed"),
+            })
+        })
+    }
+
+    async fn cancel_invite_transaction_with_dialog_and_extras_owned(
+        &self,
+        invite_tx_id: &TransactionKey,
+        extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+    ) -> DialogResult<TransactionKey> {
+        debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(invite_tx_id), extra_header_count=extra_headers.len(), "Cancelling INVITE transaction with dialog cleanup");
+        let pre_cancel_dialog_id = self
+            .transaction_to_dialog
+            .get(invite_tx_id)
+            .map(|entry| entry.value().clone());
+
+        if let Some(dialog_id) = pre_cancel_dialog_id.as_ref() {
+            let plan_ids = self.invite_failover_plan_ids_for_dialog(dialog_id);
+            for plan_id in &plan_ids {
+                let Some(plan_arc) = self
+                    .invite_failover_plans
+                    .get(plan_id)
+                    .map(|entry| entry.value().clone())
+                else {
+                    continue;
+                };
+                let mut plan = plan_arc.lock().await;
+                if plan.id != *plan_id || &plan.dialog_id != dialog_id {
+                    continue;
+                }
+
+                match plan.cancel_dispatch_state {
+                    InviteCancelDispatchState::Sent => {
+                        return plan.cancel_transaction.as_deref().cloned().ok_or_else(|| {
+                            crate::errors::DialogError::InternalError {
+                                message: safe_operation_failure(
+                                    "invite_cancel",
+                                    "sent_owner_missing",
+                                ),
+                                context: None,
+                            }
+                        });
+                    }
+                    InviteCancelDispatchState::WireUnknown => {
+                        return Err(crate::errors::DialogError::TransactionError {
+                            message: safe_operation_failure(
+                                "invite_cancel",
+                                "wire_unknown_already_owned",
+                            ),
+                        });
+                    }
+                    InviteCancelDispatchState::Dispatching => {
+                        // The plan mutex is retained across dispatch, so this
+                        // state can only be observed after an invariant breach.
+                        return Err(crate::errors::DialogError::InvalidState {
+                            expected: "settled exact CANCEL dispatch".into(),
+                            actual: "orphan CANCEL dispatch owner".into(),
+                        });
+                    }
+                    InviteCancelDispatchState::Idle => {}
+                }
+
+                if !matches!(
+                    plan.phase,
+                    InviteFailoverPlanPhase::Active | InviteFailoverPlanPhase::WireUnknown
+                ) {
+                    continue;
+                }
+                let Some(current_transaction) = plan.current_transaction.clone() else {
+                    continue;
+                };
+
+                // The plan mutex is the one serialization point against
+                // failover, 487, and selected/late 2xx processing. Do not
+                // destroy the active payload until the transaction layer has
+                // classified the exact first-write boundary.
+                plan.cancel_dispatch_state = InviteCancelDispatchState::Dispatching;
+                let cancel_deadline = tokio::time::Instant::now()
+                    + self
+                        .transaction_manager
+                        .timer_settings()
+                        .transaction_timeout
+                        .max(INVITE_CANDIDATE_COMPENSATION_TIMEOUT);
+                let dispatch = tokio::time::timeout_at(
+                    cancel_deadline,
+                    self.transaction_manager
+                        .cancel_invite_transaction_with_extras_classified(
+                            &current_transaction,
+                            extra_headers,
+                        ),
+                )
+                .await;
+
+                match dispatch {
+                    Ok(Ok(cancel_transaction)) => {
+                        plan.cancel_dispatch_state = InviteCancelDispatchState::Sent;
+                        plan.cancel_transaction =
+                            Some(std::sync::Arc::new(cancel_transaction.clone()));
+                        Self::set_invite_attempt_outcome(
+                            &mut plan,
+                            &current_transaction,
+                            InviteFailoverAttemptOutcome::Cancelled,
+                        );
+                        if plan.phase == InviteFailoverPlanPhase::Active {
+                            self.close_active_invite_failover_plan(
+                                &mut plan,
+                                InviteFailoverPlanPhase::WireUnknown,
+                            );
+                        }
+                        debug!(
+                            invite_transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&current_transaction),
+                            cancel_transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&cancel_transaction),
+                            plan_id,
+                            "Dispatched the exact retained initial-INVITE CANCEL"
+                        );
+                        return Ok(cancel_transaction);
+                    }
+                    Ok(Err(
+                        crate::transaction::manager::CancelInviteTransactionFailure::ZeroWire {
+                            ..
+                        },
+                    )) => {
+                        plan.cancel_dispatch_state = InviteCancelDispatchState::Idle;
+                        plan.cancel_transaction = None;
+                        return Err(crate::errors::DialogError::TransactionError {
+                            message: safe_operation_failure("invite_cancel", "zero_wire"),
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        plan.cancel_dispatch_state = InviteCancelDispatchState::WireUnknown;
+                        plan.cancel_transaction = error
+                            .wire_unknown_transaction()
+                            .cloned()
+                            .map(std::sync::Arc::new);
+                        Self::set_invite_attempt_outcome(
+                            &mut plan,
+                            &current_transaction,
+                            InviteFailoverAttemptOutcome::Cancelled,
+                        );
+                        if plan.phase == InviteFailoverPlanPhase::Active {
+                            self.close_active_invite_failover_plan(
+                                &mut plan,
+                                InviteFailoverPlanPhase::WireUnknown,
+                            );
+                        }
+                        return Err(crate::errors::DialogError::TransactionError {
+                            message: safe_operation_failure("invite_cancel", "wire_unknown"),
+                        });
+                    }
+                    Err(_) => {
+                        // Dropping the send waiter after the bounded deadline
+                        // cannot prove whether the retained runner crossed its
+                        // conservative write boundary. Fence the author and
+                        // hand the exact original INVITE to terminal cleanup.
+                        plan.cancel_dispatch_state = InviteCancelDispatchState::WireUnknown;
+                        plan.cancel_transaction = None;
+                        Self::set_invite_attempt_outcome(
+                            &mut plan,
+                            &current_transaction,
+                            InviteFailoverAttemptOutcome::Cancelled,
+                        );
+                        if plan.phase == InviteFailoverPlanPhase::Active {
+                            self.close_active_invite_failover_plan(
+                                &mut plan,
+                                InviteFailoverPlanPhase::WireUnknown,
+                            );
+                        }
+                        return Err(Self::invite_setup_timeout("invite_cancel"));
+                    }
+                }
+            }
+
+            if !plan_ids.is_empty() {
+                return Err(crate::errors::DialogError::InvalidState {
+                    expected: "cancellable retained initial INVITE".into(),
+                    actual: "terminal or unowned initial INVITE plan".into(),
+                });
+            }
+        }
+
+        // Cancel the transaction using transaction-core
+        let cancel_deadline = tokio::time::Instant::now()
+            + self
+                .transaction_manager
+                .timer_settings()
+                .transaction_timeout
+                .max(INVITE_CANDIDATE_COMPENSATION_TIMEOUT);
+        let cancel_tx_id = match tokio::time::timeout_at(
+            cancel_deadline,
+            self.transaction_manager
+                .cancel_invite_transaction_with_extras(invite_tx_id, extra_headers),
+        )
+        .await
+        {
+            Ok(Ok(transaction_id)) => transaction_id,
+            Ok(Err(_)) => {
+                return Err(crate::errors::DialogError::TransactionError {
+                    message: safe_operation_failure("invite_cancel", "transaction_error"),
+                });
+            }
+            Err(_) => return Err(Self::invite_setup_timeout("invite_cancel")),
+        };
+
+        if let Some(dialog_id) = pre_cancel_dialog_id {
+            if let Ok(mut dialog) = self.get_dialog_mut(&dialog_id) {
+                dialog.terminate();
+                debug!("Terminated dialog {} after sending CANCEL", dialog_id);
+            }
+        } else {
+            self.terminate_dialog_for_tx(invite_tx_id, "INVITE transaction cancelled")
+                .await;
+        }
+
+        debug!(invite_transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(invite_tx_id), cancel_transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&cancel_tx_id), "Successfully cancelled INVITE transaction and created CANCEL transaction");
+        Ok(cancel_tx_id)
+    }
+
+    /// Get transaction statistics
+    ///
+    /// Provides insight into transaction-dialog associations.
+    pub fn get_transaction_statistics(&self) -> (usize, usize) {
+        let dialog_count = self.dialogs.len();
+        let transaction_mapping_count = self.transaction_to_dialog.len();
+
+        debug!(
+            "Transaction statistics: {} dialogs, {} transaction mappings",
+            dialog_count, transaction_mapping_count
+        );
+        (dialog_count, transaction_mapping_count)
+    }
+
+    /// Resolve the configured 100rel policy for outgoing INVITEs.
+    ///
+    /// Reads `DialogConfig.use_100rel` from the unified config when present,
+    /// otherwise defaults to `RelUsage::Supported` (advertise capability).
+    pub fn config_100rel_policy(&self) -> RelUsage {
+        self.config
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.dialog_config().use_100rel))
+            .unwrap_or_default()
+    }
+
+    /// Resolve session-timer settings for outgoing INVITEs.
+    ///
+    /// Returns `Some((session_expires_secs, min_se_secs))` when session
+    /// timers are enabled in the config, otherwise `None`.
+    pub fn config_session_timer_settings(&self) -> Option<(u32, u32)> {
+        self.config.read().ok().and_then(|g| {
+            g.as_ref().and_then(|c| {
+                let dc = c.dialog_config();
+                dc.session_timer_secs
+                    .map(|secs| (secs, dc.session_timer_min_se))
+            })
+        })
+    }
+
+    /// Send a PRACK request acknowledging a reliable provisional (RFC 3262 §7.2).
+    ///
+    /// Builds a PRACK within the given dialog whose `RAck` header references the
+    /// supplied `rseq` and the original INVITE's CSeq. A new non-INVITE client
+    /// transaction is created and sent. This is the low-level send — callers that
+    /// want auto-PRACK on receipt of a reliable 18x should go through
+    /// `handle_transaction_provisional_response`.
+    pub async fn send_prack(
+        &self,
+        dialog_id: &DialogId,
+        rseq: u32,
+    ) -> DialogResult<TransactionKey> {
+        debug!(
+            "Building PRACK for dialog {} acknowledging RSeq={}",
+            dialog_id, rseq
+        );
+
+        let (candidates, request) = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+
+            let invite_cseq = dialog.invite_cseq.ok_or_else(|| {
+                crate::errors::DialogError::protocol_error(
+                    "Cannot send PRACK: dialog has no INVITE CSeq recorded",
+                )
+            })?;
+
+            // Need both tags: PRACK is in-dialog and reliable 18x establishes an early dialog.
+            let local_tag = dialog.local_tag.clone().ok_or_else(|| {
+                crate::errors::DialogError::protocol_error("PRACK requires local tag")
+            })?;
+            let remote_tag = dialog.remote_tag.clone().ok_or_else(|| {
+                crate::errors::DialogError::protocol_error(
+                    "PRACK requires remote tag from the reliable 18x response",
+                )
+            })?;
+
+            // Increment local CSeq for the PRACK (it's a new transaction).
+            dialog.local_cseq += 1;
+            let prack_cseq = dialog.local_cseq;
+            let route_set = dialog.route_set.clone();
+            let call_id = dialog.call_id.clone();
+            let local_uri = dialog.local_uri.to_string();
+            // RFC 3262 §7.2 / RFC 3261 §12.2.1.1: PRACK is sent within the
+            // early dialog, so it targets the reliable 18x's Contact (the
+            // remote target), not the callee's AOR.
+            let target_uri = dialog.remote_target.clone();
+            let remote_uri = dialog.remote_uri.to_string();
+            let local_address = self.local_address_for_target_and_routes(&target_uri, &route_set);
+
+            let mut request = crate::transaction::dialog::prack_for_dialog(
+                call_id,
+                local_uri,
+                local_tag,
+                remote_uri,
+                remote_tag,
+                rseq,
+                invite_cseq,
+                prack_cseq,
+                local_address,
+                if route_set.is_empty() {
+                    None
+                } else {
+                    Some(route_set)
+                },
+            )
+            .map_err(|_error| crate::errors::DialogError::InternalError {
+                message: safe_operation_failure("prack_build", "builder_error"),
+                context: None,
+            })?;
+            request.uri = target_uri;
+
+            let next_hop =
+                crate::transaction::transport::multiplexed::exact_next_hop_uri_for_request(
+                    &request,
+                )
+                .map_err(|_| {
+                    crate::errors::DialogError::routing_error(
+                        "PRACK contains an unusable Route header",
+                    )
+                })?;
+            drop(dialog);
+            let candidates = self.resolve_uri_to_candidates(&next_hop).await;
+            if candidates.is_empty() {
+                return Err(crate::errors::DialogError::routing_error(
+                    "No address candidates for the exact PRACK next hop",
+                ));
+            }
+
+            (candidates, request)
+        };
+
+        let (transaction_id, _) = self
+            .send_request_with_candidate_failover(request, candidates, Some(dialog_id))
+            .await?;
+
+        info!(dialog=%dialog_id, transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id), rseq, "Sent PRACK");
+        Ok(transaction_id)
+    }
+
+    /// Cleanup orphaned transaction mappings
+    ///
+    /// Removes transaction-dialog mappings for terminated dialogs.
+    pub async fn cleanup_orphaned_transaction_mappings(&self) -> usize {
+        let mut orphaned_count = 0;
+        let active_dialog_ids: std::collections::HashSet<crate::dialog::DialogId> = self
+            .dialogs
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        // Collect orphaned transaction IDs
+        let orphaned_transactions: Vec<TransactionKey> = self
+            .transaction_to_dialog
+            .iter()
+            .filter_map(|entry| {
+                let dialog_id = entry.value();
+                if !active_dialog_ids.contains(dialog_id) {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove orphaned mappings
+        for tx_id in orphaned_transactions {
+            self.unlink_transaction_from_dialog_indexed(&tx_id);
+            orphaned_count += 1;
+        }
+
+        if orphaned_count > 0 {
+            debug!(
+                "Cleaned up {} orphaned transaction mappings",
+                orphaned_count
+            );
+        }
+
+        orphaned_count
+    }
+}
+
+#[cfg(test)]
+mod rfc4028_uas_session_timer_tests {
+    use super::{
+        apply_uas_session_timer_headers, detect_peer_timer_support, negotiate_uas_session_timer,
+        UasSessionTimerDecision,
+    };
+    use rvoip_sip_core::builder::SimpleRequestBuilder;
+    use rvoip_sip_core::types::min_se::MinSE;
+    use rvoip_sip_core::types::session_expires::{Refresher, SessionExpires};
+    use rvoip_sip_core::types::{Require, Supported, TypedHeader};
+    use rvoip_sip_core::{Method, Request, Response, StatusCode};
+
+    fn invite(headers: Vec<TypedHeader>) -> Request {
+        let mut request = SimpleRequestBuilder::new(Method::Invite, "sip:bob@example.com")
+            .unwrap()
+            .from("Alice", "sip:alice@example.com", Some("a1"))
+            .to("Bob", "sip:bob@example.com", None)
+            .call_id("rfc4028-uas")
+            .cseq(1)
+            .via("127.0.0.1:5060", "UDP", Some("z9hG4bK-rfc4028"))
+            .max_forwards(70)
+            .build();
+        request.headers.extend(headers);
+        request
+    }
+
+    fn supported_timer() -> TypedHeader {
+        TypedHeader::Supported(Supported::new(vec!["timer".to_string()]))
+    }
+
+    fn se(secs: u32, refresher: Option<Refresher>) -> TypedHeader {
+        TypedHeader::SessionExpires(SessionExpires::new(secs, refresher))
+    }
+
+    const LOCAL: Option<(u32, u32)> = Some((1800, 90));
+
+    fn accept(secs: u32, uas_refreshes: bool) -> UasSessionTimerDecision {
+        UasSessionTimerDecision::Accept {
+            session_secs: Some(secs),
+            uas_refreshes,
+        }
+    }
+
+    #[test]
+    fn timer_support_is_read_from_supported_or_require() {
+        assert!(!detect_peer_timer_support(&invite(vec![])));
+        assert!(detect_peer_timer_support(&invite(vec![supported_timer()])));
+        assert!(detect_peer_timer_support(&invite(vec![
+            TypedHeader::Require(Require::with_tag("timer"))
+        ])));
+        assert!(!detect_peer_timer_support(&invite(vec![
+            TypedHeader::Supported(Supported::new(vec!["100rel".to_string()]))
+        ])));
+    }
+
+    #[test]
+    fn uac_without_timer_support_makes_the_uas_the_refresher() {
+        // RFC 4028 §9 Table 2: UAC supports = N  ->  refresher = uas.
+        assert_eq!(
+            negotiate_uas_session_timer(&invite(vec![]), LOCAL),
+            accept(1800, true)
+        );
+        // A proxy-inserted Session-Expires, even one naming the UAC, cannot
+        // make a UAC that never advertised `timer` refresh.
+        assert_eq!(
+            negotiate_uas_session_timer(&invite(vec![se(600, Some(Refresher::Uac))]), LOCAL),
+            accept(600, true)
+        );
+        // Nor can it be rejected with a 422 the UAC cannot understand; an
+        // interval below the local Min-SE (never below 90 s, §5) is raised
+        // to it instead.
+        assert_eq!(
+            negotiate_uas_session_timer(&invite(vec![se(60, None)]), LOCAL),
+            accept(90, true)
+        );
+    }
+
+    #[test]
+    fn supporting_uac_refresher_choice_is_honored() {
+        let with = |refresher| invite(vec![supported_timer(), se(1200, refresher)]);
+        assert_eq!(
+            negotiate_uas_session_timer(&with(Some(Refresher::Uac)), LOCAL),
+            accept(1200, false)
+        );
+        assert_eq!(
+            negotiate_uas_session_timer(&with(Some(Refresher::Uas)), LOCAL),
+            accept(1200, true)
+        );
+        assert_eq!(
+            negotiate_uas_session_timer(&with(None), LOCAL),
+            accept(1200, false)
+        );
+        // Supported: timer but no Session-Expires: the UAS may request a timer.
+        assert_eq!(
+            negotiate_uas_session_timer(&invite(vec![supported_timer()]), LOCAL),
+            accept(1800, true)
+        );
+    }
+
+    #[test]
+    fn answered_interval_is_reduced_but_never_below_request_min_se() {
+        assert_eq!(
+            negotiate_uas_session_timer(&invite(vec![supported_timer(), se(7200, None)]), LOCAL),
+            accept(1800, false)
+        );
+        // A peer floor above our preference raises the interval instead of
+        // rejecting the call.
+        assert_eq!(
+            negotiate_uas_session_timer(
+                &invite(vec![
+                    supported_timer(),
+                    se(7200, None),
+                    TypedHeader::MinSE(MinSE::new(3600))
+                ]),
+                LOCAL
+            ),
+            accept(3600, false)
+        );
+        assert_eq!(
+            negotiate_uas_session_timer(
+                &invite(vec![
+                    supported_timer(),
+                    TypedHeader::MinSE(MinSE::new(3600))
+                ]),
+                LOCAL
+            ),
+            accept(3600, true)
+        );
+    }
+
+    #[test]
+    fn supporting_uac_below_local_min_se_gets_422() {
+        assert_eq!(
+            negotiate_uas_session_timer(&invite(vec![supported_timer(), se(60, None)]), LOCAL),
+            UasSessionTimerDecision::Reject422 { min_se: 90 }
+        );
+    }
+
+    #[test]
+    fn in_dialog_refresh_answers_the_requests_interval_and_refresher() {
+        use super::negotiate_uas_refresh_session_timer;
+        // RFC 4028 §9: the 2xx answers *this* refresh, not the old values.
+        let current = Some((1800, true));
+        assert_eq!(
+            negotiate_uas_refresh_session_timer(
+                &invite(vec![supported_timer(), se(600, Some(Refresher::Uac))]),
+                LOCAL,
+                current
+            ),
+            accept(600, false)
+        );
+        assert_eq!(
+            negotiate_uas_refresh_session_timer(
+                &invite(vec![supported_timer(), se(900, Some(Refresher::Uas))]),
+                LOCAL,
+                Some((600, false))
+            ),
+            accept(900, true)
+        );
+        // A timer-capable peer below the floor gets 422 mid-dialog too.
+        assert_eq!(
+            negotiate_uas_refresh_session_timer(
+                &invite(vec![supported_timer(), se(60, None)]),
+                LOCAL,
+                current
+            ),
+            UasSessionTimerDecision::Reject422 { min_se: 90 }
+        );
+        // No Session-Expires: keep the running interval. A timer-capable
+        // refresher stays the refresher; otherwise this UAS takes over.
+        assert_eq!(
+            negotiate_uas_refresh_session_timer(
+                &invite(vec![supported_timer()]),
+                LOCAL,
+                Some((600, false))
+            ),
+            accept(600, false)
+        );
+        assert_eq!(
+            negotiate_uas_refresh_session_timer(&invite(vec![]), LOCAL, Some((600, false))),
+            accept(600, true)
+        );
+        // ...and never starts a timer the dialog did not have.
+        assert_eq!(
+            negotiate_uas_refresh_session_timer(&invite(vec![supported_timer()]), LOCAL, None),
+            UasSessionTimerDecision::Accept {
+                session_secs: None,
+                uas_refreshes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_response_renegotiates_or_disables_the_timer() {
+        use super::uac_refresh_response_session_timer;
+        let with_se = |secs, refresher| {
+            let mut response = ok();
+            response.headers.push(se(secs, refresher));
+            response
+        };
+        let current = Some((1800, true));
+        // RFC 4028 §7.4: the 2xx interval and refresher replace the old ones;
+        // `uac` names this side (the sender of the refresh).
+        assert_eq!(
+            uac_refresh_response_session_timer(&with_se(600, Some(Refresher::Uac)), true, current),
+            Some((600, true))
+        );
+        assert_eq!(
+            uac_refresh_response_session_timer(&with_se(600, Some(Refresher::Uas)), true, current),
+            Some((600, false))
+        );
+        // §7.2: a 2xx without Session-Expires to a request that proposed
+        // one means there is no session expiration any more.
+        assert_eq!(
+            uac_refresh_response_session_timer(&ok(), true, current),
+            None
+        );
+        // A 2xx to a request that never proposed a timer changes nothing.
+        assert_eq!(
+            uac_refresh_response_session_timer(&ok(), false, current),
+            current
+        );
+    }
+
+    #[test]
+    fn allow_header_decides_whether_update_is_usable() {
+        use super::allow_lists_update;
+        use rvoip_sip_core::types::Allow;
+        assert_eq!(allow_lists_update(&[]), None);
+        assert_eq!(
+            allow_lists_update(&[TypedHeader::Allow(Allow::from_methods([
+                Method::Invite,
+                Method::Ack,
+                Method::Bye,
+            ]))]),
+            Some(false)
+        );
+        assert_eq!(
+            allow_lists_update(&[TypedHeader::Allow(Allow::from_methods([
+                Method::Invite,
+                Method::Update,
+            ]))]),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn disabled_local_timers_never_negotiate() {
+        assert_eq!(
+            negotiate_uas_session_timer(&invite(vec![supported_timer(), se(1800, None)]), None),
+            UasSessionTimerDecision::Accept {
+                session_secs: None,
+                uas_refreshes: false,
+            }
+        );
+    }
+
+    fn header_values(request: &Request) -> (Vec<(u32, Option<Refresher>)>, Vec<u32>, usize) {
+        let se = request
+            .headers
+            .iter()
+            .filter_map(|h| match h {
+                TypedHeader::SessionExpires(se) => Some((se.delta_seconds, se.refresher)),
+                _ => None,
+            })
+            .collect();
+        let min_se = request
+            .headers
+            .iter()
+            .filter_map(|h| match h {
+                TypedHeader::MinSE(min) => Some(min.delta_seconds),
+                _ => None,
+            })
+            .collect();
+        let supported_timer = request
+            .headers
+            .iter()
+            .filter(|h| matches!(h, TypedHeader::Supported(s) if s.supports("timer")))
+            .count();
+        (se, min_se, supported_timer)
+    }
+
+    #[test]
+    fn initial_invite_injection_never_duplicates_staged_headers() {
+        // A refresh or 422 retry stages its own Session-Expires/Min-SE; the
+        // config injection must not add a second copy (which made the
+        // refresh re-INVITE unbuildable).
+        let mut request = invite(vec![
+            se(120, Some(Refresher::Uac)),
+            TypedHeader::MinSE(MinSE::new(120)),
+            supported_timer(),
+        ]);
+        super::inject_session_timer_headers(&mut request, 1800, 90);
+        assert_eq!(
+            header_values(&request),
+            (vec![(120, Some(Refresher::Uac))], vec![120], 1)
+        );
+
+        let mut request = invite(vec![]);
+        super::inject_session_timer_headers(&mut request, 1800, 90);
+        assert_eq!(
+            header_values(&request),
+            (vec![(1800, Some(Refresher::Uac))], vec![90], 1)
+        );
+    }
+
+    #[test]
+    fn reinvite_keeps_negotiated_interval_and_current_refresher() {
+        // RFC 4028 §7.4.
+        let mut request = invite(vec![]);
+        super::inject_in_dialog_session_timer_headers(&mut request, Some((600, false)), 90);
+        assert_eq!(
+            header_values(&request),
+            (vec![(600, Some(Refresher::Uas))], vec![90], 1)
+        );
+
+        let mut request = invite(vec![]);
+        super::inject_in_dialog_session_timer_headers(&mut request, Some((600, true)), 90);
+        assert_eq!(
+            header_values(&request),
+            (vec![(600, Some(Refresher::Uac))], vec![90], 1)
+        );
+
+        // No negotiated timer: only advertise support, never start one.
+        let mut request = invite(vec![]);
+        super::inject_in_dialog_session_timer_headers(&mut request, None, 90);
+        assert_eq!(header_values(&request), (vec![], vec![], 1));
+
+        // An explicit refresh's headers win.
+        let mut request = invite(vec![se(600, Some(Refresher::Uac)), supported_timer()]);
+        super::inject_in_dialog_session_timer_headers(&mut request, Some((600, false)), 90);
+        assert_eq!(
+            header_values(&request),
+            (vec![(600, Some(Refresher::Uac))], vec![90], 1)
+        );
+    }
+
+    fn ok() -> Response {
+        Response::new(StatusCode::Ok)
+    }
+
+    fn requires_timer(response: &Response) -> bool {
+        response
+            .headers
+            .iter()
+            .any(|h| matches!(h, TypedHeader::Require(r) if r.requires("timer")))
+    }
+
+    fn session_expires(response: &Response) -> Option<(u32, Option<Refresher>)> {
+        response.headers.iter().find_map(|h| match h {
+            TypedHeader::SessionExpires(se) => Some((se.delta_seconds, se.refresher)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn response_to_uac_without_timer_support_omits_require_timer() {
+        let mut response = ok();
+        apply_uas_session_timer_headers(&mut response, 1800, true, false);
+        assert_eq!(
+            session_expires(&response),
+            Some((1800, Some(Refresher::Uas)))
+        );
+        assert!(!requires_timer(&response));
+    }
+
+    #[test]
+    fn response_to_supporting_uac_requires_timer() {
+        for uas_refreshes in [true, false] {
+            let mut response = ok();
+            apply_uas_session_timer_headers(&mut response, 900, uas_refreshes, true);
+            let refresher = if uas_refreshes {
+                Refresher::Uas
+            } else {
+                Refresher::Uac
+            };
+            assert_eq!(session_expires(&response), Some((900, Some(refresher))));
+            assert!(requires_timer(&response));
+        }
+        // An existing Require gains the tag instead of a second header.
+        let mut response = ok();
+        response
+            .headers
+            .push(TypedHeader::Require(Require::with_tag("100rel")));
+        apply_uas_session_timer_headers(&mut response, 900, true, true);
+        let requires: Vec<_> = response
+            .headers
+            .iter()
+            .filter_map(|h| match h {
+                TypedHeader::Require(r) => Some(r.option_tags.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            requires,
+            vec![vec!["100rel".to_string(), "timer".to_string()]]
+        );
+    }
+}

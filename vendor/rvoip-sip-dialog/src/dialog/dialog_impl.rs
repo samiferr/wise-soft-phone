@@ -1,0 +1,1185 @@
+//! Dialog implementation for RFC 3261 SIP dialogs
+//!
+//! This module contains the main Dialog struct and its implementation,
+//! handling dialog creation, state management, and request/response processing.
+
+use crate::diagnostics::safe_log::method_class;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::net::SocketAddr;
+use std::time::Duration;
+use tracing::debug;
+
+use rvoip_sip_core::{
+    types::uri::Scheme, HeaderName, Method, Request, Response, StatusCode, TypedHeader, Uri,
+};
+
+use crate::transaction::utils::DialogRequestTemplate;
+
+use super::dialog_id::DialogId;
+use super::dialog_state::DialogState;
+use super::dialog_utils::extract_uri_from_contact;
+use super::subscription_state::SubscriptionState;
+use crate::errors::{DialogError, DialogResult};
+
+/// A SIP dialog as defined in RFC 3261
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Dialog {
+    /// Unique identifier for this dialog
+    pub id: DialogId,
+
+    /// Current state of the dialog
+    pub state: DialogState,
+
+    /// Call-ID for this dialog
+    pub call_id: String,
+
+    /// Local URI
+    pub local_uri: Uri,
+
+    /// Remote URI
+    pub remote_uri: Uri,
+
+    /// Local tag
+    pub local_tag: Option<String>,
+
+    /// Remote tag
+    pub remote_tag: Option<String>,
+
+    /// Local sequence number
+    pub local_cseq: u32,
+
+    /// Remote sequence number
+    pub remote_cseq: u32,
+
+    /// Remote target URI (where to send requests)
+    pub remote_target: Uri,
+
+    /// End-to-end SIPS confidentiality requirement inherited from the
+    /// dialog-forming request. This survives Contact target refreshes so a
+    /// later `sip:` Contact cannot silently downgrade an established secure
+    /// dialog.
+    #[serde(default)]
+    pub secure_transport_required: bool,
+
+    /// Pinned only by an opted-in initial INVITE on an observed TLS transaction.
+    #[serde(default)]
+    pub allow_tls_contact_on_sips: bool,
+
+    /// Exact admitted TLS flow for the opt-in direct-peer Contact workaround.
+    /// Process-local: never restore a stale flow ID from persisted dialogs.
+    #[serde(skip)]
+    pub tls_contact_flow: Option<(Uri, rvoip_sip_transport::TransportRoute)>,
+
+    /// Route set for this dialog
+    pub route_set: Vec<Uri>,
+
+    /// Whether this dialog was created by local UA (true) or remote UA (false)
+    pub is_initiator: bool,
+
+    /// Last known good remote socket address
+    pub last_known_remote_addr: Option<std::net::SocketAddr>,
+
+    /// Time of the last successful transaction
+    pub last_successful_transaction_time: Option<std::time::SystemTime>,
+
+    /// Number of recovery attempts made
+    pub recovery_attempts: u32,
+
+    /// Reason for recovery (if in recovering state)
+    pub recovery_reason: Option<String>,
+
+    /// Time when the dialog was last successfully recovered
+    pub recovered_at: Option<std::time::SystemTime>,
+
+    /// Time when recovery was started
+    pub recovery_start_time: Option<std::time::SystemTime>,
+
+    // Subscription-specific fields (RFC 6665)
+    /// Subscription state for event subscriptions
+    pub subscription_state: Option<SubscriptionState>,
+
+    /// Event package being subscribed to (e.g., "presence", "dialog", "message-summary")
+    pub event_package: Option<String>,
+
+    /// Event ID for this subscription (if any)
+    pub event_id: Option<String>,
+
+    /// Number of failed refresh attempts
+    pub refresh_failures: u32,
+
+    /// Maximum refresh failures before termination
+    pub max_refresh_failures: u32,
+
+    // PRACK / 100rel fields (RFC 3262)
+    /// CSeq number of the INVITE that created this dialog.
+    ///
+    /// Captured by the UAC when the initial INVITE is sent, and by the UAS
+    /// when the INVITE is received. Needed to populate the `RAck` header
+    /// when sending PRACK in response to a reliable provisional.
+    pub invite_cseq: Option<u32>,
+
+    /// Highest `RSeq` value that has already been acknowledged by PRACK on
+    /// this dialog. Used to drop retransmitted reliable provisionals and
+    /// preserve RFC 3262 §4 monotonic ordering.
+    pub last_rseq_acked: Option<u32>,
+
+    /// Monotonic `RSeq` counter for UAS-originated reliable provisionals on
+    /// this dialog (RFC 3262 §3). Incremented before being placed on the
+    /// wire; initial value is chosen by `next_local_rseq()` to pick a random
+    /// starting point per RFC 3262 §7.1.
+    pub local_rseq_counter: u32,
+
+    /// Whether the peer advertised the `100rel` option tag (in `Supported`
+    /// or `Require`) on the dialog-creating INVITE. Used by the UAS to
+    /// decide whether an outgoing 18x response should be sent reliably.
+    pub peer_supports_100rel: bool,
+
+    // Session timer state (RFC 4028)
+    /// Negotiated session-expires interval in seconds. `None` when session
+    /// timers are disabled or not negotiated on this dialog.
+    pub session_expires_secs: Option<u32>,
+
+    /// Whether we are the refresher (per the `refresher=` parameter of the
+    /// negotiated `Session-Expires` header). Only meaningful when
+    /// `session_expires_secs.is_some()`.
+    pub is_session_refresher: bool,
+
+    /// Whether the peer listed `UPDATE` in the `Allow` header of its last
+    /// INVITE, re-INVITE, UPDATE or 2xx to one. `None` until the peer sends
+    /// an `Allow` header: RFC 3261 §20.5 makes its absence uninformative, so
+    /// only an explicit list without UPDATE rules UPDATE out (RFC 4028 §7.4
+    /// refreshes then go straight to re-INVITE).
+    pub peer_allows_update: Option<bool>,
+
+    /// Largest `Min-SE` the peer sent in a 422 to an in-dialog session
+    /// refresh (RFC 4028 §7.4). Later refreshes must not go below it.
+    pub session_timer_peer_min_se: Option<u32>,
+
+    /// CSeq numbers of this side's in-flight INVITE/UPDATE requests that
+    /// carried `Session-Expires`. A 2xx to one of them without
+    /// `Session-Expires` turns the session timer off (RFC 4028 §7.2, §7.4);
+    /// a 2xx to a request that never proposed a timer leaves it alone.
+    pub session_timer_request_cseqs: Vec<u32>,
+}
+
+impl fmt::Debug for Dialog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Dialog")
+            .field("id", &self.id)
+            .field("state", &self.state)
+            .field("call_id_len", &self.call_id.len())
+            .field("local_uri", &"[redacted]")
+            .field("remote_uri", &"[redacted]")
+            .field("local_tag_present", &self.local_tag.is_some())
+            .field("remote_tag_present", &self.remote_tag.is_some())
+            .field("local_cseq", &self.local_cseq)
+            .field("remote_cseq", &self.remote_cseq)
+            .field("remote_target", &"[redacted]")
+            .field("secure_transport_required", &self.secure_transport_required)
+            .field("route_count", &self.route_set.len())
+            .field("is_initiator", &self.is_initiator)
+            .field("last_known_remote_addr", &self.last_known_remote_addr)
+            .field("recovery_attempts", &self.recovery_attempts)
+            .field("recovery_reason_present", &self.recovery_reason.is_some())
+            .field(
+                "subscription_state_present",
+                &self.subscription_state.is_some(),
+            )
+            .field("event_package_present", &self.event_package.is_some())
+            .field("event_id_present", &self.event_id.is_some())
+            .field("refresh_failures", &self.refresh_failures)
+            .field("max_refresh_failures", &self.max_refresh_failures)
+            .field("invite_cseq", &self.invite_cseq)
+            .field("last_rseq_acked", &self.last_rseq_acked)
+            .field("session_expires_secs", &self.session_expires_secs)
+            .field("is_session_refresher", &self.is_session_refresher)
+            .field("peer_allows_update", &self.peer_allows_update)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Dialog {
+    /// Create a new dialog
+    pub fn new(
+        call_id: String,
+        local_uri: Uri,
+        remote_uri: Uri,
+        local_tag: Option<String>,
+        remote_tag: Option<String>,
+        is_initiator: bool,
+    ) -> Self {
+        let secure_transport_required = matches!(
+            (local_uri.scheme(), remote_uri.scheme()),
+            (Scheme::Sips, _) | (_, Scheme::Sips)
+        );
+        Self {
+            id: DialogId::new(),
+            state: DialogState::Initial,
+            call_id,
+            local_uri,
+            remote_uri: remote_uri.clone(),
+            local_tag,
+            remote_tag,
+            local_cseq: 0,
+            remote_cseq: 0,
+            remote_target: remote_uri, // Initially same as remote URI
+            secure_transport_required,
+            allow_tls_contact_on_sips: false,
+            tls_contact_flow: None,
+            route_set: Vec::new(),
+            is_initiator,
+            last_known_remote_addr: None,
+            last_successful_transaction_time: None,
+            recovery_attempts: 0,
+            recovery_reason: None,
+            recovered_at: None,
+            recovery_start_time: None,
+            subscription_state: None,
+            event_package: None,
+            event_id: None,
+            refresh_failures: 0,
+            max_refresh_failures: 3,
+            invite_cseq: None,
+            last_rseq_acked: None,
+            local_rseq_counter: 0,
+            peer_supports_100rel: false,
+            session_expires_secs: None,
+            is_session_refresher: false,
+            peer_allows_update: None,
+            session_timer_peer_min_se: None,
+            session_timer_request_cseqs: Vec::new(),
+        }
+    }
+
+    /// Create a new early dialog
+    pub fn new_early(
+        call_id: String,
+        local_uri: Uri,
+        remote_uri: Uri,
+        local_tag: Option<String>,
+        remote_tag: Option<String>,
+        is_initiator: bool,
+    ) -> Self {
+        let mut dialog = Self::new(
+            call_id,
+            local_uri,
+            remote_uri,
+            local_tag,
+            remote_tag,
+            is_initiator,
+        );
+        dialog.state = DialogState::Early;
+        dialog
+    }
+
+    /// Generate a local tag for this dialog
+    pub fn generate_local_tag(&self) -> String {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        format!("{:08x}", rng.gen::<u32>())
+    }
+
+    /// Confirm the dialog with a local tag
+    pub fn confirm_with_tag(&mut self, local_tag: String) {
+        self.local_tag = Some(local_tag);
+        self.state = DialogState::Confirmed;
+    }
+
+    /// Update remote sequence number from an incoming request
+    pub fn update_remote_sequence(&mut self, request: &Request) -> DialogResult<()> {
+        if let Some(TypedHeader::CSeq(cseq)) = request.header(&HeaderName::CSeq) {
+            let new_seq = cseq.sequence();
+
+            // Validate sequence number (should be higher than last known)
+            if new_seq <= self.remote_cseq && self.remote_cseq != 0 {
+                return Err(DialogError::protocol_error(&format!(
+                    "Invalid CSeq: got {}, expected > {}",
+                    new_seq, self.remote_cseq
+                )));
+            }
+
+            self.remote_cseq = new_seq;
+            Ok(())
+        } else {
+            Err(DialogError::protocol_error("Request missing CSeq header"))
+        }
+    }
+
+    /// Get the remote target address (for sending requests)
+    pub async fn get_remote_target_address(&self) -> Option<SocketAddr> {
+        // Use the last known address if available
+        if let Some(addr) = self.last_known_remote_addr {
+            return Some(addr);
+        }
+
+        // Otherwise, try to resolve the remote target URI
+        crate::dialog::dialog_utils::resolve_uri_to_socketaddr(&self.remote_target).await
+    }
+
+    /// Create a dialog from a 2xx response to an INVITE
+    pub fn from_2xx_response(
+        request: &Request,
+        response: &Response,
+        is_initiator: bool,
+    ) -> Option<Self> {
+        if !matches!(response.status, StatusCode::Ok | StatusCode::Accepted) {
+            debug!(
+                "Dialog creation failed: Response status is not 200 OK or 202 Accepted ({})",
+                response.status
+            );
+            return None;
+        }
+
+        if request.method != Method::Invite {
+            debug!(
+                "Dialog creation failed: Request method is not INVITE ({})",
+                method_class(&request.method)
+            );
+            return None;
+        }
+
+        // Extract Call-ID
+        let call_id = match response.header(&HeaderName::CallId) {
+            Some(TypedHeader::CallId(call_id)) => call_id.to_string(),
+            _ => {
+                debug!("Dialog creation failed: Missing or invalid Call-ID header");
+                return None;
+            }
+        };
+
+        // Extract CSeq
+        let cseq_number = match request.header(&HeaderName::CSeq) {
+            Some(TypedHeader::CSeq(cseq)) => cseq.sequence(),
+            _ => {
+                debug!("Dialog creation failed: Missing or invalid CSeq header in request");
+                return None;
+            }
+        };
+
+        // Extract To and From headers
+        let to_header = match response.header(&HeaderName::To) {
+            Some(TypedHeader::To(to)) => to,
+            _ => {
+                debug!("Dialog creation failed: Missing or invalid To header");
+                return None;
+            }
+        };
+
+        let from_header = match response.header(&HeaderName::From) {
+            Some(TypedHeader::From(from)) => from,
+            _ => {
+                debug!("Dialog creation failed: Missing or invalid From header");
+                return None;
+            }
+        };
+
+        // Extract tags
+        let to_tag = to_header.tag();
+        let from_tag = from_header.tag();
+
+        // Set local and remote tags and URIs based on initiator status
+        let (local_tag, remote_tag, local_uri, remote_uri) = if is_initiator {
+            // Local UA initiated, so local is From, remote is To
+            (
+                from_tag.map(|s| s.to_string()),
+                to_tag.map(|s| s.to_string()),
+                from_header.uri().clone(),
+                to_header.uri().clone(),
+            )
+        } else {
+            // Remote UA initiated, so local is To, remote is From
+            (
+                to_tag.map(|s| s.to_string()),
+                from_tag.map(|s| s.to_string()),
+                to_header.uri().clone(),
+                from_header.uri().clone(),
+            )
+        };
+
+        // Extract contact URI
+        let remote_target = match response.header(&HeaderName::Contact) {
+            Some(TypedHeader::Contact(contacts)) => {
+                if let Some(contact) = contacts.0.first() {
+                    extract_uri_from_contact(contact).ok()?
+                } else {
+                    debug!("Dialog creation failed: Empty Contact header");
+                    return None;
+                }
+            }
+            _ => {
+                debug!("Dialog creation failed: Missing Contact header");
+                return None;
+            }
+        };
+        let secure_transport_required = matches!(request.uri().scheme(), Scheme::Sips)
+            || matches!(local_uri.scheme(), Scheme::Sips)
+            || matches!(remote_uri.scheme(), Scheme::Sips);
+        if secure_transport_required && !matches!(remote_target.scheme(), Scheme::Sips) {
+            debug!("Dialog creation failed: secure dialog received a non-SIPS Contact");
+            return None;
+        }
+
+        // Extract Route set from Record-Route headers
+        let route_set = extract_route_set(response, is_initiator);
+
+        Some(Self {
+            id: DialogId::new(),
+            state: DialogState::Confirmed,
+            call_id,
+            local_uri,
+            remote_uri,
+            local_tag,
+            remote_tag,
+            local_cseq: if is_initiator { cseq_number } else { 0 },
+            remote_cseq: if is_initiator { 0 } else { cseq_number },
+            remote_target,
+            secure_transport_required,
+            allow_tls_contact_on_sips: false,
+            tls_contact_flow: None,
+            route_set,
+            is_initiator,
+            last_known_remote_addr: None,
+            last_successful_transaction_time: None,
+            recovery_attempts: 0,
+            recovery_reason: None,
+            recovered_at: None,
+            recovery_start_time: None,
+            subscription_state: None,
+            event_package: None,
+            event_id: None,
+            refresh_failures: 0,
+            max_refresh_failures: 3,
+            invite_cseq: Some(cseq_number),
+            last_rseq_acked: None,
+            local_rseq_counter: 0,
+            peer_supports_100rel: false,
+            session_expires_secs: None,
+            is_session_refresher: false,
+            peer_allows_update: None,
+            session_timer_peer_min_se: None,
+            session_timer_request_cseqs: Vec::new(),
+        })
+    }
+
+    /// Create a dialog from an early (1xx) response to an INVITE
+    pub fn from_provisional_response(
+        request: &Request,
+        response: &Response,
+        is_initiator: bool,
+    ) -> Option<Self> {
+        // Only certain provisional responses can create dialogs
+        if !matches!(
+            response.status,
+            StatusCode::Ringing
+                | StatusCode::SessionProgress
+                | StatusCode::CallIsBeingForwarded
+                | StatusCode::Queued
+        ) {
+            return None;
+        }
+
+        if request.method != Method::Invite {
+            return None;
+        }
+
+        // To tag is required for early dialog
+        let to_header = match response.header(&HeaderName::To) {
+            Some(TypedHeader::To(to)) => to,
+            _ => return None,
+        };
+
+        if to_header.tag().is_none() {
+            return None; // No tag in To header, can't create early dialog
+        }
+
+        // Similar extraction logic to from_2xx_response but for early dialog
+        let call_id = match response.header(&HeaderName::CallId) {
+            Some(TypedHeader::CallId(call_id)) => call_id.to_string(),
+            _ => return None,
+        };
+
+        let cseq_number = match request.header(&HeaderName::CSeq) {
+            Some(TypedHeader::CSeq(cseq)) => cseq.sequence(),
+            _ => return None,
+        };
+
+        let from_header = match response.header(&HeaderName::From) {
+            Some(TypedHeader::From(from)) => from,
+            _ => return None,
+        };
+
+        let (local_tag, remote_tag, local_uri, remote_uri) = if is_initiator {
+            (
+                from_header.tag().map(|s| s.to_string()),
+                to_header.tag().map(|s| s.to_string()),
+                from_header.uri().clone(),
+                to_header.uri().clone(),
+            )
+        } else {
+            (
+                to_header.tag().map(|s| s.to_string()),
+                from_header.tag().map(|s| s.to_string()),
+                to_header.uri().clone(),
+                from_header.uri().clone(),
+            )
+        };
+
+        let remote_target = match response.header(&HeaderName::Contact) {
+            Some(TypedHeader::Contact(contacts)) => {
+                if let Some(contact) = contacts.0.first() {
+                    extract_uri_from_contact(contact).ok()?
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let secure_transport_required = matches!(request.uri().scheme(), Scheme::Sips)
+            || matches!(local_uri.scheme(), Scheme::Sips)
+            || matches!(remote_uri.scheme(), Scheme::Sips);
+        if secure_transport_required && !matches!(remote_target.scheme(), Scheme::Sips) {
+            debug!("Early dialog creation failed: secure dialog received a non-SIPS Contact");
+            return None;
+        }
+
+        let route_set = extract_route_set(response, is_initiator);
+
+        Some(Self {
+            id: DialogId::new(),
+            state: DialogState::Early,
+            call_id,
+            local_uri,
+            remote_uri,
+            local_tag,
+            remote_tag,
+            local_cseq: if is_initiator { cseq_number } else { 0 },
+            remote_cseq: if is_initiator { 0 } else { cseq_number },
+            remote_target,
+            secure_transport_required,
+            allow_tls_contact_on_sips: false,
+            tls_contact_flow: None,
+            route_set,
+            is_initiator,
+            last_known_remote_addr: None,
+            last_successful_transaction_time: None,
+            recovery_attempts: 0,
+            recovery_reason: None,
+            recovered_at: None,
+            recovery_start_time: None,
+            subscription_state: None,
+            event_package: None,
+            event_id: None,
+            refresh_failures: 0,
+            max_refresh_failures: 3,
+            invite_cseq: Some(cseq_number),
+            last_rseq_acked: None,
+            local_rseq_counter: 0,
+            peer_supports_100rel: false,
+            session_expires_secs: None,
+            is_session_refresher: false,
+            peer_allows_update: None,
+            session_timer_peer_min_se: None,
+            session_timer_request_cseqs: Vec::new(),
+        })
+    }
+
+    /// Allocate the next outgoing `RSeq` value for a UAS reliable provisional.
+    ///
+    /// RFC 3262 §7.1: the first `RSeq` in a dialog may be any value in
+    /// `[1, 2**31 - 1]`; subsequent values increment by 1. We start at 1 on
+    /// the first reliable response (simple, spec-compliant), then increment
+    /// monotonically. Saturates at `u32::MAX` rather than wrapping.
+    pub fn next_local_rseq(&mut self) -> u32 {
+        self.local_rseq_counter = self.local_rseq_counter.saturating_add(1);
+        self.local_rseq_counter
+    }
+
+    // ===== Subscription-specific methods (RFC 6665) =====
+
+    /// Initialize dialog for subscription with event package
+    pub fn init_subscription(
+        &mut self,
+        event_package: String,
+        event_id: Option<String>,
+        expires: u32,
+    ) {
+        use std::time::Duration;
+
+        self.event_package = Some(event_package);
+        self.event_id = event_id;
+
+        if expires > 0 {
+            self.subscription_state = Some(SubscriptionState::Active {
+                remaining_duration: Duration::from_secs(expires as u64),
+                original_duration: Duration::from_secs(expires as u64),
+            });
+        } else {
+            // Expires: 0 means immediate termination
+            self.subscription_state = Some(SubscriptionState::Terminated {
+                reason: Some(crate::dialog::SubscriptionTerminationReason::ClientRequested),
+            });
+        }
+    }
+
+    /// Update subscription state from received NOTIFY
+    pub fn update_subscription_from_notify(&mut self, subscription_state_header: &str) {
+        self.subscription_state = Some(SubscriptionState::from_header_value(
+            subscription_state_header,
+        ));
+    }
+
+    /// Check if subscription needs refresh
+    pub fn subscription_needs_refresh(&self) -> bool {
+        use std::time::Duration;
+
+        if let Some(ref state) = self.subscription_state {
+            // Refresh 30 seconds before expiry
+            state.needs_refresh(Duration::from_secs(30))
+        } else {
+            false
+        }
+    }
+
+    /// Mark subscription as refreshing
+    pub fn start_subscription_refresh(&mut self, new_expires: u32) {
+        use std::time::Duration;
+
+        if let Some(SubscriptionState::Active {
+            remaining_duration, ..
+        }) = self.subscription_state
+        {
+            self.subscription_state = Some(SubscriptionState::Refreshing {
+                current_remaining: remaining_duration,
+                requested_duration: Duration::from_secs(new_expires as u64),
+            });
+        }
+    }
+
+    /// Complete subscription refresh
+    pub fn complete_subscription_refresh(&mut self, new_expires: u32) {
+        self.subscription_state = Some(SubscriptionState::Active {
+            remaining_duration: Duration::from_secs(new_expires as u64),
+            original_duration: Duration::from_secs(new_expires as u64),
+        });
+        self.refresh_failures = 0; // Reset failure counter on success
+    }
+
+    /// Record subscription refresh failure
+    pub fn record_refresh_failure(&mut self) {
+        self.refresh_failures += 1;
+
+        if self.refresh_failures >= self.max_refresh_failures {
+            self.subscription_state = Some(SubscriptionState::Terminated {
+                reason: Some(crate::dialog::SubscriptionTerminationReason::RefreshFailed),
+            });
+        }
+    }
+
+    /// Terminate subscription
+    pub fn terminate_subscription(
+        &mut self,
+        reason: Option<crate::dialog::SubscriptionTerminationReason>,
+    ) {
+        self.subscription_state = Some(SubscriptionState::Terminated { reason });
+
+        // Refresh timer will be handled by SubscriptionManager
+    }
+
+    /// Check if this is a subscription dialog
+    pub fn is_subscription(&self) -> bool {
+        self.event_package.is_some()
+    }
+
+    /// Get subscription expiry time
+    pub fn subscription_expiry(&self) -> Option<std::time::Duration> {
+        self.subscription_state.as_ref()?.time_until_expiry()
+    }
+
+    /// Create a new request within this dialog
+    ///
+    /// **ARCHITECTURAL NOTE**: This method creates a dialog-aware request template
+    /// that should be processed by transaction-core helpers for proper RFC 3261 compliance.
+    /// The DialogManager's transaction integration layer handles the complete request creation.
+    pub fn create_request_template(&mut self, method: Method) -> DialogRequestTemplate {
+        // Increment local sequence number for new request (except ACK)
+        if method != Method::Ack {
+            self.local_cseq += 1;
+        }
+
+        DialogRequestTemplate {
+            method: method.clone(),
+            target_uri: self.remote_target.clone(),
+            call_id: self.call_id.clone(),
+            local_uri: self.local_uri.clone(),
+            remote_uri: self.remote_uri.clone(),
+            local_tag: self.local_tag.clone(),
+            remote_tag: self.remote_tag.clone(),
+            cseq_number: self.local_cseq,
+            route_set: self.route_set.clone(),
+        }
+    }
+
+    /// Get the dialog ID tuple (Call-ID, local tag, remote tag)
+    pub fn dialog_id_tuple(&self) -> Option<(String, String, String)> {
+        if let (Some(local_tag), Some(remote_tag)) = (&self.local_tag, &self.remote_tag) {
+            Some((self.call_id.clone(), local_tag.clone(), remote_tag.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Update dialog state from a 2xx response
+    pub fn update_from_2xx(&mut self, response: &Response) -> bool {
+        if self.state == DialogState::Early {
+            let refreshed_target = response
+                .header(&HeaderName::Contact)
+                .and_then(|header| match header {
+                    TypedHeader::Contact(contacts) => contacts.0.first(),
+                    _ => None,
+                })
+                .and_then(|contact| extract_uri_from_contact(contact).ok())
+                .map(|uri| self.normalize_tls_contact(uri));
+            if refreshed_target.as_ref().is_some_and(|uri| {
+                self.secure_transport_required && !matches!(uri.scheme(), Scheme::Sips)
+            }) {
+                debug!("Rejected non-SIPS Contact refresh on a secure dialog");
+                return false;
+            }
+
+            self.state = DialogState::Confirmed;
+
+            // Update remote tag if not set
+            if let Some(TypedHeader::To(to)) = response.header(&HeaderName::To) {
+                if let Some(tag) = to.tag() {
+                    self.remote_tag = Some(tag.to_string());
+                }
+            }
+
+            // Update remote target from Contact
+            if let Some(uri) = refreshed_target {
+                self.remote_target = uri;
+            }
+
+            // RFC 3261 §12.1.2: learn the route set from the confirming
+            // 2xx's Record-Route (reversed for the UAC). This overlays any
+            // RFC 3608 Service-Route preload — the per-dialog set wins — but
+            // a 2xx without Record-Route keeps the preload rather than
+            // erasing it. Without this, in-dialog requests (BYE, re-INVITE)
+            // bypass every record-routing proxy in the path.
+            let learned = extract_route_set(response, self.is_initiator);
+            if !learned.is_empty() {
+                self.route_set = learned;
+            }
+
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Map an explicit `sip:...;transport=tls` Contact to SIPS when this
+    /// dialog opted in to TLS Contact compatibility; other targets are unchanged.
+    fn normalize_tls_contact(&self, mut remote_target: Uri) -> Uri {
+        if self.secure_transport_required
+            && self.allow_tls_contact_on_sips
+            && matches!(remote_target.scheme(), Scheme::Sip)
+            && remote_target
+                .transport()
+                .is_some_and(|value| value.eq_ignore_ascii_case("tls"))
+        {
+            // Preserve explicit host, port, user and URI parameters. Only the
+            // internal routing target changes; captured wire messages stay original.
+            remote_target.scheme = Scheme::Sips;
+        }
+        remote_target
+    }
+
+    /// Reuse an admitted direct TLS flow only while the request still targets
+    /// the pinned Contact. Route headers and target refreshes use normal routing.
+    pub(crate) fn compatible_tls_contact_route(
+        &self,
+        request: &Request,
+    ) -> Option<rvoip_sip_transport::TransportRoute> {
+        if !self.allow_tls_contact_on_sips
+            || !self.secure_transport_required
+            || !self.route_set.is_empty()
+            || request.header(&HeaderName::Route).is_some()
+        {
+            return None;
+        }
+        let (target, route) = self.tls_contact_flow.as_ref()?;
+        (request.uri() == target
+            && &self.remote_target == target
+            && route.flow_id.is_some()
+            && route.transport_type == Some(rvoip_sip_transport::transport::TransportType::Tls))
+        .then(|| route.clone())
+    }
+
+    /// Update the remote target while preserving the dialog-forming SIPS
+    /// requirement. Returns `false` when the target would downgrade a secure
+    /// dialog and leaves the existing target unchanged.
+    pub fn update_remote_target(&mut self, remote_target: Uri) -> bool {
+        let remote_target = self.normalize_tls_contact(remote_target);
+        if self.secure_transport_required && !matches!(remote_target.scheme(), Scheme::Sips) {
+            return false;
+        }
+        self.remote_target = remote_target;
+        true
+    }
+
+    /// Terminate the dialog
+    pub fn terminate(&mut self) {
+        self.state = DialogState::Terminated;
+    }
+
+    /// Check if dialog is terminated
+    pub fn is_terminated(&self) -> bool {
+        self.state == DialogState::Terminated
+    }
+
+    /// Update remote address tracking
+    pub fn update_remote_address(&mut self, remote_addr: std::net::SocketAddr) {
+        self.last_known_remote_addr = Some(remote_addr);
+        self.last_successful_transaction_time = Some(std::time::SystemTime::now());
+    }
+
+    /// Set the remote tag for this dialog
+    ///
+    /// Updates the remote tag, typically when receiving a response with a to-tag.
+    /// This is used during dialog state transitions and response processing.
+    pub fn set_remote_tag(&mut self, tag: String) {
+        debug!("Setting remote tag for dialog {}", self.id);
+        self.remote_tag = Some(tag);
+    }
+
+    /// Enter recovery mode
+    pub fn enter_recovery_mode(&mut self, reason: &str) {
+        if self.state != DialogState::Terminated {
+            self.state = DialogState::Recovering;
+            self.recovery_reason = Some(reason.to_string());
+            self.recovery_start_time = Some(std::time::SystemTime::now());
+        }
+    }
+
+    /// Check if dialog is in recovery mode
+    pub fn is_recovering(&self) -> bool {
+        self.state == DialogState::Recovering
+    }
+
+    /// Complete recovery
+    pub fn complete_recovery(&mut self) -> bool {
+        if self.state == DialogState::Recovering {
+            self.state = DialogState::Confirmed;
+            self.recovery_reason = None;
+            self.recovered_at = Some(std::time::SystemTime::now());
+            self.recovery_start_time = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Increment the local CSeq number
+    ///
+    /// Used for sequence number management during dialog operations.
+    pub fn increment_local_cseq(&mut self) {
+        self.local_cseq += 1;
+    }
+}
+
+/// Extract route set from Record-Route headers
+fn extract_route_set(response: &Response, is_initiator: bool) -> Vec<Uri> {
+    route_set_from_record_route(&response.headers, is_initiator)
+}
+
+/// Route set for a UAS dialog: the request's Record-Route in message order
+/// (RFC 3261 §12.1.1). The UAC learns the same set reversed from the
+/// response (§12.1.2); both directions preserve every URI parameter.
+pub(crate) fn route_set_from_request(request: &Request) -> Vec<Uri> {
+    route_set_from_record_route(&request.headers, false)
+}
+
+/// Route set for a UAC dialog: the dialog-forming response's Record-Route
+/// reversed (RFC 3261 §12.1.2), URI parameters preserved.
+pub(crate) fn route_set_from_response_for_uac(response: &Response) -> Vec<Uri> {
+    route_set_from_record_route(&response.headers, true)
+}
+
+fn route_set_from_record_route(headers: &[TypedHeader], reverse: bool) -> Vec<Uri> {
+    let routes: Vec<Uri> = headers
+        .iter()
+        .filter_map(|h| {
+            if h.name() == HeaderName::RecordRoute {
+                match h {
+                    TypedHeader::RecordRoute(routes) => Some(
+                        routes
+                            .0
+                            .iter()
+                            .map(|route| {
+                                let mut uri = route.uri().clone();
+                                for param in &route.address().params {
+                                    uri = uri.with_parameter(param.clone());
+                                }
+                                uri
+                            })
+                            .collect::<Vec<Uri>>(),
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    if reverse {
+        // Reverse for initiator
+        routes.into_iter().rev().collect()
+    } else {
+        routes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rvoip_sip_core::types::{
+        address::Address,
+        contact::{Contact, ContactParamInfo},
+    };
+
+    #[test]
+    fn test_dialog_creation() {
+        let dialog = Dialog::new(
+            "test-call-id".to_string(),
+            "sip:alice@example.com".parse().unwrap(),
+            "sip:bob@example.com".parse().unwrap(),
+            Some("tag1".to_string()),
+            Some("tag2".to_string()),
+            true,
+        );
+
+        assert_eq!(dialog.call_id, "test-call-id");
+        assert_eq!(dialog.state, DialogState::Initial);
+        assert!(dialog.is_initiator);
+    }
+
+    #[test]
+    fn dialog_debug_is_metadata_only() {
+        const SECRET: &str = "dialog-debug-secret-canary";
+        let dialog = Dialog::new(
+            SECRET.to_string(),
+            format!("sip:{SECRET}@local.example").parse().unwrap(),
+            format!("sip:{SECRET}@remote.example").parse().unwrap(),
+            Some(SECRET.to_string()),
+            Some(SECRET.to_string()),
+            true,
+        );
+
+        let debug = format!("{dialog:?}");
+        assert!(!debug.contains(SECRET));
+        assert!(debug.contains("local_tag_present: true"));
+        assert!(debug.contains("route_count: 0"));
+    }
+
+    #[test]
+    fn test_dialog_id_tuple() {
+        let dialog = Dialog::new(
+            "test-call-id".to_string(),
+            "sip:alice@example.com".parse().unwrap(),
+            "sip:bob@example.com".parse().unwrap(),
+            Some("tag1".to_string()),
+            Some("tag2".to_string()),
+            true,
+        );
+
+        let tuple = dialog.dialog_id_tuple().unwrap();
+        assert_eq!(tuple.0, "test-call-id");
+        assert_eq!(tuple.1, "tag1");
+        assert_eq!(tuple.2, "tag2");
+    }
+
+    #[test]
+    fn test_dialog_termination() {
+        let mut dialog = Dialog::new(
+            "test-call-id".to_string(),
+            "sip:alice@example.com".parse().unwrap(),
+            "sip:bob@example.com".parse().unwrap(),
+            Some("tag1".to_string()),
+            Some("tag2".to_string()),
+            true,
+        );
+
+        assert!(!dialog.is_terminated());
+        dialog.terminate();
+        assert!(dialog.is_terminated());
+        assert_eq!(dialog.state, DialogState::Terminated);
+    }
+
+    #[test]
+    fn confirming_2xx_teaches_the_uac_its_route_set_reversed() {
+        use rvoip_sip_core::types::record_route::RecordRoute;
+        use std::str::FromStr;
+
+        let mut dialog = Dialog::new_early(
+            "rr-call".to_string(),
+            "sip:alice@example.com".parse().unwrap(),
+            "sip:bob@example.com".parse().unwrap(),
+            Some("local".to_string()),
+            None,
+            true,
+        );
+        // RFC 3608 preload that the per-dialog set must overlay.
+        dialog.route_set = vec!["sip:sr.example.com;lr".parse().unwrap()];
+
+        let mut response = Response::new(StatusCode::Ok);
+        response
+            .headers
+            .push(TypedHeader::Contact(Contact::new_params(vec![
+                ContactParamInfo {
+                    address: Address::new("sip:bob@192.0.2.9:5062".parse().unwrap()),
+                },
+            ])));
+        response.headers.push(TypedHeader::RecordRoute(
+            RecordRoute::from_str("<sip:p1.example.com;lr>, <sip:p2.example.com;lr>")
+                .expect("record-route"),
+        ));
+
+        assert!(dialog.update_from_2xx(&response));
+        assert_eq!(dialog.state, DialogState::Confirmed);
+        // Reversed for the initiator: last Record-Route entry first.
+        assert_eq!(dialog.route_set.len(), 2);
+        assert!(dialog.route_set[0].to_string().contains("p2.example.com"));
+        assert!(dialog.route_set[1].to_string().contains("p1.example.com"));
+        // The lr parameter must survive extraction.
+        assert!(dialog.route_set[0].to_string().contains("lr"));
+    }
+
+    #[test]
+    fn confirming_2xx_without_record_route_keeps_the_service_route_preload() {
+        let mut dialog = Dialog::new_early(
+            "sr-call".to_string(),
+            "sip:alice@example.com".parse().unwrap(),
+            "sip:bob@example.com".parse().unwrap(),
+            Some("local".to_string()),
+            None,
+            true,
+        );
+        let preload: Uri = "sip:sr.example.com;lr".parse().unwrap();
+        dialog.route_set = vec![preload.clone()];
+
+        let mut response = Response::new(StatusCode::Ok);
+        response
+            .headers
+            .push(TypedHeader::Contact(Contact::new_params(vec![
+                ContactParamInfo {
+                    address: Address::new("sip:bob@192.0.2.9:5062".parse().unwrap()),
+                },
+            ])));
+
+        assert!(dialog.update_from_2xx(&response));
+        assert_eq!(dialog.route_set, vec![preload]);
+    }
+
+    #[test]
+    fn uas_route_set_keeps_the_request_record_route_order() {
+        use rvoip_sip_core::types::record_route::RecordRoute;
+        use std::str::FromStr;
+
+        let mut request = Request::new(Method::Invite, "sip:bob@example.com".parse().unwrap());
+        request.headers.push(TypedHeader::RecordRoute(
+            RecordRoute::from_str("<sip:p1.example.com;lr>, <sip:p2.example.com;lr>")
+                .expect("record-route"),
+        ));
+
+        let routes = route_set_from_request(&request);
+        // RFC 3261 §12.1.1: message order, not reversed.
+        assert_eq!(routes.len(), 2);
+        assert!(routes[0].to_string().contains("p1.example.com"));
+        assert!(routes[1].to_string().contains("p2.example.com"));
+        assert!(routes[0].to_string().contains("lr"));
+    }
+
+    #[test]
+    fn secure_dialog_rejects_non_sips_contact_refresh() {
+        let mut dialog = Dialog::new_early(
+            "secure-call".to_string(),
+            "sips:alice@example.com".parse().unwrap(),
+            "sips:bob@example.com".parse().unwrap(),
+            Some("local".to_string()),
+            Some("remote".to_string()),
+            true,
+        );
+        let original_target = dialog.remote_target.clone();
+        let mut response = Response::new(StatusCode::Ok);
+        response
+            .headers
+            .push(TypedHeader::Contact(Contact::new_params(vec![
+                ContactParamInfo {
+                    address: Address::new("sip:bob@downgrade.example.com".parse().unwrap()),
+                },
+            ])));
+
+        assert!(dialog.secure_transport_required);
+        assert!(!dialog.update_from_2xx(&response));
+        assert_eq!(dialog.state, DialogState::Early);
+        assert_eq!(dialog.remote_target, original_target);
+    }
+    #[test]
+    fn compatible_flow_never_overrides_routes_or_target_refresh_and_is_not_persisted() {
+        use rvoip_sip_core::types::route::Route;
+        use rvoip_sip_transport::transport::TransportType;
+        use rvoip_sip_transport::{TransportFlowId, TransportRoute};
+        use std::str::FromStr;
+        let target: Uri = "sips:peer@127.0.0.1:5061;transport=tls".parse().unwrap();
+        let mut dialog = Dialog::new_early(
+            "flow-call".into(),
+            "sips:local@127.0.0.1".parse().unwrap(),
+            target.clone(),
+            None,
+            Some("remote".into()),
+            false,
+        );
+        dialog.allow_tls_contact_on_sips = true;
+        let mut route = TransportRoute::new("127.0.0.1:43210".parse().unwrap())
+            .with_transport_type(TransportType::Tls);
+        route.flow_id = TransportFlowId::from_process_local_value(17);
+        dialog.tls_contact_flow = Some((target.clone(), route));
+        let mut request = Request::new(Method::Bye, target.clone());
+        assert_eq!(
+            dialog
+                .compatible_tls_contact_route(&request)
+                .unwrap()
+                .flow_id
+                .unwrap()
+                .as_u64(),
+            17
+        );
+        let encoded = serde_json::to_string(&dialog).unwrap();
+        assert!(!encoded.contains("tls_contact_flow"));
+        let restored: Dialog = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.tls_contact_flow.is_none());
+        assert!(restored.compatible_tls_contact_route(&request).is_none());
+        dialog
+            .route_set
+            .push("sips:proxy.example.test;lr".parse().unwrap());
+        assert!(dialog.compatible_tls_contact_route(&request).is_none());
+        dialog.route_set.clear();
+        request.headers.push(TypedHeader::Route(
+            Route::from_str("<sips:proxy.example.test;lr>").unwrap(),
+        ));
+        assert!(dialog.compatible_tls_contact_route(&request).is_none());
+        request.headers.clear();
+        dialog.remote_target = "sips:peer@127.0.0.1:5062;transport=tls".parse().unwrap();
+        assert!(dialog.compatible_tls_contact_route(&request).is_none());
+        request.uri = dialog.remote_target.clone();
+        assert!(dialog.compatible_tls_contact_route(&request).is_none());
+        dialog.remote_target = target.clone();
+        request.uri = target;
+        dialog.allow_tls_contact_on_sips = false;
+        assert!(dialog.compatible_tls_contact_route(&request).is_none());
+    }
+}

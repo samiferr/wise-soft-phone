@@ -1,0 +1,109 @@
+--- a/src/transaction/method/ack.rs
++++ b/src/transaction/method/ack.rs
+@@ -77,6 +77,7 @@
+     call_id: Option<CallId>,
+     cseq_num: Option<u32>,
+     via_transport: String,
++    preloaded_routes: Vec<TypedHeader>,
+ }
+ 
+ impl Invite2xxAckTemplate {
+@@ -87,6 +88,8 @@
+             call_id: request.call_id().cloned(),
+             cseq_num: request.cseq().map(|cseq| cseq.seq),
+             via_transport: request.first_via_transport().unwrap_or("UDP").to_owned(),
++            preloaded_routes: request.headers.iter()
++                .filter(|header| matches!(header, TypedHeader::Route(_))).cloned().collect(),
+         }
+     }
+ }
+@@ -251,8 +254,34 @@
+             route_set.extend(record_route.iter().map(|entry| entry.address().clone()));
+         }
+     }
+-    for route_address in route_set.into_iter().rev() {
+-        builder = builder.header(TypedHeader::Route(Route::with_address(route_address)));
++    if route_set.is_empty() {
++        // A configured outbound proxy/Service-Route remains the next hop
++        // when the provider's 2xx does not supply a Record-Route. Preserve
++        // the Contact request URI and the original preload order.
++        for route in &template.preloaded_routes {
++            builder = builder.header(route.clone());
++        }
++    } else {
++        route_set.reverse();
++        // A provider can record-route an internal hop. A configured edge
++        // proxy must still carry the request to that private route; preserve
++        // the provider's Route and Contact values behind the edge hop.
++        let private_next_hop = route_set.first().is_some_and(|address| {
++            matches!(&address.uri.host,
++                rvoip_sip_core::types::uri::Host::Address(std::net::IpAddr::V4(ip)) if ip.is_private())
++        });
++        if private_next_hop {
++            if let Some(TypedHeader::Route(proxy)) = template.preloaded_routes.first() {
++                if proxy.iter().next().is_some_and(|entry| {
++                    route_set.first().is_some_and(|first| entry.0.uri() != &first.uri)
++                }) {
++                    builder = builder.header(TypedHeader::Route(proxy.clone()));
++                }
++            }
++        }
++        for route_address in route_set {
++            builder = builder.header(TypedHeader::Route(Route::with_address(route_address)));
++        }
+     }
+ 
+     Ok(builder.build())
+--- a/src/transaction/manager/mod.rs
++++ b/src/transaction/manager/mod.rs
+@@ -7890,32 +7890,25 @@
+         }
+         let original_route = generation.route.clone();
+ 
+-        // ACK follows the established dialog route set: top Route if present,
+-        // otherwise the remote target in the Contact-derived Request-URI.
+-        let destination = utils::socket_addr_from_uri(&next_hop_uri_for_request(&ack_request));
+-
+-        // If the ACK has no route-set destination, try Contact explicitly.
+-        let contact_destination =
+-            if let Some(TypedHeader::Contact(contact)) = response.header(&HeaderName::Contact) {
+-                if let Some(contact_addr) = contact.addresses().next() {
+-                    // Try to parse the URI as a socket address
+-                    if let Some(addr) = utils::socket_addr_from_uri(&contact_addr.uri) {
+-                        Some(addr)
+-                    } else {
+-                        None
+-                    }
+-                } else {
+-                    None
+-                }
+-            } else {
+-                None
+-            };
+-
+-        // If we couldn't get a route or Contact destination, use the original destination.
+-        let destination = if let Some(dest) = destination.or(contact_destination) {
+-            dest
++        // Resolve the selected Route, not the Contact as a fallback. The
++        // previous literal-only conversion silently skipped hostname proxies
++        // and sent ACK to a provider's unreachable private Contact.
++        let next_hop = crate::transaction::transport::multiplexed::exact_next_hop_uri_for_request(&ack_request)
++            .map_err(|_| Error::Other("ACK has an unusable next-hop route".into()))?;
++        let original_invite = if let Some(request) = self.retired_client_original_request(invite_tx_id)? {
++            Some(request)
++        } else { self.original_request(invite_tx_id).await? };
++        let same_next_hop = original_invite.as_ref().is_some_and(|request| {
++            crate::transaction::transport::multiplexed::exact_next_hop_uri_for_request(request)
++                .is_ok_and(|original| original == next_hop)
++        });
++        let destination = if same_next_hop {
++            // Reuse the exact DNS-selected edge and authenticated stream flow
++            // that carried INVITE; a new DNS lookup can choose a different edge.
++            original_route.destination
+         } else {
+-            original_route.destination
++            crate::dialog::dialog_utils::resolve_uri_to_socketaddr(&next_hop).await
++                .ok_or_else(|| Error::Other("ACK next-hop hostname could not be resolved".into()))?
+         };
+ 
+         let mut ack_route = original_route;

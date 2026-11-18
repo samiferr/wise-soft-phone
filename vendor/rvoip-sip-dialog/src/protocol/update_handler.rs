@@ -1,0 +1,192 @@
+//! UPDATE Request Handler for Dialog-Core
+//!
+//! This module handles UPDATE requests according to RFC 3311.
+//! UPDATE provides a mechanism for modifying sessions within established
+//! SIP dialogs without the complexity of re-INVITE.
+//!
+//! ## UPDATE vs Re-INVITE
+//!
+//! - **UPDATE**: Lightweight session modification within dialogs
+//! - **Re-INVITE**: Full session renegotiation, can create new dialogs
+//! - **Use Cases**: Media parameter changes, codec switches, hold/unhold
+//!
+//! ## Processing Rules
+//!
+//! - UPDATE can only be sent within confirmed dialogs
+//! - Must increment CSeq number like other in-dialog requests
+//! - Supports SDP offer/answer model for media changes
+//! - Generates appropriate responses (200 OK, 4xx/5xx errors)
+
+use tracing::debug;
+
+use crate::dialog::DialogId;
+use crate::errors::{DialogError, DialogResult};
+use crate::events::SessionCoordinationEvent;
+use crate::manager::transaction_integration::{
+    allow_lists_update, negotiate_uas_refresh_session_timer, UasSessionTimerDecision,
+};
+use crate::manager::{DialogManager, SessionCoordinator, SourceExtractor};
+use crate::transaction::utils::response_builders;
+use rvoip_sip_core::types::min_se::MinSE;
+use rvoip_sip_core::{Request, StatusCode, TypedHeader};
+
+/// UPDATE-specific handling operations
+pub trait UpdateHandler {
+    /// Handle UPDATE requests (session modification)
+    fn handle_update_method(
+        &self,
+        request: Request,
+    ) -> impl std::future::Future<Output = DialogResult<()>> + Send;
+}
+
+/// Implementation of UPDATE handling for DialogManager
+impl UpdateHandler for DialogManager {
+    /// Handle UPDATE requests according to RFC 3311
+    ///
+    /// Provides session modification within dialogs.
+    async fn handle_update_method(&self, request: Request) -> DialogResult<()> {
+        debug!("Processing UPDATE request");
+
+        if let Some(dialog_id) = self.find_dialog_for_request(&request).await {
+            self.process_update_in_dialog(request, dialog_id).await
+        } else {
+            // Send 481 Call/Transaction Does Not Exist
+            let source = SourceExtractor::extract_from_request(&request);
+            let server_transaction = self
+                .transaction_manager
+                .create_server_transaction(request.clone(), source)
+                .await
+                .map_err(|_error| DialogError::TransactionError {
+                    message: "Failed to create server transaction for UPDATE".to_string(),
+                })?;
+
+            let transaction_id = server_transaction.id().clone();
+            let response = response_builders::create_response(
+                &request,
+                StatusCode::CallOrTransactionDoesNotExist,
+            );
+
+            self.send_unowned_final_response_classified(&transaction_id, response)
+                .await?;
+
+            debug!("UPDATE processed with 481 response (no dialog found)");
+            Ok(())
+        }
+    }
+}
+
+/// UPDATE-specific helper methods for DialogManager
+impl DialogManager {
+    /// Process UPDATE within a dialog
+    pub async fn process_update_in_dialog(
+        &self,
+        request: Request,
+        dialog_id: DialogId,
+    ) -> DialogResult<()> {
+        debug!("Processing UPDATE for dialog {}", dialog_id);
+
+        // Update dialog sequence number
+        let current_session_timer = {
+            let mut dialog = self.get_dialog_mut(&dialog_id)?;
+            dialog.update_remote_sequence(&request)?;
+            if let Some(allows) = allow_lists_update(&request.headers) {
+                dialog.peer_allows_update = Some(allows);
+            }
+            dialog
+                .session_expires_secs
+                .map(|secs| (secs, dialog.is_session_refresher))
+        };
+
+        // Create server transaction and forward to session layer
+        let source = SourceExtractor::extract_from_request(&request);
+        let server_transaction = self
+            .transaction_manager
+            .create_server_transaction(request.clone(), source)
+            .await
+            .map_err(|_error| DialogError::TransactionError {
+                message: "Failed to create server transaction for UPDATE".to_string(),
+            })?;
+
+        let transaction_id = server_transaction.id().clone();
+
+        // RFC 4028 §9: a timer-capable peer whose refresh asks for less than
+        // our Min-SE gets 422 with our Min-SE.
+        if let UasSessionTimerDecision::Reject422 { min_se } = negotiate_uas_refresh_session_timer(
+            &request,
+            self.config_session_timer_settings(),
+            current_session_timer,
+        ) {
+            debug!(
+                "UPDATE Session-Expires is below our Min-SE {} — rejecting with 422",
+                min_se
+            );
+            let mut response =
+                response_builders::create_response(&request, StatusCode::SessionIntervalTooSmall);
+            response
+                .headers
+                .push(TypedHeader::MinSE(MinSE::new(min_se)));
+            self.send_unowned_final_response_classified(&transaction_id, response)
+                .await?;
+            return Ok(());
+        }
+
+        // Associate the new UAS transaction with the dialog so the session
+        // layer's `send_response_for_session` can route its 200 OK (or 4xx)
+        // back to *this* UPDATE, not to the stale INVITE-server-tx kept
+        // around for retransmission. Required because UPDATE responses must
+        // echo the UPDATE's Via/branch per RFC 3261 §17.2.
+        self.link_transaction_to_dialog_indexed(&transaction_id, &dialog_id);
+        self.pending_response_transaction_by_dialog
+            .insert(dialog_id.clone(), transaction_id.clone());
+
+        let event = SessionCoordinationEvent::ReInvite {
+            dialog_id: dialog_id.clone(),
+            transaction_id: transaction_id.clone(),
+            request: request.clone(),
+        };
+
+        if self.notify_session_layer(event).await.is_err() {
+            let response =
+                response_builders::create_response(&request, StatusCode::ServiceUnavailable);
+            self.send_unowned_final_response_classified(&transaction_id, response)
+                .await?;
+            self.retire_unowned_response_indexes(&dialog_id, &transaction_id);
+            return Ok(());
+        }
+        debug!("UPDATE processed for dialog {}", dialog_id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exact_update_response_tests {
+    #[test]
+    fn update_481_and_dispatch_503_are_exact_and_classified() {
+        let source = include_str!("update_handler.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("UPDATE implementation source");
+        assert!(source.contains("StatusCode::CallOrTransactionDoesNotExist"));
+        assert!(source.contains("StatusCode::ServiceUnavailable"));
+        // RFC 4028 §9: the 422 for a refresh below our Min-SE is the third
+        // exact, classified final response this handler authors itself.
+        assert!(source.contains("StatusCode::SessionIntervalTooSmall"));
+        assert_eq!(
+            source
+                .matches("send_unowned_final_response_classified")
+                .count(),
+            3
+        );
+        let dispatch_failure = source
+            .split("if self.notify_session_layer(event).await.is_err()")
+            .nth(1)
+            .expect("UPDATE dispatch failure source");
+        let send = dispatch_failure
+            .find("send_unowned_final_response_classified")
+            .expect("classified UPDATE fallback");
+        let retire = dispatch_failure
+            .find("retire_unowned_response_indexes")
+            .expect("UPDATE fallback index retirement");
+        assert!(send < retire);
+    }
+}

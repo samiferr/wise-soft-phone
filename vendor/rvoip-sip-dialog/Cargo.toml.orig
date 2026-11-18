@@ -1,0 +1,105 @@
+[package]
+name = "rvoip-sip-dialog"
+# Flow-aware transaction routing is a public semver-breaking change coordinated
+# with rvoip-sip-transport 0.3.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+# Crate-specific description
+description = "RFC 3261 SIP Dialog Management Layer for RVOIP"
+
+# ✨ INHERIT LINTS FROM WORKSPACE
+[lints]
+workspace = true
+
+[dependencies]
+# 🎯 INTERNAL CRATES - Use workspace dependencies
+rvoip-sip-core.workspace = true
+# `dns` activates `HickoryResolver` + NAPTR/SRV/A ladder. Phase 5
+# default behaviour preserves pre-Phase-5 URI resolution; consumers
+# that want a leaner build can `default-features = false` on this
+# crate and re-add only the features they need.
+rvoip-sip-transport = { workspace = true, features = ["dns"] }
+rvoip-infra-common.workspace = true
+rvoip-core-traits.workspace = true
+# transaction-core has been merged into this crate
+
+# External dependencies from workspace
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+dashmap.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+sha2.workspace = true
+
+# Crate-specific dependencies not in workspace
+http = "1"
+# arc-swap — lock-free atomic Arc swap used for `event_subscribers`
+# (the broadcast hot path needs lock-free reads).
+arc-swap = "1.7"
+
+[dev-dependencies]
+# Logging for examples
+tracing-subscriber = "0.3"
+
+# Benchmarks
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+rvoip-sip-core = { workspace = true }
+dashmap = { workspace = true }
+
+# Performance benchmarks. See `crates/sip/rvoip-sip/docs/PROFILING.md`.
+[[bench]]
+name = "transaction_manager"
+harness = false
+
+[features]
+default = ["recovery", "events"]
+generated-validation = ["rvoip-sip-core/generated-validation"]
+
+# Dialog recovery features
+recovery = []
+
+# Event system features
+events = []
+
+# Testing features
+testing = []
+
+# WebSocket transport support. Declared so the cfg gates in
+# transport/mod.rs compile cleanly; enabling it on its own is a no-op
+# until the corresponding rvoip-sip-transport `ws` feature is wired
+# through.
+ws = []
+
+# Development features (additional debugging)
+dev = ["recovery", "events", "testing"]
+
+# Dev-only: forwards to sip-transport's `dev-insecure-tls` and exposes
+# `TlsClientConfig::insecure_skip_verify` through the `TransportManager`.
+# See `crates/sip-transport/Cargo.toml` for the production warning.
+dev-insecure-tls = ["rvoip-sip-transport/dev-insecure-tls"]
+
+[[test]]
+name = "generated_sip_compliance"
+path = "tests/generated_sip_compliance.rs"
+required-features = ["generated-validation"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

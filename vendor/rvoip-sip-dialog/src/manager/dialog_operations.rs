@@ -1,0 +1,772 @@
+//! Dialog CRUD Operations
+//!
+//! This module handles all Create, Read, Update, Delete operations for SIP dialogs,
+//! implementing RFC 3261 compliant dialog management with proper state transitions.
+
+use dashmap::mapref::one::RefMut;
+use tracing::{debug, info};
+use uuid::Uuid;
+
+use super::core::DialogManager;
+use super::utils::DialogUtils;
+use crate::dialog::dialog_utils::extract_uri_from_contact;
+use crate::dialog::{Dialog, DialogId, DialogState};
+use crate::errors::{DialogError, DialogResult};
+use rvoip_sip_core::types::uri::Scheme;
+use rvoip_sip_core::types::TypedHeader;
+use rvoip_sip_core::HeaderName;
+use rvoip_sip_core::{Request, Uri};
+
+/// Trait for dialog storage operations
+///
+/// Provides the interface for storing, retrieving, and managing dialogs
+/// according to RFC 3261 dialog identification and state management rules.
+pub trait DialogStore {
+    /// Create a new dialog from an incoming request
+    fn create_dialog(
+        &self,
+        request: &Request,
+    ) -> impl std::future::Future<Output = DialogResult<DialogId>> + Send;
+
+    /// Create an outgoing dialog for client-initiated requests
+    fn create_outgoing_dialog(
+        &self,
+        local_uri: Uri,
+        remote_uri: Uri,
+        call_id: Option<String>,
+    ) -> impl std::future::Future<Output = DialogResult<DialogId>> + Send;
+
+    /// Store a dialog in the manager
+    fn store_dialog(
+        &self,
+        dialog: Dialog,
+    ) -> impl std::future::Future<Output = DialogResult<()>> + Send;
+
+    /// Get a dialog by ID (read-only)
+    fn get_dialog(&self, dialog_id: &DialogId) -> DialogResult<Dialog>;
+
+    /// Get a mutable reference to a dialog
+    fn get_dialog_mut(&self, dialog_id: &DialogId) -> DialogResult<RefMut<'_, DialogId, Dialog>>;
+
+    /// Terminate a dialog
+    fn terminate_dialog(
+        &self,
+        dialog_id: &DialogId,
+    ) -> impl std::future::Future<Output = DialogResult<()>> + Send;
+
+    /// List all active dialogs
+    fn list_dialogs(&self) -> Vec<DialogId>;
+
+    /// Get current dialog count
+    fn dialog_count(&self) -> usize;
+
+    /// Check if a dialog exists
+    fn has_dialog(&self, dialog_id: &DialogId) -> bool;
+
+    /// Get dialog state
+    fn get_dialog_state(&self, dialog_id: &DialogId) -> DialogResult<DialogState>;
+
+    /// Update dialog state with proper notifications
+    fn update_dialog_state(
+        &self,
+        dialog_id: &DialogId,
+        new_state: DialogState,
+    ) -> impl std::future::Future<Output = DialogResult<()>> + Send;
+}
+
+/// Trait for dialog lookup operations
+///
+/// Provides RFC 3261 compliant dialog lookup mechanisms based on
+/// Call-ID, tags, and other dialog identifiers.
+pub trait DialogLookup {
+    /// Find dialog for an incoming request
+    fn find_dialog_for_request(
+        &self,
+        request: &Request,
+    ) -> impl std::future::Future<Output = Option<DialogId>> + Send;
+
+    /// Create early dialog from INVITE request
+    fn create_early_dialog_from_invite(
+        &self,
+        request: &Request,
+    ) -> impl std::future::Future<Output = DialogResult<DialogId>> + Send;
+}
+
+// Implement DialogStore for DialogManager
+impl DialogStore for DialogManager {
+    /// Create a new dialog from an incoming request
+    ///
+    /// Implements RFC 3261 Section 12.1.1 for UAS dialog creation.
+    /// Creates an early dialog that can be confirmed later.
+    async fn create_dialog(&self, request: &Request) -> DialogResult<DialogId> {
+        debug!("Creating dialog from incoming request");
+
+        // Extract dialog information from request and create dialog
+        let call_id = request
+            .call_id()
+            .ok_or_else(|| DialogError::protocol_error("Request missing Call-ID header"))?
+            .to_string();
+
+        let from_uri = request
+            .from()
+            .ok_or_else(|| DialogError::protocol_error("Request missing From header"))?
+            .uri()
+            .clone();
+
+        let to_uri = request
+            .to()
+            .ok_or_else(|| DialogError::protocol_error("Request missing To header"))?
+            .uri()
+            .clone();
+
+        let remote_tag = request
+            .from()
+            .and_then(|from| from.tag())
+            .map(|tag| tag.to_string());
+
+        // Create dialog (early state for INVITE)
+        let mut dialog = Dialog::new_early(
+            call_id, to_uri,     // local_uri (we are the UAS)
+            from_uri,   // remote_uri (they are the UAC)
+            None,       // local_tag (generated later when we respond)
+            remote_tag, // remote_tag (from their From header)
+            false,      // is_initiator = false (incoming request, we are UAS)
+        );
+        dialog.secure_transport_required |= matches!(request.uri().scheme(), Scheme::Sips);
+        if let Some(remote_target) = remote_target_from_request(request) {
+            if !dialog.update_remote_target(remote_target) {
+                return Err(DialogError::protocol_error(
+                    "Secure dialog-forming request contains a non-SIPS Contact",
+                ));
+            }
+        }
+        // RFC 3261 §12.1.1: the UAS route set is the request's Record-Route,
+        // in message order with all URI parameters preserved. Without it our
+        // in-dialog requests (BYE, re-INVITE) bypass the proxy chain.
+        dialog.route_set = crate::dialog::dialog_impl::route_set_from_request(request);
+
+        let dialog_id = dialog.id.clone();
+        self.store_dialog(dialog).await?;
+
+        debug!("Created UAS dialog {} for incoming request", dialog_id);
+        Ok(dialog_id)
+    }
+
+    /// Create an outgoing dialog for client-initiated requests
+    ///
+    /// Implements RFC 3261 Section 12.1.2 for UAC dialog creation.
+    /// Creates an early dialog that will be confirmed by the response.
+    async fn create_outgoing_dialog(
+        &self,
+        local_uri: Uri,
+        remote_uri: Uri,
+        call_id: Option<String>,
+    ) -> DialogResult<DialogId> {
+        debug!("Creating outgoing dialog for UAC request");
+
+        // Generate call-id if not provided
+        let call_id = call_id.unwrap_or_else(|| format!("call-{}", Uuid::new_v4()));
+
+        // Create outgoing dialog (UAC perspective)
+        let mut dialog = Dialog::new_early(
+            call_id.clone(),   // Clone call_id for later use
+            local_uri.clone(), // local_uri (we are the UAC)
+            remote_uri,        // remote_uri (they are the UAS)
+            None,              // local_tag (will be generated when we send request)
+            None,              // remote_tag (will be set from response)
+            true,              // is_initiator = true (we're UAC)
+        );
+
+        // RFC 3608 §5.2 preload: if a prior REGISTER 2xx populated the
+        // Service-Route cache for this AoR (the From URI of the
+        // outgoing request equals the AoR), pre-populate the dialog's
+        // route_set so that subsequent in-dialog and out-of-dialog
+        // requests within this registration binding traverse the
+        // registrar-prescribed path. Per-dialog Record-Route entries
+        // learned from the response will overlay this when the dialog
+        // is confirmed.
+        let aor_key = local_uri.to_string();
+        if let Some(service_route) = self
+            .service_route_by_aor
+            .read()
+            .await
+            .get(&aor_key)
+            .cloned()
+        {
+            if !service_route.is_empty() {
+                debug!(
+                    "RFC 3608 preload: prepending {} Service-Route hop(s) to outbound dialog route_set",
+                    service_route.len()
+                );
+                dialog.route_set = service_route;
+            }
+        }
+
+        let dialog_id = dialog.id.clone();
+        self.store_dialog(dialog).await?;
+
+        // The creator already owns the returned exact DialogId and commits its
+        // session mapping directly. The retired creation bus projection
+        // was a no-op in session-core and put observer availability on dialog
+        // creation's hot path.
+
+        debug!("Created UAC dialog {} for outgoing request", dialog_id);
+        Ok(dialog_id)
+    }
+
+    /// Store a dialog in the manager
+    ///
+    /// Implements proper dialog storage with RFC 3261 compliant lookup keys.
+    async fn store_dialog(&self, dialog: Dialog) -> DialogResult<()> {
+        let dialog_id = dialog.id.clone();
+
+        // Store the dialog
+        self.dialogs.insert(dialog_id.clone(), dialog.clone());
+
+        // Store dialog lookup if we have both tags (confirmed dialog)
+        if let Some(tuple) = dialog.dialog_id_tuple() {
+            let key = DialogUtils::create_lookup_key(&tuple.0, &tuple.1, &tuple.2);
+            self.dialog_lookup.insert(key, dialog_id.clone());
+            debug!("Stored confirmed dialog lookup for {}", dialog_id);
+        } else if dialog.state == DialogState::Early {
+            if let Some(remote_tag) = dialog.remote_tag.as_ref() {
+                let key = DialogUtils::create_early_lookup_key(&dialog.call_id, remote_tag);
+                self.early_dialog_lookup.insert(key, dialog_id.clone());
+                debug!("Stored early dialog lookup for {}", dialog_id);
+            }
+        }
+
+        debug!("Stored dialog {} (state: {:?})", dialog_id, dialog.state);
+        Ok(())
+    }
+
+    /// Get a dialog (read-only)
+    fn get_dialog(&self, dialog_id: &DialogId) -> DialogResult<Dialog> {
+        self.dialogs
+            .get(dialog_id)
+            .map(|entry| entry.clone())
+            .ok_or_else(|| DialogError::dialog_not_found(&dialog_id.to_string()))
+    }
+
+    /// Get a mutable reference to a dialog
+    fn get_dialog_mut(&self, dialog_id: &DialogId) -> DialogResult<RefMut<'_, DialogId, Dialog>> {
+        self.dialogs
+            .get_mut(dialog_id)
+            .ok_or_else(|| DialogError::dialog_not_found(&dialog_id.to_string()))
+    }
+
+    /// Terminate a dialog
+    ///
+    /// Implements RFC 3261 Section 12.3 dialog termination.
+    /// Properly cleans up all dialog state and lookup entries.
+    async fn terminate_dialog(&self, dialog_id: &DialogId) -> DialogResult<()> {
+        debug!("Terminating dialog {}", dialog_id);
+
+        // Cancel any RFC 4028 refresh task + RFC 3262 retransmit tasks
+        // associated with this dialog before we unwind state.
+        crate::manager::session_timer::cancel_refresh_task(self, dialog_id)
+            .await
+            .map_err(|_error| DialogError::InternalError {
+                message: "Session refresh task did not drain".to_string(),
+                context: None,
+            })?;
+        self.reliable_provisional_tasks
+            .close_dialog(dialog_id)
+            .await
+            .map_err(|_error| DialogError::InternalError {
+                message: "Reliable provisional tasks did not drain".to_string(),
+                context: None,
+            })?;
+
+        // Get the dialog and terminate it
+        if let Some(mut dialog_entry) = self.dialogs.get_mut(dialog_id) {
+            let dialog = dialog_entry.value_mut();
+            if let Some(remote_tag) = dialog.remote_tag.as_ref() {
+                let key = DialogUtils::create_early_lookup_key(&dialog.call_id, remote_tag);
+                self.early_dialog_lookup.remove(&key);
+            }
+
+            // Only terminate if not already terminated
+            if dialog.state != DialogState::Terminated {
+                let previous_state = dialog.state.clone();
+                dialog.terminate();
+
+                debug!(
+                    "Dialog {} terminated (was: {:?})",
+                    dialog_id, previous_state
+                );
+            } else {
+                debug!("Dialog {} already terminated", dialog_id);
+            }
+
+            Ok(())
+        } else {
+            Err(DialogError::dialog_not_found(&dialog_id.to_string()))
+        }
+    }
+
+    /// List all active dialogs
+    fn list_dialogs(&self) -> Vec<DialogId> {
+        self.dialogs
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Get current dialog count
+    fn dialog_count(&self) -> usize {
+        self.dialogs.len()
+    }
+
+    /// Check if a dialog exists
+    fn has_dialog(&self, dialog_id: &DialogId) -> bool {
+        self.dialogs.contains_key(dialog_id)
+    }
+
+    /// Get dialog state
+    fn get_dialog_state(&self, dialog_id: &DialogId) -> DialogResult<DialogState> {
+        let dialog = self.get_dialog(dialog_id)?;
+        Ok(dialog.state.clone())
+    }
+
+    /// Update dialog state with proper notifications
+    ///
+    /// Updates dialog state and notifies session-core of the change.
+    /// Implements proper RFC 3261 state transition validation.
+    async fn update_dialog_state(
+        &self,
+        dialog_id: &DialogId,
+        new_state: DialogState,
+    ) -> DialogResult<()> {
+        debug!("Updating dialog {} state to {:?}", dialog_id, new_state);
+
+        let previous_state = {
+            let mut dialog = self.get_dialog_mut(dialog_id)?;
+            let prev = dialog.state.clone();
+
+            // Validate state transition (RFC 3261 compliance)
+            match (&prev, &new_state) {
+                // Valid transitions: Early -> Confirmed or Terminated
+                (DialogState::Early, DialogState::Confirmed) => {}
+                (DialogState::Early, DialogState::Terminated) => {}
+
+                // Valid transitions: Confirmed -> Terminated
+                (DialogState::Confirmed, DialogState::Terminated) => {}
+
+                // Valid transitions: Initial can go to any state
+                (DialogState::Initial, _) => {}
+
+                // Valid transitions: Recovering can transition to any state
+                (DialogState::Recovering, _) => {}
+
+                // Allow re-termination
+                (DialogState::Terminated, DialogState::Terminated) => {}
+
+                // Same state transitions for Early and Confirmed (idempotent)
+                (DialogState::Early, DialogState::Early) => {}
+                (DialogState::Confirmed, DialogState::Confirmed) => {}
+
+                // Valid transitions: Initial can go to any state (covers all Initial cases)
+
+                // Valid transitions: Recovering can transition to any state (covers all Recovering cases)
+
+                // Invalid transitions - Confirmed cannot go back to Early
+                (DialogState::Confirmed, DialogState::Early) => {
+                    return Err(DialogError::protocol_error(
+                        "Invalid state transition: Confirmed -> Early",
+                    ));
+                }
+
+                // Invalid transitions - Confirmed cannot go to Initial or Recovering
+                (DialogState::Confirmed, DialogState::Initial) => {
+                    return Err(DialogError::protocol_error(
+                        "Invalid state transition: Confirmed -> Initial",
+                    ));
+                }
+                (DialogState::Confirmed, DialogState::Recovering) => {
+                    return Err(DialogError::protocol_error(
+                        "Invalid state transition: Confirmed -> Recovering",
+                    ));
+                }
+
+                // Invalid transitions - Early cannot go back to Initial
+                (DialogState::Early, DialogState::Initial) => {
+                    return Err(DialogError::protocol_error(
+                        "Invalid state transition: Early -> Initial",
+                    ));
+                }
+                (DialogState::Early, DialogState::Recovering) => {
+                    return Err(DialogError::protocol_error(
+                        "Invalid state transition: Early -> Recovering",
+                    ));
+                }
+
+                // Invalid transitions - Cannot transition from Terminated (except to Terminated)
+                (DialogState::Terminated, _) => {
+                    return Err(DialogError::protocol_error(
+                        "Cannot transition from Terminated state",
+                    ));
+                }
+            }
+
+            dialog.state = new_state.clone();
+            prev
+        };
+
+        debug!(
+            "Updated dialog {} state from {:?} to {:?}",
+            dialog_id, previous_state, new_state
+        );
+        Ok(())
+    }
+}
+
+// Implement DialogLookup for DialogManager
+impl DialogLookup for DialogManager {
+    /// Find an existing dialog by request
+    ///
+    /// Implements RFC 3261 Section 12.2 dialog identification rules.
+    /// Uses Call-ID, From tag, and To tag for proper dialog matching.
+    ///
+    /// **FIXED**: Added fallback lookup for early dialogs that don't have both tags yet.
+    async fn find_dialog_for_request(&self, request: &Request) -> Option<DialogId> {
+        // Extract dialog identification info
+        let (call_id, from_tag, to_tag) = DialogUtils::extract_dialog_info(request)?;
+        let from_tag = from_tag?;
+
+        // First try: Standard lookup with both tags (for confirmed dialogs)
+        if let Some(to_tag) = &to_tag {
+            debug!("Looking for confirmed dialog with Call-ID and both tags present");
+
+            // Try both scenarios: UAC and UAS perspective
+            let (key1, key2) = DialogUtils::create_bidirectional_keys(&call_id, &from_tag, &to_tag);
+            debug!("Trying lookup key1 (UAC perspective)");
+            debug!("Trying lookup key2 (UAS perspective)");
+
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    "Dialog lookup table has {} entries:",
+                    self.dialog_lookup.len()
+                );
+                for entry in self.dialog_lookup.iter().take(10) {
+                    debug!("  Lookup entry -> dialog: {}", entry.value());
+                }
+            }
+
+            // Scenario 1: Local is From, Remote is To (UAC perspective)
+            if let Some(dialog_id) = self.dialog_lookup.get(&key1) {
+                debug!(
+                    "✅ Found confirmed dialog {} using UAC perspective (key1)",
+                    dialog_id.value()
+                );
+                return Some(dialog_id.clone());
+            }
+
+            // Scenario 2: Local is To, Remote is From (UAS perspective)
+            if let Some(dialog_id) = self.dialog_lookup.get(&key2) {
+                debug!(
+                    "✅ Found confirmed dialog {} using UAS perspective (key2)",
+                    dialog_id.value()
+                );
+                return Some(dialog_id.clone());
+            }
+
+            debug!("❌ No match found for either key in lookup table");
+        }
+
+        // Second try: Fallback lookup for early dialogs (only have call-id and from-tag)
+        // This is needed for initial INVITEs where we created an early dialog but don't have to-tag yet
+        debug!("Searching for early dialog with Call-ID and From-tag present");
+
+        let early_key = DialogUtils::create_early_lookup_key(&call_id, &from_tag);
+        if let Some(dialog_id) = self
+            .early_dialog_lookup
+            .get(&early_key)
+            .map(|entry| entry.value().clone())
+        {
+            if let Some(dialog) = self.dialogs.get(&dialog_id) {
+                if dialog.call_id == call_id
+                    && dialog.state == crate::dialog::DialogState::Early
+                    && dialog.remote_tag.as_ref() == Some(&from_tag)
+                {
+                    debug!("Found early dialog {} for initial INVITE", dialog.id);
+                    return Some(dialog.id.clone());
+                }
+            }
+            self.early_dialog_lookup.remove(&early_key);
+        }
+
+        debug!("No matching dialog found for request");
+        None
+    }
+
+    /// Create an early dialog from an INVITE request
+    ///
+    /// Implements RFC 3261 Section 12.1.1 for early dialog creation.
+    /// Early dialogs are created when processing incoming INVITE requests.
+    async fn create_early_dialog_from_invite(&self, request: &Request) -> DialogResult<DialogId> {
+        debug!("Creating early dialog from INVITE request");
+
+        // Validate this is an INVITE request
+        if request.method() != rvoip_sip_core::Method::Invite {
+            return Err(DialogError::protocol_error(
+                "Early dialog creation only valid for INVITE requests",
+            ));
+        }
+
+        // Extract required information from INVITE
+        let call_id = request
+            .call_id()
+            .ok_or_else(|| DialogError::protocol_error("INVITE missing Call-ID header"))?
+            .to_string();
+
+        let from_uri = request
+            .from()
+            .ok_or_else(|| DialogError::protocol_error("INVITE missing From header"))?
+            .uri()
+            .clone();
+
+        let to_uri = request
+            .to()
+            .ok_or_else(|| DialogError::protocol_error("INVITE missing To header"))?
+            .uri()
+            .clone();
+
+        let remote_tag = request
+            .from()
+            .and_then(|from| from.tag())
+            .map(|tag| tag.to_string());
+
+        // For incoming INVITE, we are the UAS (not initiator)
+        let mut dialog = Dialog::new_early(
+            call_id, to_uri,     // local_uri (we are the UAS)
+            from_uri,   // remote_uri (they are the UAC)
+            None,       // local_tag (will be generated when we respond)
+            remote_tag, // remote_tag (from the From header)
+            false,      // is_initiator = false (we're UAS)
+        );
+        dialog.secure_transport_required |= matches!(request.uri().scheme(), Scheme::Sips);
+        // A Via header is not proof of transport. Use transaction-core's
+        // retained ingress route, and keep direct/offline callers strict.
+        let ingress_route =
+            crate::transaction::TransactionKey::from_request(request).and_then(|key| {
+                self.transaction_manager()
+                    .server_transaction_response_route(&key)
+            });
+        dialog.allow_tls_contact_on_sips = self
+            .config()
+            .is_some_and(|config| config.dialog_config().allow_tls_contact_on_sips)
+            && ingress_route.as_ref().is_some_and(|route| {
+                route.transport_type == Some(rvoip_sip_transport::transport::TransportType::Tls)
+            });
+        if let Some(remote_target) = remote_target_from_request(request) {
+            if !dialog.update_remote_target(remote_target) {
+                return Err(DialogError::protocol_error(
+                    "Secure INVITE contains a non-SIPS Contact",
+                ));
+            }
+        }
+        // RFC 3261 §12.1.1: UAS route set from the INVITE's Record-Route,
+        // in message order (see create_dialog).
+        dialog.route_set = crate::dialog::dialog_impl::route_set_from_request(request);
+        // Opt-in direct-peer interop only. Do not bypass proxies or a Contact
+        // claiming a different host. Retain the opaque accepted flow.
+        if dialog.allow_tls_contact_on_sips && dialog.route_set.is_empty() {
+            if let Some(route) = ingress_route.filter(|route| route.flow_id.is_some()) {
+                if matches!(dialog.remote_target.host,
+                    rvoip_sip_core::Host::Address(ip) if ip == route.destination.ip())
+                {
+                    dialog.tls_contact_flow = Some((dialog.remote_target.clone(), route));
+                }
+            }
+        }
+
+        let dialog_id = dialog.id.clone();
+
+        // Store the early dialog
+        self.store_dialog(dialog).await?;
+
+        info!("Created early dialog {} from INVITE request", dialog_id);
+        Ok(dialog_id)
+    }
+}
+
+fn remote_target_from_request(request: &Request) -> Option<Uri> {
+    match request.header(&HeaderName::Contact) {
+        Some(TypedHeader::Contact(contacts)) => contacts
+            .0
+            .first()
+            .and_then(|contact| extract_uri_from_contact(contact).ok()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialog::DialogState;
+    use rvoip_sip_core::{Method, Uri};
+
+    #[test]
+    fn test_dialog_lookup_key_creation() {
+        let key = DialogUtils::create_lookup_key("call-123", "tag-local", "tag-remote");
+        assert_eq!(key, "call-123:tag-local:tag-remote");
+    }
+
+    #[test]
+    fn outgoing_dialog_creation_has_no_event_bus_dependency() {
+        let source = include_str!("dialog_operations.rs");
+        let body = source
+            .split("async fn create_outgoing_dialog(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn store_dialog(").next())
+            .expect("outgoing dialog implementation");
+        assert!(!body.contains("event_hub"));
+        assert!(!body.contains("publish_cross_crate_event"));
+        assert!(!body.contains("DialogCreated"));
+    }
+
+    #[test]
+    fn test_bidirectional_dialog_keys() {
+        let (key1, key2) = DialogUtils::create_bidirectional_keys("call-123", "tag-a", "tag-b");
+        assert_eq!(key1, "call-123:tag-a:tag-b");
+        assert_eq!(key2, "call-123:tag-b:tag-a");
+    }
+
+    #[test]
+    fn test_dialog_info_extraction() {
+        let uri = Uri::sip("test@example.com");
+        let request = Request::new(Method::Invite, uri);
+
+        // Test extraction when no headers are present
+        let result = DialogUtils::extract_dialog_info(&request);
+        assert!(result.is_none()); // Should be None due to missing Call-ID
+    }
+
+    #[test]
+    fn test_dialog_state_transition_validation() {
+        // Test the state transition logic that's implemented in update_dialog_state
+        use DialogState::*;
+
+        // Test valid transitions - these should NOT panic in our match logic
+        let valid_transitions = vec![
+            (Early, Confirmed),
+            (Early, Terminated),
+            (Confirmed, Terminated),
+            (Initial, Early),
+            (Initial, Confirmed),
+            (Initial, Terminated),
+            (Recovering, Early),
+            (Recovering, Confirmed),
+            (Recovering, Terminated),
+            (Terminated, Terminated), // Re-termination allowed
+            // Idempotent transitions
+            (Early, Early),
+            (Confirmed, Confirmed),
+            (Initial, Initial),
+            (Recovering, Recovering),
+        ];
+
+        for (from_state, to_state) in valid_transitions {
+            // Simulate the validation logic from update_dialog_state
+            let validation_result = validate_state_transition(&from_state, &to_state);
+            assert!(
+                validation_result.is_ok(),
+                "Transition from {:?} to {:?} should be valid",
+                from_state,
+                to_state
+            );
+        }
+
+        // Test invalid transitions
+        let invalid_transitions = vec![
+            (Confirmed, Early),
+            (Confirmed, Initial),
+            (Confirmed, Recovering),
+            (Early, Initial),
+            (Early, Recovering),
+            (Terminated, Early),
+            (Terminated, Confirmed),
+            (Terminated, Initial),
+            (Terminated, Recovering),
+        ];
+
+        for (from_state, to_state) in invalid_transitions {
+            let validation_result = validate_state_transition(&from_state, &to_state);
+            assert!(
+                validation_result.is_err(),
+                "Transition from {:?} to {:?} should be invalid",
+                from_state,
+                to_state
+            );
+        }
+    }
+
+    #[test]
+    fn test_message_extensions() {
+        use super::super::utils::MessageExtensions;
+
+        let uri = Uri::sip("test@example.com");
+        let request_empty = Request::new(Method::Invite, uri.clone());
+        let request_with_body = Request::new(Method::Invite, uri).with_body(b"test body".to_vec());
+
+        // Test empty body
+        assert_eq!(request_empty.body_string(), None);
+
+        // Test body with content
+        assert_eq!(
+            request_with_body.body_string(),
+            Some("test body".to_string())
+        );
+    }
+
+    // Helper function to test state transition validation logic
+    // This extracts the validation logic from update_dialog_state for unit testing
+    fn validate_state_transition(from: &DialogState, to: &DialogState) -> Result<(), &'static str> {
+        match (from, to) {
+            // Valid transitions: Early -> Confirmed or Terminated
+            (DialogState::Early, DialogState::Confirmed) => Ok(()),
+            (DialogState::Early, DialogState::Terminated) => Ok(()),
+
+            // Valid transitions: Confirmed -> Terminated
+            (DialogState::Confirmed, DialogState::Terminated) => Ok(()),
+
+            // Allow re-termination
+            (DialogState::Terminated, DialogState::Terminated) => Ok(()),
+
+            // Same state transitions for Early and Confirmed (idempotent)
+            (DialogState::Early, DialogState::Early) => Ok(()),
+            (DialogState::Confirmed, DialogState::Confirmed) => Ok(()),
+
+            // Valid transitions: Initial can go to any state (covers all Initial cases)
+            (DialogState::Initial, _) => Ok(()),
+
+            // Valid transitions: Recovering can transition to any state (covers all Recovering cases)
+            (DialogState::Recovering, _) => Ok(()),
+
+            // Invalid transitions - Confirmed cannot go back to Early
+            (DialogState::Confirmed, DialogState::Early) => {
+                Err("Invalid state transition: Confirmed -> Early")
+            }
+
+            // Invalid transitions - Confirmed cannot go to Initial or Recovering
+            (DialogState::Confirmed, DialogState::Initial) => {
+                Err("Invalid state transition: Confirmed -> Initial")
+            }
+            (DialogState::Confirmed, DialogState::Recovering) => {
+                Err("Invalid state transition: Confirmed -> Recovering")
+            }
+
+            // Invalid transitions - Early cannot go back to Initial
+            (DialogState::Early, DialogState::Initial) => {
+                Err("Invalid state transition: Early -> Initial")
+            }
+            (DialogState::Early, DialogState::Recovering) => {
+                Err("Invalid state transition: Early -> Recovering")
+            }
+
+            // Invalid transitions - Cannot transition from Terminated (except to Terminated)
+            (DialogState::Terminated, _) => Err("Cannot transition from Terminated state"),
+        }
+    }
+}
