@@ -1,0 +1,595 @@
+//! `OutboundCallBuilder` — SIP_API_DESIGN_2 §3.3 INVITE builder.
+
+use std::{fmt, sync::Arc};
+
+use rvoip_sip_core::types::{Method, TypedHeader};
+
+use crate::api::handle::CallId;
+use crate::api::headers::{BuilderHeaderState, SipRequestOptions};
+use crate::api::unified::UnifiedCoordinator;
+use crate::auth::SipClientAuth;
+use crate::errors::Result;
+use crate::types::Credentials;
+
+/// Per-request override for the `P-Asserted-Identity` (RFC 3325).
+///
+/// `Debug` reports the selected variant without formatting the URI override.
+#[non_exhaustive]
+#[derive(Default, Clone)]
+pub enum PaiOverride {
+    /// Inherit `Config.pai_uri`.
+    #[default]
+    Default,
+    /// Suppress PAI emission even if `Config` has one.
+    Suppress,
+    /// Override `Config.pai_uri` for this call only.
+    Use(String),
+}
+
+impl fmt::Debug for PaiOverride {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Default => "Default",
+            Self::Suppress => "Suppress",
+            Self::Use(_) => "Use",
+        })
+    }
+}
+
+/// Per-request override for the outbound proxy `Route:` header.
+///
+/// `Debug` reports the selected variant without formatting the URI override.
+#[non_exhaustive]
+#[derive(Default, Clone)]
+pub enum ProxyOverride {
+    /// Inherit `Config.outbound_proxy_uri`.
+    #[default]
+    Default,
+    /// Suppress the outbound proxy `Route:` even if `Config` has one.
+    Suppress,
+    /// Override the outbound proxy `Route:` for this call only.
+    Use(String),
+}
+
+impl fmt::Debug for ProxyOverride {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Default => "Default",
+            Self::Suppress => "Suppress",
+            Self::Use(_) => "Use",
+        })
+    }
+}
+
+/// SIP_API_DESIGN_2 §7.1 — frozen snapshot of an `OutboundCallBuilder`
+/// staged on `SessionState.pending_invite_options` and consumed by the
+/// `Action::SendINVITEWithOptions` handler.
+///
+/// `OutboundCallOptions` is an rvoip-sip-side struct (not in
+/// rvoip-sip-dialog) because INVITE carries rvoip-sip concerns rvoip-sip-dialog
+/// doesn't need: PAI mode, credentials, transfer-leg tracking,
+/// `supported_100rel`. The state machine unpacks it at the DialogAdapter
+/// boundary into rvoip-sip-dialog's structural `InviteRequestOptions`.
+///
+/// `Debug` intentionally exposes only operational flags and counts; retained
+/// URIs, SDP, credentials, authorization, and application headers are redacted.
+#[derive(Default, Clone)]
+pub struct OutboundCallOptionsSnapshot {
+    /// `From:` URI; falls back to `Config.local_uri` when `None`.
+    pub from: Option<String>,
+    /// Request-URI / `To:` target of the INVITE.
+    pub to: String,
+    /// SDP offer body, if any.
+    pub sdp: Option<String>,
+    /// Digest credentials used for 401/407 retry.
+    pub credentials: Option<Credentials>,
+    /// General SIP auth used for 401/407 retry.
+    pub auth: Option<SipClientAuth>,
+    /// `P-Asserted-Identity` (RFC 3325) override mode for this call.
+    pub pai_override: PaiOverride,
+    /// `Contact:` URI override advertised on the INVITE.
+    pub contact_uri: Option<String>,
+    /// Outbound proxy `Route:` override mode for this call.
+    pub outbound_proxy_override: ProxyOverride,
+    /// `Subject:` header value.
+    pub subject: Option<String>,
+    /// `From:` display name override.
+    pub from_display: Option<String>,
+    /// Pre-computed `Authorization:` header value, bypassing 401-driven
+    /// digest computation.
+    pub precomputed_auth: Option<String>,
+    /// When set, marks this INVITE as the B leg of an attended transfer
+    /// initiated by the named transferor session.
+    pub transfer_leg: Option<CallId>,
+    /// Whether RFC 3262 reliable provisional responses are advertised.
+    pub supported_100rel: bool,
+    /// Application-staged extra headers appended after stack-managed ones.
+    pub extra_headers: Vec<rvoip_sip_core::types::TypedHeader>,
+    /// When true, the outbound INVITE applies SBC topology hiding:
+    /// stack-managed Via headers below the top entry are stripped
+    /// and Record-Route entries not pointing at this SBC are
+    /// removed before send. Default `false` — applications that
+    /// want B2BUA-style hiding turn this on per call via
+    /// [`OutboundCallBuilder::with_topology_hiding`].
+    pub topology_hiding: bool,
+    /// Exact process-local RFC 5626 routes selected by a registrar-backed
+    /// application facade. Empty uses normal RFC 3263 routing.
+    #[doc(hidden)]
+    pub registered_flow_routes: Vec<rvoip_sip_transport::TransportRoute>,
+}
+
+impl fmt::Debug for OutboundCallOptionsSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pai_override = match &self.pai_override {
+            PaiOverride::Default => "default",
+            PaiOverride::Suppress => "suppress",
+            PaiOverride::Use(_) => "override",
+        };
+        let outbound_proxy_override = match &self.outbound_proxy_override {
+            ProxyOverride::Default => "default",
+            ProxyOverride::Suppress => "suppress",
+            ProxyOverride::Use(_) => "override",
+        };
+
+        formatter
+            .debug_struct("OutboundCallOptionsSnapshot")
+            .field("from_present", &self.from.is_some())
+            .field("target_present", &!self.to.is_empty())
+            .field("sdp_present", &self.sdp.is_some())
+            .field("credentials_present", &self.credentials.is_some())
+            .field("auth_present", &self.auth.is_some())
+            .field("pai_override", &pai_override)
+            .field("contact_uri_present", &self.contact_uri.is_some())
+            .field("outbound_proxy_override", &outbound_proxy_override)
+            .field("subject_present", &self.subject.is_some())
+            .field("from_display_present", &self.from_display.is_some())
+            .field("precomputed_auth_present", &self.precomputed_auth.is_some())
+            .field("transfer_leg_present", &self.transfer_leg.is_some())
+            .field("supported_100rel", &self.supported_100rel)
+            .field("extra_header_count", &self.extra_headers.len())
+            .field("topology_hiding", &self.topology_hiding)
+            .field(
+                "registered_flow_route_count",
+                &self.registered_flow_routes.len(),
+            )
+            .finish()
+    }
+}
+
+/// Outbound INVITE builder.
+pub struct OutboundCallBuilder {
+    coord: Arc<UnifiedCoordinator>,
+    from: Option<String>,
+    to: String,
+    sdp: Option<String>,
+    credentials: Option<Credentials>,
+    auth: Option<SipClientAuth>,
+    pai: PaiOverride,
+    ppi_uri: Option<String>,
+    contact_uri: Option<String>,
+    outbound_proxy: ProxyOverride,
+    subject: Option<String>,
+    from_display: Option<String>,
+    precomputed_authorization: Option<String>,
+    transfer_leg: Option<CallId>,
+    supported_100rel: bool,
+    state: BuilderHeaderState,
+    topology_hiding: bool,
+    registered_flow_routes: Vec<rvoip_sip_transport::TransportRoute>,
+    session_id: Option<CallId>,
+}
+
+impl OutboundCallBuilder {
+    pub(crate) fn new(
+        coord: Arc<UnifiedCoordinator>,
+        from: Option<String>,
+        to: impl Into<String>,
+    ) -> Self {
+        Self {
+            coord,
+            from,
+            to: to.into(),
+            sdp: None,
+            credentials: None,
+            auth: None,
+            pai: PaiOverride::default(),
+            ppi_uri: None,
+            contact_uri: None,
+            outbound_proxy: ProxyOverride::default(),
+            subject: None,
+            from_display: None,
+            precomputed_authorization: None,
+            transfer_leg: None,
+            supported_100rel: false,
+            state: BuilderHeaderState::default(),
+            topology_hiding: false,
+            registered_flow_routes: Vec::new(),
+            session_id: None,
+        }
+    }
+
+    /// Attach an SDP offer.
+    pub fn with_sdp(mut self, sdp: impl Into<String>) -> Self {
+        self.sdp = Some(sdp.into());
+        self
+    }
+
+    /// Send the initial INVITE without an SDP offer.
+    ///
+    /// If the successful response contains an SDP offer, the coordinator
+    /// generates its answer and carries it in ACK as required by RFC 3261.
+    pub fn without_sdp(mut self) -> Self {
+        // `None` means "use the generated offer" at dispatch, so retain an
+        // explicit empty snapshot to represent delayed offer.
+        self.sdp = Some(String::new());
+        self
+    }
+
+    /// Attach Digest credentials for UAC 401/407 retry.
+    pub fn with_credentials(mut self, creds: Credentials) -> Self {
+        self.credentials = Some(creds);
+        self
+    }
+
+    /// Attach general UAC SIP auth for 401/407 retry.
+    ///
+    /// Use [`SipClientAuth::any`] when the peer may offer multiple schemes and
+    /// the UAC should negotiate among Digest, Bearer, Basic, and AKA options.
+    pub fn with_auth(mut self, auth: SipClientAuth) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Attach a Bearer token for UAC 401/407 retry.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.auth = Some(SipClientAuth::bearer_token(token));
+        self
+    }
+
+    /// Attach Basic credentials for UAC 401/407 retry.
+    ///
+    /// Basic is cleartext-disabled by default. Use
+    /// `with_auth(SipClientAuth::basic(...).allow_basic_over_cleartext(true))`
+    /// only for explicit legacy cleartext interop.
+    pub fn with_basic_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auth = Some(SipClientAuth::basic(username, password));
+        self
+    }
+
+    /// Override the `P-Asserted-Identity` URI for this call only.
+    pub fn with_pai(mut self, uri: impl Into<String>) -> Self {
+        self.pai = PaiOverride::Use(uri.into());
+        self
+    }
+
+    /// Suppress `P-Asserted-Identity` emission even when
+    /// `Config.pai_uri` is set.
+    pub fn without_pai(mut self) -> Self {
+        self.pai = PaiOverride::Suppress;
+        self
+    }
+
+    /// Attach a typed `P-Preferred-Identity` URI to this call.
+    ///
+    /// The URI is validated before any session or network resource is
+    /// allocated and is retained across authenticated INVITE retries.
+    pub fn with_ppi(mut self, uri: impl Into<String>) -> Self {
+        self.ppi_uri = Some(uri.into());
+        self
+    }
+
+    /// Override the `Contact:` URI advertised on this INVITE.
+    pub fn with_contact_uri(mut self, uri: impl Into<String>) -> Self {
+        self.contact_uri = Some(uri.into());
+        self
+    }
+
+    /// Override the outbound proxy `Route:` for this call only.
+    pub fn with_outbound_proxy(mut self, uri: impl Into<String>) -> Self {
+        self.outbound_proxy = ProxyOverride::Use(uri.into());
+        self
+    }
+
+    /// Suppress the outbound proxy `Route:` even when
+    /// `Config.outbound_proxy_uri` is set.
+    pub fn without_outbound_proxy(mut self) -> Self {
+        self.outbound_proxy = ProxyOverride::Suppress;
+        self
+    }
+
+    /// Attach a `Subject:` header.
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    /// Override the `From:` display name.
+    pub fn with_from_display(mut self, display: impl Into<String>) -> Self {
+        self.from_display = Some(display.into());
+        self
+    }
+
+    /// Pre-computed `Authorization:` header value — bypasses
+    /// 401-driven digest computation.
+    pub fn with_precomputed_authorization(mut self, value: impl Into<String>) -> Self {
+        self.precomputed_authorization = Some(value.into());
+        self
+    }
+
+    /// Mark this INVITE as the replacement leg for an accepted inbound REFER.
+    ///
+    /// The transfer relationship is committed before the INVITE reaches the
+    /// state machine, so provisional, final, and failure progress can drive
+    /// RFC 3515 NOTIFY without the race inherent in post-send linkage. This is
+    /// valid for blind and attended-transfer application orchestration.
+    pub fn as_transfer_leg(mut self, transferor: &CallId) -> Self {
+        self.transfer_leg = Some(transferor.clone());
+        self
+    }
+
+    /// Advertise RFC 3262 reliable provisional support.
+    pub fn with_supported_100rel(mut self, supported: bool) -> Self {
+        self.supported_100rel = supported;
+        self
+    }
+
+    /// Apply SBC topology hiding to this outbound INVITE. When enabled,
+    /// any Via headers below the SBC's own top Via are stripped, and
+    /// Record-Route entries that do not point at this SBC are removed
+    /// before the message reaches the wire. Use this on B2BUA forwards
+    /// where the inbound topology (upstream Via stack, intermediate
+    /// Record-Routes) must not leak to downstream peers.
+    ///
+    /// The default outbound-INVITE shape already builds a fresh Via
+    /// stack and Contact, so most call sites do not need this — the
+    /// flag matters only for forward paths that explicitly carry
+    /// inherited topology headers across (e.g. proxy-style B2BUA on
+    /// top of `Transport::send_message_raw`).
+    pub fn with_topology_hiding(mut self, enabled: bool) -> Self {
+        self.topology_hiding = enabled;
+        self
+    }
+
+    /// Use a caller-reserved Session identity for this INVITE.
+    ///
+    /// This crate-private seam lets the core adapter install its Connection ID
+    /// and dormant event stage before the state machine can emit a fast answer
+    /// or terminal event. Ordinary API callers continue to receive a generated
+    /// Session ID from [`Self::send`].
+    pub(crate) fn with_reserved_session_id(mut self, session_id: CallId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Retain verified process-local registered-flow routes through the
+    /// state-machine snapshot and every initial-INVITE retry.
+    pub(crate) fn with_registered_flow_routes(
+        mut self,
+        routes: Vec<rvoip_sip_transport::TransportRoute>,
+    ) -> Self {
+        self.registered_flow_routes = routes;
+        self
+    }
+
+    /// Send the INVITE.
+    ///
+    /// Routes through the unified state-machine path: creates the
+    /// session, stages an [`OutboundCallOptionsSnapshot`] on the
+    /// session's INVITE stash, then dispatches
+    /// [`EventType::SendOutboundInvite`](crate::state_table::EventType::SendOutboundInvite).
+    /// The state table's `(Idle, SendOutboundInvite, UAC)` row runs
+    /// `CreateDialog → CreateMediaSession → GenerateLocalSDP →
+    /// SendINVITEWithOptions`, which drains the stash and emits the
+    /// INVITE through rvoip-sip-dialog's `send_invite_with_extra_headers`.
+    /// Application-staged headers, PAI override, outbound-proxy
+    /// override, credentials and Subject ride through the snapshot.
+    pub async fn send(self) -> Result<CallId> {
+        #[cfg(feature = "perf-call-setup-diagnostics")]
+        let send_started = std::time::Instant::now();
+        let from = self
+            .from
+            .clone()
+            .unwrap_or_else(|| self.coord.config_local_uri());
+        let to = self.to.clone();
+
+        // Resolve PAI per the builder's override mode against Config.
+        let pai_uri = match &self.pai {
+            PaiOverride::Use(uri) => Some(uri.clone()),
+            PaiOverride::Suppress => None,
+            PaiOverride::Default => self.coord.config_pai_uri(),
+        };
+
+        // Fall back to `Config::credentials` when the application did
+        // not stage per-call credentials, so PBX-auth flows that only
+        // configure peer-level credentials keep working.
+        let credentials = self
+            .credentials
+            .clone()
+            .or_else(|| self.coord.config_credentials());
+        let auth = self
+            .auth
+            .clone()
+            .or_else(|| self.coord.config_auth())
+            .or_else(|| credentials.clone().map(Into::into));
+        let mut extra_headers = self.state.headers.clone();
+        if let Some(ppi) = self.ppi_uri.as_deref() {
+            use rvoip_sip_core::types::{PPreferredIdentity, Uri};
+            use std::str::FromStr;
+            let uri = Uri::from_str(ppi).map_err(|_| {
+                crate::errors::SessionError::InvalidInput(
+                    "P-Preferred-Identity URI failed validation".to_string(),
+                )
+            })?;
+            extra_headers.insert(
+                0,
+                TypedHeader::PPreferredIdentity(PPreferredIdentity::with_uri(uri)),
+            );
+        }
+
+        // Build the snapshot — folds every override into a frozen
+        // struct that the state-machine handler reads back verbatim.
+        let snapshot = std::sync::Arc::new(OutboundCallOptionsSnapshot {
+            from: Some(from.clone()),
+            to: to.clone(),
+            sdp: self.sdp,
+            credentials,
+            auth,
+            pai_override: self.pai,
+            contact_uri: self.contact_uri,
+            outbound_proxy_override: self.outbound_proxy,
+            subject: self.subject,
+            from_display: self.from_display,
+            precomputed_auth: self.precomputed_authorization,
+            transfer_leg: self.transfer_leg,
+            supported_100rel: self.supported_100rel,
+            extra_headers,
+            topology_hiding: self.topology_hiding,
+            registered_flow_routes: self.registered_flow_routes,
+        });
+
+        // Validate the complete wire-facing option set before allocating a
+        // SessionState or media resources. This catches semantic stack-owned
+        // headers (including `TypedHeader::Other` aliases), malformed Contact,
+        // auth, proxy and singleton collisions without mutating any runtime
+        // state or performing DNS.
+        let (preflight_opts, _) = crate::state_machine::actions::materialize_invite_options(
+            &snapshot,
+            pai_uri.as_deref(),
+            snapshot.sdp.clone(),
+        )
+        .map_err(|error| crate::errors::SessionError::InvalidInput(error.to_string()))?;
+        rvoip_sip_dialog::api::unified::validate_initial_invite_options(&preflight_opts).map_err(
+            |_| {
+                crate::errors::SessionError::InvalidInput(
+                    "initial INVITE options failed preflight validation".to_string(),
+                )
+            },
+        )?;
+
+        // Create the session up front — Idle UAC. Builder metadata and the
+        // immutable request snapshot enter together through the exact-session
+        // lane below, before the state-table `CreateDialog` action reads them.
+        let session_id = self.session_id.unwrap_or_default();
+        #[cfg(feature = "perf-call-setup-diagnostics")]
+        let create_session_started = std::time::Instant::now();
+        self.coord
+            .helpers
+            .create_session(
+                session_id.clone(),
+                from.clone(),
+                to.clone(),
+                crate::state_table::Role::UAC,
+            )
+            .await?;
+        #[cfg(feature = "perf-call-setup-diagnostics")]
+        crate::call_setup_diag::record_stage(
+            &session_id,
+            "outbound_send.create_session",
+            create_session_started.elapsed(),
+        );
+
+        let setup_result: Result<()> = async {
+            #[cfg(feature = "perf-call-setup-diagnostics")]
+            let stage_and_dispatch_started = std::time::Instant::now();
+            self.coord
+                .dispatch_outbound_invite_with_options(&session_id, Arc::clone(&snapshot), pai_uri)
+                .await?;
+            #[cfg(feature = "perf-call-setup-diagnostics")]
+            crate::call_setup_diag::record_stage(
+                &session_id,
+                "outbound_send.stage_and_dispatch",
+                stage_and_dispatch_started.elapsed(),
+            );
+            Ok(())
+        }
+        .await;
+        if let Err(error) = setup_result {
+            self.coord.rollback_outbound_setup(&session_id).await;
+            return Err(error);
+        }
+        #[cfg(feature = "perf-call-setup-diagnostics")]
+        let schedule_timeout_started = std::time::Instant::now();
+        self.coord
+            .schedule_outbound_setup_timeout(&session_id)
+            .await;
+        #[cfg(feature = "perf-call-setup-diagnostics")]
+        {
+            crate::call_setup_diag::record_stage(
+                &session_id,
+                "outbound_send.schedule_timeout",
+                schedule_timeout_started.elapsed(),
+            );
+            crate::call_setup_diag::record_stage(
+                &session_id,
+                "outbound_send.total",
+                send_started.elapsed(),
+            );
+        }
+        Ok(session_id)
+    }
+}
+
+impl SipRequestOptions for OutboundCallBuilder {
+    fn method(&self) -> Method {
+        Method::Invite
+    }
+    fn header_state_mut(&mut self) -> &mut BuilderHeaderState {
+        &mut self.state
+    }
+    fn header_state(&self) -> &BuilderHeaderState {
+        &self.state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rvoip_sip_core::types::{headers::HeaderValue, HeaderName, TypedHeader};
+
+    #[test]
+    fn outbound_call_snapshot_debug_redacts_every_retained_value() {
+        const SECRET: &str = "outbound-snapshot-secret-canary";
+        let snapshot = OutboundCallOptionsSnapshot {
+            from: Some(format!("sip:{SECRET}@from.invalid")),
+            to: format!("sip:{SECRET}@target.invalid"),
+            sdp: Some(format!("v=0\r\na={SECRET}")),
+            credentials: Some(Credentials::new(SECRET, SECRET)),
+            auth: Some(SipClientAuth::bearer_token(SECRET)),
+            pai_override: PaiOverride::Use(format!("sip:{SECRET}@pai.invalid")),
+            contact_uri: Some(format!("sip:{SECRET}@contact.invalid")),
+            outbound_proxy_override: ProxyOverride::Use(format!("sip:{SECRET}@proxy.invalid")),
+            subject: Some(SECRET.into()),
+            from_display: Some(SECRET.into()),
+            precomputed_auth: Some(format!("Bearer {SECRET}")),
+            transfer_leg: Some(SECRET.into()),
+            supported_100rel: true,
+            extra_headers: vec![TypedHeader::Other(
+                HeaderName::Other("X-Secret-Canary".into()),
+                HeaderValue::Raw(SECRET.as_bytes().to_vec()),
+            )],
+            topology_hiding: true,
+            registered_flow_routes: Vec::new(),
+        };
+
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains(SECRET));
+        assert!(!debug.contains("X-Secret-Canary"));
+        assert!(debug.contains("credentials_present: true"));
+        assert!(debug.contains("auth_present: true"));
+        assert!(debug.contains("pai_override: \"override\""));
+        assert!(debug.contains("outbound_proxy_override: \"override\""));
+        assert!(debug.contains("extra_header_count: 1"));
+        assert!(debug.contains("supported_100rel: true"));
+
+        let pai_debug = format!("{:?}", PaiOverride::Use(SECRET.into()));
+        let proxy_debug = format!("{:?}", ProxyOverride::Use(SECRET.into()));
+        assert_eq!(pai_debug, "Use");
+        assert_eq!(proxy_debug, "Use");
+        assert!(!pai_debug.contains(SECRET));
+        assert!(!proxy_debug.contains(SECRET));
+    }
+}

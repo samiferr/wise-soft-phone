@@ -83,6 +83,7 @@ Most controls wait while another UI operation is pending. Hang up and Disconnect
 | Concrete local SIP port | Use the listening port in the endpoint identity | Small port-selection/bind handoff can fail on collision |
 | Configured provider-edge routing | Reach private provider dialog targets through the correct proxy | Provider-specific interoperability still requires acceptance |
 | Vendored RVoIP ACK correction | Preserve routes and correctly resolve hostname next hops | Local patch must be maintained across dependency upgrades |
+| Opus first, G.711 fallback | Wideband voice where the PBX supports it, unchanged G.711 elsewhere | Device bridge must run at the negotiated rate (48 kHz) and channel count; vendored `rvoip-sip` exposes that format and `rvoip-audio-device` produces it |
 
 The [patch note](../vendor/rvoip-sip-dialog/SOFTPHONE_PATCH.md) and [exact diff](../vendor/rvoip-sip-dialog/SOFTPHONE.patch) document the local changes. The patch keeps learned public routes and can place the configured edge before a learned private IPv4 hop. ACK reuses the INVITE's DNS-selected route when the next hop is unchanged; otherwise it resolves the new hostname. It must not silently fall back to private Contact.
 

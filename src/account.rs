@@ -22,6 +22,43 @@ pub struct Account {
     pub outbound_proxy: String,
     pub secure: bool,
     pub remember_password: bool,
+    pub codecs: CodecPreference,
+}
+
+/// Which audio codecs the endpoint offers, in preference order.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodecPreference {
+    /// Opus wideband first, then G.711 µ-law and A-law.
+    #[default]
+    OpusFirst,
+    /// G.711 µ-law and A-law only, for PBXs without working Opus.
+    G711Only,
+}
+
+/// RTP payload type RVoIP assigns to Opus in its own offers.
+pub const OPUS_PT: u8 = 111;
+const PCMU_PT: u8 = 0;
+const PCMA_PT: u8 = 8;
+const TELEPHONE_EVENT_PT: u8 = 101;
+
+impl CodecPreference {
+    pub const ALL: [Self; 2] = [Self::OpusFirst, Self::G711Only];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpusFirst => "Opus first, G.711 fallback",
+            Self::G711Only => "G.711 only",
+        }
+    }
+
+    /// Payload types offered in SDP, most preferred first.
+    pub fn payload_types(self) -> Vec<u8> {
+        match self {
+            Self::OpusFirst => vec![OPUS_PT, PCMU_PT, PCMA_PT, TELEPHONE_EVENT_PT],
+            Self::G711Only => vec![PCMU_PT, PCMA_PT, TELEPHONE_EVENT_PT],
+        }
+    }
 }
 
 impl Account {
@@ -214,6 +251,9 @@ impl Account {
             .srtp(srtp)
             .bind_addr(address)
             .auto_180_ringing(true);
+        let offered = self.codecs.payload_types();
+        tracing::info!(codecs = ?offered, "Configured offered audio codecs");
+        builder = builder.configure(move |config| config.offered_codecs = offered);
 
         if let Some(proxy) = self.proxy_uri() {
             tracing::info!("Routing SIP through the configured provider edge");
@@ -358,5 +398,28 @@ mod proxy_tests {
         );
         account.outbound_proxy = "invalid;route=evil".into();
         assert!(account.validate().is_err());
+    }
+
+    #[test]
+    fn codec_preference_orders_payload_types() {
+        assert_eq!(CodecPreference::OpusFirst.payload_types(), [111, 0, 8, 101]);
+        let g711 = CodecPreference::G711Only.payload_types();
+        assert_eq!(g711, [0, 8, 101]);
+        assert!(!g711.contains(&OPUS_PT));
+    }
+
+    #[test]
+    fn saved_settings_without_codecs_default_to_opus_first() {
+        let account: Account =
+            serde_json::from_str(r#"{"registrar":"pbx.example.com","username":"1001"}"#).unwrap();
+        assert_eq!(account.codecs, CodecPreference::OpusFirst);
+        let json = serde_json::to_string(&Account {
+            codecs: CodecPreference::G711Only,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(json.contains(r#""codecs":"g711Only""#));
+        let back: Account = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.codecs, CodecPreference::G711Only);
     }
 }

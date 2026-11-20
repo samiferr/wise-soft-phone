@@ -43,7 +43,7 @@ The provider edge and media endpoint may run on the same infrastructure. They ha
 Linux is the tested development platform. Building requires Rust 1.95 or newer and native audio and windowing libraries. On Debian/Ubuntu, run:
 
 ```sh
-sudo apt install build-essential pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
+sudo apt install build-essential pkg-config cmake libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
 cargo build --locked --release
 ```
 
@@ -90,7 +90,7 @@ Set SIP hostnames, transport, and proxy in the account form. Saving or retrievin
 
 The app uses the OS route to the registrar, including VPN routes, to choose a local interface. It selects a listening port before building its SIP identity. Another process could take the port before the SIP stack binds it; that collision causes startup to fail.
 
-Use your provider's current network requirements; do not copy example IPs from logs into firewall or proxy settings. The app has no ICE/TURN settings and cannot guarantee every NAT setup. Start with a reachable PBX that relays voice. Asterisk examples use `direct_media=no`, G.711, and RFC 4733 DTMF. Twilio accounts route through their configured domain while keeping private Contact values intact.
+Use your provider's current network requirements; do not copy example IPs from logs into firewall or proxy settings. The app has no ICE/TURN settings and cannot guarantee every NAT setup. Start with a reachable PBX that relays voice. Asterisk examples use `direct_media=no`, Opus with G.711 fallback, and RFC 4733 DTMF. Twilio accounts route through their configured domain while keeping private Contact values intact.
 
 ## Test environments and limits
 

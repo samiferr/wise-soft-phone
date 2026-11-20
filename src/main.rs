@@ -47,3 +47,6 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod sip_routing_tests;
+
+#[cfg(test)]
+mod codec_tests;

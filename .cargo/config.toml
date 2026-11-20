@@ -1,0 +1,5 @@
+# Build the libopus copy bundled with audiopus_sys (CMake) and link it
+# statically, so the binary does not depend on a system libopus.
+[env]
+LIBOPUS_NO_PKG = "1"
+LIBOPUS_STATIC = "1"

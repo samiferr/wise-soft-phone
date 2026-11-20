@@ -39,7 +39,7 @@ SDP and provider settings determine the voice route. The call diagram shows the 
 | Desktop UI | User ↔ app | Account form, status, dial pad, call controls, device selection, Escape shortcut |
 | SIP registration | App ↔ registrar | Digest challenge/response, registration refresh, unregister |
 | SIP dialog | App ↔ provider/peer | INVITE, progress/answer, ACK, CANCEL, BYE; responses and dialog identity |
-| Voice | App ↔ negotiated media endpoint | G.711 PCMU/PCMA over RTP; required SDES-SRTP in secure mode |
+| Voice | App ↔ negotiated media endpoint | Opus (default first choice) or G.711 PCMU/PCMA over RTP; required SDES-SRTP in secure mode |
 | Keypad tones | App → remote media endpoint | Negotiated RFC 4733 telephone events during connected calls |
 | Hostname lookup | App → DNS | Registrar route selection; SIP stack resolution of next-hop names |
 | Audio hardware | App ↔ CPAL / OS audio | Capture, playback, device enumeration, incoming alert output |
@@ -50,7 +50,7 @@ SDP and provider settings determine the voice route. The call diagram shows the 
 ## What the app needs
 
 - A reachable IPv4 SIP registrar/PBX/provider and valid account credentials are available.
-- The provider supports the selected signaling/media profile and G.711 codecs.
+- The provider supports the selected signaling/media profile and Opus or G.711 codecs.
 - The desktop provides working audio devices and an OpenGL-capable window environment.
 - Secure calling requires a trusted server certificate and compatible SDES-SRTP negotiation.
 - Saving or retrieving passwords requires an available, unlocked OS credential store.

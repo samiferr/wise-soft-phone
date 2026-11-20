@@ -1,0 +1,451 @@
+diff -ruN rvoip-audio-device-0.4.0/src/lib.rs rvoip-audio-device/src/lib.rs
+--- rvoip-audio-device-0.4.0/src/lib.rs	2006-07-24 01:21:28.000000000 +0000
++++ rvoip-audio-device/src/lib.rs	2026-11-20 10:09:33.414490730 +0000
+@@ -12,9 +12,15 @@
+ //!   [`tokio::time::interval`] (one frame per tick, silence on underrun), not a
+ //!   per-frame `sleep` — `sleep` accumulates latency and drifts to ~22 ms,
+ //!   starving the far end.
++//! - **Negotiated PCM format.** Mic frames are produced at the call's
++//!   negotiated sample rate and channel count ([`DeviceOptions::with_format`]):
++//!   8 kHz mono for G.711, 48 kHz for Opus. Stereo frames carry the mono mic
++//!   on both channels; received stereo is mixed to mono for playback.
+ //! - **Band-limited resampling.** A 4th-order Butterworth low-pass band-limits
+-//!   to the telephone passband before/after the 8 kHz ↔ device-rate conversion,
+-//!   so linear interpolation doesn't alias.
++//!   before decimation and after interpolation, so linear interpolation doesn't
++//!   alias. G.711 keeps the telephone passband (3.4 kHz); wideband codecs keep
++//!   up to 45 % of the lower rate. The interpolator carries its phase across
++//!   blocks, so non-integer ratios (44.1 ↔ 48 kHz) neither drift nor click.
+ //! - **Click-free jitter buffer.** A small playback buffer (~50 ms pre-roll,
+ //!   ~300 ms cap) decays toward silence on underrun instead of hard-zeroing.
+ //! - **Mute-as-silence and VU metering.**
+@@ -49,13 +55,49 @@
+ 
+ use rvoip_sip::{AudioFrame, AudioSender, AudioStream};
+ 
+-/// SIP audio is negotiated as 8 kHz mono PCM (G.711).
+-const SAMPLE_RATE: u32 = 8_000;
++/// Default PCM format: 8 kHz mono (G.711).
++const DEFAULT_SAMPLE_RATE: u32 = 8_000;
+ const FRAME_MS: u32 = 20;
+-const FRAME_SAMPLES: usize = (SAMPLE_RATE as usize * FRAME_MS as usize) / 1_000;
+ /// Low-pass cutoff: top of the telephone passband (G.711 is band-limited anyway).
+ const TELEPHONE_CUTOFF_HZ: f32 = 3400.0;
+ 
++/// PCM shape of the frames exchanged with rvoip for one call.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct AudioFormat {
++    /// Sample rate in Hz (8000 for G.711, 48000 for Opus).
++    pub sample_rate: u32,
++    /// Interleaved channel count, 1 or 2.
++    pub channels: u8,
++}
++
++impl Default for AudioFormat {
++    fn default() -> Self {
++        Self {
++            sample_rate: DEFAULT_SAMPLE_RATE,
++            channels: 1,
++        }
++    }
++}
++
++impl AudioFormat {
++    /// Samples per channel in one 20 ms frame.
++    pub fn frame_samples(self) -> usize {
++        (self.sample_rate as usize * FRAME_MS as usize) / 1_000
++    }
++}
++
++/// Audio bandwidth worth keeping for a stream at `rate` Hz.
++///
++/// Narrowband (G.711) keeps the telephone passband; wider streams keep 45 %
++/// of the rate, capped at 20 kHz.
++fn audio_band_hz(rate: u32) -> f32 {
++    if rate <= DEFAULT_SAMPLE_RATE {
++        TELEPHONE_CUTOFF_HZ
++    } else {
++        (rate as f32 * 0.45).min(20_000.0)
++    }
++}
++
+ /// Direction of an audio device / stream, from the client's point of view.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum AudioDirection {
+@@ -87,6 +129,7 @@
+     output_device: Option<String>,
+     muted: Option<Arc<AtomicBool>>,
+     level_sink: Option<LevelSink>,
++    format: AudioFormat,
+ }
+ 
+ impl DeviceOptions {
+@@ -107,6 +150,17 @@
+         self
+     }
+ 
++    /// Produce mic frames in the call's negotiated PCM format. Defaults to
++    /// 8 kHz mono. rvoip rejects frames whose rate or channel count differs
++    /// from the negotiated codec, so pass the format the call negotiated.
++    pub fn with_format(mut self, format: AudioFormat) -> Self {
++        self.format = AudioFormat {
++            sample_rate: format.sample_rate.max(1),
++            channels: format.channels.clamp(1, 2),
++        };
++        self
++    }
++
+     /// Share a mute flag with the bridge. While `true`, the mic pump emits
+     /// silence (RTP keeps flowing) — pair this with the rvoip `mute()` signal.
+     pub fn with_mute_flag(mut self, muted: Arc<AtomicBool>) -> Self {
+@@ -177,6 +231,7 @@
+         output_device,
+         muted,
+         level_sink,
++        format,
+     } = opts;
+     let muted = muted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+ 
+@@ -186,7 +241,11 @@
+     let output = choose_device(&host, false, output_device.as_deref())?;
+     let input_name = input.name().unwrap_or_else(|_| "input".into());
+     let output_name = output.name().unwrap_or_else(|_| "output".into());
+-    log::info!("audio route: {input_name} -> {output_name}");
++    log::info!(
++        "audio route: {input_name} -> {output_name} ({} Hz, {} ch)",
++        format.sample_rate,
++        format.channels
++    );
+ 
+     let input_config = input.default_input_config()?;
+     let output_config = output.default_output_config()?;
+@@ -216,35 +275,43 @@
+     input_stream.play()?;
+     output_stream.play()?;
+ 
+-    // Mic pump (Send): captured f32 @ device rate -> 8 kHz i16 frames -> rvoip.
++    // Mic pump (Send): captured f32 @ device rate -> codec-rate i16 frames -> rvoip.
+     let mic_level_sink = level_sink.clone();
+     let input_task = tokio::spawn(async move {
+-        send_microphone_frames(&mut mic_rx, input_sample_rate, sender, mic_level_sink).await;
++        send_microphone_frames(&mut mic_rx, input_sample_rate, format, sender, mic_level_sink)
++            .await;
+     });
+ 
+     // Playback pump (Send): rvoip frames -> resample to device rate -> buffer.
+     let out_level_sink = level_sink.clone();
+     let output_task = tokio::spawn(async move {
+         let mut level_tick = 0u32;
+-        // Reconstruction filter applied after upsampling 8 kHz to the device rate.
+-        let mut playback_lp = LowPass::new(output_sample_rate, TELEPHONE_CUTOFF_HZ);
++        // Rebuilt whenever the received rate changes (codec renegotiation).
++        let mut resampler: Option<Resampler> = None;
+         while let Some(frame) = receiver.recv().await {
+-            let mono = frame
++            let channels = usize::from(frame.channels.max(1));
++            let interleaved = frame
+                 .samples
+                 .iter()
+                 .map(|sample| *sample as f32 / i16::MAX as f32)
+                 .collect::<Vec<_>>();
++            let mono = mix_to_mono(&interleaved, channels);
+             // Throttle VU updates to ~10/s (see input pump).
+             level_tick = level_tick.wrapping_add(1);
+             if level_tick % 5 == 0 {
+                 emit_level(&out_level_sink, AudioDirection::Output, rms(&mono));
+             }
+-            let mut resampled = resample_linear(&mono, frame.sample_rate, output_sample_rate);
+-            if output_sample_rate > frame.sample_rate {
+-                for s in resampled.iter_mut() {
+-                    *s = playback_lp.process(*s);
+-                }
++            if resampler
++                .as_ref()
++                .is_none_or(|r| r.from_rate != frame.sample_rate.max(1))
++            {
++                let rate = frame.sample_rate.max(1);
++                resampler = Some(Resampler::new(rate, output_sample_rate, audio_band_hz(rate)));
+             }
++            let resampled = match resampler.as_mut() {
++                Some(r) => r.process(&mono),
++                None => mono,
++            };
+             if let Ok(mut pb) = playback.lock() {
+                 pb.buffer.extend(resampled);
+                 let cap = pb.cap_samples;
+@@ -278,17 +345,23 @@
+ async fn send_microphone_frames(
+     mic_rx: &mut mpsc::UnboundedReceiver<Vec<f32>>,
+     input_sample_rate: u32,
++    format: AudioFormat,
+     sender: AudioSender,
+     level_sink: Option<LevelSink>,
+ ) {
++    let frame_samples = format.frame_samples();
++    let channels = usize::from(format.channels);
+     let mut mono_buffer = Vec::<f32>::new();
+     let mut timestamp = 0u32;
+     let mut level_tick = 0u32;
+     // Bound the accumulation buffer so latency can't grow without limit if the
+     // capture clock runs slightly faster than the 20 ms send clock.
+-    let max_buffer = (SAMPLE_RATE as usize) / 2; // 0.5 s of 8 kHz audio
+-                                                 // Anti-alias filter applied before downsampling the mic to 8 kHz.
+-    let mut capture_lp = LowPass::new(input_sample_rate, TELEPHONE_CUTOFF_HZ);
++    let max_buffer = (format.sample_rate as usize) / 2; // 0.5 s at the codec rate
++    let mut resampler = Resampler::new(
++        input_sample_rate,
++        format.sample_rate,
++        audio_band_hz(format.sample_rate),
++    );
+ 
+     // Drift-free 20 ms send clock. `interval` ticks on absolute deadlines and
+     // absorbs processing time, unlike `sleep` which accumulates drift (a
+@@ -301,33 +374,27 @@
+             biased;
+             // Emit exactly one 20 ms frame per tick.
+             _ = ticker.tick() => {
+-                let pcm: Vec<i16> = if mono_buffer.len() >= FRAME_SAMPLES {
+-                    mono_buffer.drain(..FRAME_SAMPLES).map(float_to_i16).collect()
++                let mono: Vec<i16> = if mono_buffer.len() >= frame_samples {
++                    mono_buffer.drain(..frame_samples).map(float_to_i16).collect()
+                 } else {
+                     // Underrun: send silence to hold the RTP cadence.
+-                    vec![0i16; FRAME_SAMPLES]
++                    vec![0i16; frame_samples]
+                 };
+-                let frame = AudioFrame::new(pcm, SAMPLE_RATE, 1, timestamp);
+-                timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
++                let pcm = interleave(mono, channels);
++                let frame = AudioFrame::new(pcm, format.sample_rate, format.channels, timestamp);
++                timestamp = timestamp.wrapping_add(frame_samples as u32);
+                 if sender.send(frame).await.is_err() {
+                     return;
+                 }
+             }
+             // Drain whatever the mic captured into the accumulation buffer.
+             maybe = mic_rx.recv() => {
+-                let Some(mut samples) = maybe else { return };
++                let Some(samples) = maybe else { return };
+                 level_tick = level_tick.wrapping_add(1);
+                 if level_tick % 5 == 0 {
+                     emit_level(&level_sink, AudioDirection::Input, rms(&samples));
+                 }
+-                // Band-limit before decimating to 8 kHz to avoid aliasing.
+-                if input_sample_rate > SAMPLE_RATE {
+-                    for s in samples.iter_mut() {
+-                        *s = capture_lp.process(*s);
+-                    }
+-                }
+-                let resampled = resample_linear(&samples, input_sample_rate, SAMPLE_RATE);
+-                mono_buffer.extend(resampled);
++                mono_buffer.extend(resampler.process(&samples));
+                 if mono_buffer.len() > max_buffer {
+                     let overflow = mono_buffer.len() - max_buffer;
+                     mono_buffer.drain(..overflow);
+@@ -570,22 +637,105 @@
+     }
+ }
+ 
+-fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+-    if input.is_empty() || from_rate == to_rate {
+-        return input.to_vec();
+-    }
+-    let out_len = ((input.len() as u64 * to_rate as u64) / from_rate as u64).max(1) as usize;
+-    let ratio = from_rate as f32 / to_rate as f32;
+-    let mut output = Vec::with_capacity(out_len);
+-    for i in 0..out_len {
+-        let pos = i as f32 * ratio;
+-        let idx = pos.floor() as usize;
+-        let frac = pos - idx as f32;
+-        let a = input.get(idx).copied().unwrap_or(0.0);
+-        let b = input.get(idx + 1).copied().unwrap_or(a);
+-        output.push(a + (b - a) * frac);
++/// Streaming mono sample-rate converter: linear interpolation with a
++/// Butterworth band limit, applied at the higher of the two rates (before
++/// decimation, after interpolation). Equal rates pass through, filtered only
++/// when the requested band is narrower than the stream (G.711 at 8 kHz has no
++/// filter; an 8 kHz codec on a 48 kHz device is still limited to 3.4 kHz).
++struct Resampler {
++    from_rate: u32,
++    to_rate: u32,
++    /// Filter applied to the input before decimation.
++    pre: Option<LowPass>,
++    /// Filter applied to the output after interpolation.
++    post: Option<LowPass>,
++    /// Position of the next output sample, in input samples relative to the
++    /// start of the next block (`-1.0..0.0` points into `last`).
++    position: f64,
++    /// Final input sample of the previous block, for interpolation across
++    /// block boundaries.
++    last: f32,
++}
++
++impl Resampler {
++    fn new(from_rate: u32, to_rate: u32, band_hz: f32) -> Self {
++        let from_rate = from_rate.max(1);
++        let to_rate = to_rate.max(1);
++        let lower = from_rate.min(to_rate) as f32;
++        let cutoff = band_hz.min(lower * 0.45);
++        let needs_filter = |rate: u32| cutoff < rate as f32 * 0.4;
++        let (pre, post) = if from_rate > to_rate {
++            (Some(LowPass::new(from_rate, cutoff)), None)
++        } else if from_rate < to_rate {
++            (None, Some(LowPass::new(to_rate, cutoff)))
++        } else if needs_filter(from_rate) {
++            (Some(LowPass::new(from_rate, cutoff)), None)
++        } else {
++            (None, None)
++        };
++        Self {
++            from_rate,
++            to_rate,
++            pre,
++            post,
++            position: 0.0,
++            last: 0.0,
++        }
++    }
++
++    fn process(&mut self, input: &[f32]) -> Vec<f32> {
++        if input.is_empty() {
++            return Vec::new();
++        }
++        let filtered;
++        let input = match self.pre.as_mut() {
++            Some(lp) => {
++                filtered = input.iter().map(|s| lp.process(*s)).collect::<Vec<_>>();
++                filtered.as_slice()
++            }
++            None => input,
++        };
++        let mut output = if self.from_rate == self.to_rate {
++            input.to_vec()
++        } else {
++            let step = self.from_rate as f64 / self.to_rate as f64;
++            let len = input.len() as f64;
++            let mut output =
++                Vec::with_capacity((len / step) as usize + 2);
++            // Output samples whose right-hand neighbour lies in this block.
++            while self.position < len - 1.0 {
++                let floor = self.position.floor();
++                let frac = (self.position - floor) as f32;
++                let (a, b) = if floor < 0.0 {
++                    (self.last, input[0])
++                } else {
++                    let idx = floor as usize;
++                    (input[idx], input[idx + 1])
++                };
++                output.push(a + (b - a) * frac);
++                self.position += step;
++            }
++            self.position -= len;
++            self.last = input[input.len() - 1];
++            output
++        };
++        if let Some(lp) = self.post.as_mut() {
++            for s in output.iter_mut() {
++                *s = lp.process(*s);
++            }
++        }
++        output
+     }
+-    output
++}
++
++/// Duplicate mono samples into `channels` interleaved channels.
++fn interleave(mono: Vec<i16>, channels: usize) -> Vec<i16> {
++    if channels <= 1 {
++        return mono;
++    }
++    mono.into_iter()
++        .flat_map(|sample| std::iter::repeat_n(sample, channels))
++        .collect()
+ }
+ 
+ fn float_to_i16(sample: f32) -> i16 {
+@@ -658,3 +808,85 @@
+         Err(_) => Vec::new(),
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn tone(rate: u32, hz: f32, len: usize) -> Vec<f32> {
++        (0..len)
++            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin())
++            .collect()
++    }
++
++    /// Run `input` through `resampler` in 10 ms blocks and drop the first
++    /// 50 ms of output (filter settling).
++    fn stream(resampler: &mut Resampler, input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
++        let block = from_rate as usize / 100;
++        let out: Vec<f32> = input
++            .chunks(block)
++            .flat_map(|chunk| resampler.process(chunk))
++            .collect();
++        out[to_rate as usize / 20..].to_vec()
++    }
++
++    #[test]
++    fn frame_shape_follows_format() {
++        assert_eq!(AudioFormat::default().frame_samples(), 160);
++        let opus = AudioFormat {
++            sample_rate: 48_000,
++            channels: 2,
++        };
++        assert_eq!(opus.frame_samples(), 960);
++        assert_eq!(interleave(vec![1, 2], 2), vec![1, 1, 2, 2]);
++        assert_eq!(interleave(vec![1, 2], 1), vec![1, 2]);
++        assert_eq!(mix_to_mono(&[0.5, -0.5, 1.0, 0.0], 2), vec![0.0, 0.5]);
++    }
++
++    #[test]
++    fn opus_at_device_rate_passes_through_unfiltered() {
++        let input = tone(48_000, 6_000.0, 4_800);
++        let mut resampler = Resampler::new(48_000, 48_000, audio_band_hz(48_000));
++        assert_eq!(resampler.process(&input), input);
++    }
++
++    #[test]
++    fn wideband_keeps_six_khz_and_g711_removes_it() {
++        let input = tone(48_000, 6_000.0, 48_000);
++        let wide = stream(
++            &mut Resampler::new(44_100, 48_000, audio_band_hz(48_000)),
++            &tone(44_100, 6_000.0, 44_100),
++            44_100,
++            48_000,
++        );
++        assert!(rms(&wide) > 0.33, "wideband 6 kHz rms {}", rms(&wide));
++        // Decimating to 8 kHz without the telephone band limit would alias
++        // 6 kHz down to an audible 2 kHz at full level. The 4th-order 3.4 kHz
++        // Butterworth (unchanged from upstream) gives about 20 dB there.
++        let narrow = stream(
++            &mut Resampler::new(48_000, 8_000, audio_band_hz(8_000)),
++            &input,
++            48_000,
++            8_000,
++        );
++        assert!(rms(&narrow) < 0.04, "G.711 6 kHz rms {}", rms(&narrow));
++    }
++
++    #[test]
++    fn streaming_resampler_neither_drifts_nor_clicks() {
++        let input = tone(44_100, 440.0, 441_000); // 10 s
++        let mut resampler = Resampler::new(44_100, 48_000, audio_band_hz(48_000));
++        let out: Vec<f32> = input
++            .chunks(441)
++            .flat_map(|chunk| resampler.process(chunk))
++            .collect();
++        assert!((out.len() as i64 - 480_000).abs() <= 2, "len {}", out.len());
++        let max_step = out
++            .windows(2)
++            .skip(2_400)
++            .map(|w| (w[1] - w[0]).abs())
++            .fold(0.0f32, f32::max);
++        // A 440 Hz, 0.5-amplitude sine moves at most ~0.029 per 48 kHz sample.
++        assert!(max_step < 0.035, "discontinuity {max_step}");
++    }
++}

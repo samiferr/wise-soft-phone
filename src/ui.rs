@@ -1,5 +1,5 @@
 use crate::{
-    account::Account,
+    account::{Account, CodecPreference},
     audio::DeviceList,
     phone::{Action, CallPhase, PhoneHandle, Registration, Status},
 };
@@ -190,6 +190,17 @@ impl SoftphoneApp {
                     );
                     ui.checkbox(&mut self.account.secure, "TLS + required SRTP");
                     ui.small("Secure mode requires a trusted PBX certificate.");
+                    egui::ComboBox::from_label("Audio codecs")
+                        .selected_text(self.account.codecs.label())
+                        .show_ui(ui, |ui| {
+                            for choice in CodecPreference::ALL {
+                                ui.selectable_value(
+                                    &mut self.account.codecs,
+                                    choice,
+                                    choice.label(),
+                                );
+                            }
+                        });
                 });
             },
         );
@@ -349,11 +360,12 @@ impl SoftphoneApp {
                 );
                 if let Some((_, started)) = &self.connected {
                     let seconds = started.elapsed().as_secs();
-                    ui.label(
-                        RichText::new(format!("{:02}:{:02}", seconds / 60, seconds % 60))
-                            .monospace()
-                            .color(MUTED),
-                    );
+                    let elapsed = format!("{:02}:{:02}", seconds / 60, seconds % 60);
+                    let text = match &call.codec {
+                        Some(codec) => format!("{elapsed} · {codec}"),
+                        None => elapsed,
+                    };
+                    ui.label(RichText::new(text).monospace().color(MUTED));
                 } else {
                     ui.label(" ");
                 }
@@ -651,6 +663,7 @@ mod tests {
             peer: "test".into(),
             phase: CallPhase::Connected,
             muted: false,
+            codec: Some("Opus wideband".into()),
         };
         let mut rect = egui::Rect::NOTHING;
         let input = || egui::RawInput {

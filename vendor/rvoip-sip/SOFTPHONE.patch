@@ -1,0 +1,94 @@
+diff -ruN rvoip-sip-0.4.0/src/adapters/media_adapter.rs rvoip-sip/src/adapters/media_adapter.rs
+--- rvoip-sip-0.4.0/src/adapters/media_adapter.rs	2006-07-24 01:21:28.000000000 +0000
++++ rvoip-sip/src/adapters/media_adapter.rs	2026-11-20 09:47:04.759781139 +0000
+@@ -505,6 +505,19 @@
+ /// answerer states its own.
+ fn answer_fmtp_for_pt(offer: &SdpSession, pt: u8, g729_annex_b: bool) -> Option<String> {
+     if !sdp_payload_is_amr(offer, pt) {
++        // Dynamic payload numbers belong to the offerer, and the static fmtp
++        // table is keyed on this stack's own numbering. Asterisk, for one,
++        // offers Opus on 107, which this stack uses for AMR-NB octet-aligned;
++        // keying on the number alone answered Opus with AMR framing params.
++        if pt >= 96 {
++            let name = audio_rtpmap(offer, pt).map(|mapping| mapping.encoding_name.clone());
++            let ours = match name.as_deref() {
++                Some(name) if name.eq_ignore_ascii_case("opus") => 111,
++                Some(name) if name.eq_ignore_ascii_case("telephone-event") => 101,
++                _ => return None,
++            };
++            return fmtp_for_pt_with_g729_annex_b(ours, g729_annex_b).map(ToString::to_string);
++        }
+         return fmtp_for_pt_with_g729_annex_b(pt, g729_annex_b).map(ToString::to_string);
+     }
+ 
+@@ -628,8 +641,9 @@
+         // stated by omitting `octet-align` rather than by setting it to 0.
+         AMR_WB_OA_PT | AMR_NB_OA_PT => Some("octet-align=1; max-red=0"),
+         AMR_WB_BE_PT | AMR_NB_BE_PT => Some("max-red=0"),
+-        // Opus (PT 111) defaults are fine for VoIP without fmtp; a
+-        // production deployment may want `useinbandfec=1; minptime=10`.
++        // Opus (PT 111): ask the peer for in-band FEC, which libopus decodes
++        // as ordinary packets, and allow 10 ms packets (RFC 7587 §7).
++        111 => Some("minptime=10; useinbandfec=1"),
+         _ => None,
+     }
+ }
+diff -ruN rvoip-sip-0.4.0/src/api/handle.rs rvoip-sip/src/api/handle.rs
+--- rvoip-sip-0.4.0/src/api/handle.rs	2006-07-24 01:21:28.000000000 +0000
++++ rvoip-sip/src/api/handle.rs	2026-11-20 09:46:21.956195418 +0000
+@@ -1386,6 +1386,26 @@
+         self.coordinator.get_session_info_exact(&handle).await
+     }
+ 
++    /// Audio format negotiated by SDP offer/answer for this exact call.
++    ///
++    /// Frames sent through [`AudioSender`] must match this sample rate and
++    /// channel count: the encoder rejects any other shape. Returns `Ok(None)`
++    /// before SDP negotiation has completed.
++    pub async fn negotiated_audio(&self) -> Result<Option<NegotiatedAudio>> {
++        let handle = self.exact_lifecycle_handle()?;
++        Ok(self
++            .coordinator
++            .helpers
++            .negotiated_media_config_exact(&handle)
++            .await?
++            .map(|(config, payload_type)| NegotiatedAudio {
++                codec: config.codec,
++                sample_rate: config.sample_rate,
++                channels: config.channels,
++                payload_type,
++            }))
++    }
++
+     /// Get the current negotiated media-security state for this call.
+     ///
+     /// Returns `Ok(None)` when media is plaintext or SRTP has not been
+@@ -2182,3 +2202,16 @@
+         ));
+     }
+ }
++
++/// Audio codec and PCM shape negotiated for a call.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct NegotiatedAudio {
++    /// Canonical codec name, for example `PCMU`, `PCMA`, or `opus`.
++    pub codec: String,
++    /// RTP clock rate and PCM sample rate in Hz.
++    pub sample_rate: u32,
++    /// PCM channel count expected by the encoder.
++    pub channels: u8,
++    /// Negotiated RTP payload type.
++    pub payload_type: u8,
++}
+diff -ruN rvoip-sip-0.4.0/src/lib.rs rvoip-sip/src/lib.rs
+--- rvoip-sip-0.4.0/src/lib.rs	2006-07-24 01:21:28.000000000 +0000
++++ rvoip-sip/src/lib.rs	2026-11-20 09:46:14.861440984 +0000
+@@ -564,7 +564,7 @@
+ // Re-exported so clients can construct frames (mic -> RTP) without taking a
+ // direct dependency on `rvoip-media-core`.
+ pub use api::handle::{
+-    CallId, SessionHandle, SipReason, TransferDialogMatcher, TransferLifecycleOptions,
++    CallId, NegotiatedAudio, SessionHandle, SipReason, TransferDialogMatcher, TransferLifecycleOptions,
+     TransferOutcome, TransferWaitMode,
+ };
+ pub use api::headers::options::{

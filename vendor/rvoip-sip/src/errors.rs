@@ -1,0 +1,976 @@
+//! Error and `Result` types for the `rvoip-sip` session layer.
+//!
+//! [`SessionError`] is the crate-wide error enum returned by the public API
+//! surfaces (`Endpoint`, `StreamPeer`, `CallbackPeer`, `UnifiedCoordinator`,
+//! `SessionHandle`). [`Result`] is the `Result<T, SessionError>` alias used
+//! throughout the crate.
+
+use std::fmt;
+
+use thiserror::Error;
+
+use crate::api::headers::options::{HeaderNameDiagnostic, HeaderNamesDiagnostic, MethodDiagnostic};
+use rvoip_sip_core::types::sdp::CryptoSuite;
+
+/// SDP side on which an RFC 4568 SDES failure was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SdesNegotiationStage {
+    /// An inbound SDP offer was being validated.
+    RemoteOffer,
+    /// An inbound SDP answer was being validated.
+    RemoteAnswer,
+}
+
+impl fmt::Display for SdesNegotiationStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RemoteOffer => "remote-offer",
+            Self::RemoteAnswer => "remote-answer",
+        })
+    }
+}
+
+/// Secret-safe class for an RFC 4568 SDES key-material failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SdesNegotiationFailureClass {
+    /// The encoded key material was not acceptable Base64.
+    InvalidBase64,
+    /// Base64 decoded successfully but did not have the suite's exact length.
+    DecodedLength,
+}
+
+impl fmt::Display for SdesNegotiationFailureClass {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidBase64 => "invalid-base64",
+            Self::DecodedLength => "decoded-length",
+        })
+    }
+}
+
+/// Classification of the trailing Base64 padding in an SDES inline key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SdesBase64Padding {
+    /// Canonical Base64 ending in one or two `=` characters.
+    CanonicalPadded,
+    /// Canonical Base64 for a byte length that requires no `=` padding.
+    CanonicalUnpadded,
+    /// Otherwise-valid Base64 with only required trailing padding omitted.
+    OmittedTrailing,
+    /// Padding was misplaced, excessive, or structurally invalid.
+    Malformed,
+}
+
+impl fmt::Display for SdesBase64Padding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CanonicalPadded => "canonical-padded",
+            Self::CanonicalUnpadded => "canonical-unpadded",
+            Self::OmittedTrailing => "omitted-trailing",
+            Self::Malformed => "malformed",
+        })
+    }
+}
+
+/// Public, secret-safe diagnostics for one failed SDES key negotiation.
+///
+/// The encoded key, decoded key bytes, lifetime/MKI text, and parser source
+/// error are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SdesNegotiationDiagnostic {
+    /// Whether the peer's offer or answer was being processed.
+    pub stage: SdesNegotiationStage,
+    /// Stable failure class suitable for metrics and alerts.
+    pub failure_class: SdesNegotiationFailureClass,
+    /// RFC 4568 crypto attribute tag.
+    pub tag: u32,
+    /// Suite named by the peer's crypto attribute.
+    pub suite: CryptoSuite,
+    /// Length of the encoded key token, excluding lifetime/MKI suffixes.
+    pub encoded_bytes: usize,
+    /// Classification of the token's trailing Base64 padding.
+    pub padding: SdesBase64Padding,
+    /// Exact decoded key-plus-salt length required by the suite.
+    pub expected_decoded_bytes: usize,
+    /// Decoded byte length when decoding succeeded, otherwise `None`.
+    pub actual_decoded_bytes: Option<usize>,
+}
+
+impl fmt::Display for SdesNegotiationDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let actual = self
+            .actual_decoded_bytes
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        write!(
+            formatter,
+            "SDES negotiation failed (stage={}, class={}, tag={}, suite={:?}, encoded_bytes={}, padding={}, expected_decoded_bytes={}, actual_decoded_bytes={actual})",
+            self.stage,
+            self.failure_class,
+            self.tag,
+            self.suite,
+            self.encoded_bytes,
+            self.padding,
+            self.expected_decoded_bytes
+        )
+    }
+}
+
+/// Convenience alias for `Result<T, SessionError>` used across the crate's API.
+pub type Result<T> = std::result::Result<T, SessionError>;
+
+struct TextDiagnostic<'a>(&'a str);
+
+impl fmt::Display for TextDiagnostic<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "redacted(bytes={})", self.0.len())
+    }
+}
+
+impl fmt::Debug for TextDiagnostic<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+/// Errors returned by the `rvoip-sip` session layer.
+#[derive(Error)]
+pub enum SessionError {
+    /// No session with the given identifier exists in the registry.
+    #[error("Session not found: {}", TextDiagnostic(.0))]
+    SessionNotFound(String),
+
+    /// A requested state-machine transition is not legal from the current state.
+    #[error("Invalid state transition: {}", TextDiagnostic(.0))]
+    InvalidTransition(String),
+
+    /// An error originating in the dialog layer (`rvoip-sip-dialog`).
+    #[error("Dialog error: {}", TextDiagnostic(.0))]
+    DialogError(String),
+
+    /// An error originating in the media layer (`rvoip-media-core`).
+    #[error("Media error: {}", TextDiagnostic(.0))]
+    MediaError(String),
+
+    /// SIP signalling succeeded but wiring media to the negotiated session failed.
+    #[error("Media integration error: {}", TextDiagnostic(.reason))]
+    MediaIntegration {
+        /// Human-readable description of the media-integration failure.
+        reason: String,
+    },
+
+    /// SDP offer/answer negotiation failed (no common codec, malformed SDP, etc.).
+    #[error("SDP negotiation failed: {}", TextDiagnostic(.0))]
+    SDPNegotiationFailed(String),
+
+    /// Invalid or inconsistent configuration supplied to a builder or coordinator.
+    #[error("Configuration error: {}", TextDiagnostic(.0))]
+    ConfigurationError(String),
+
+    /// Configuration error (legacy alias of [`SessionError::ConfigurationError`]).
+    #[error("Config error: {}", TextDiagnostic(.0))]
+    ConfigError(String),
+
+    /// An application-supplied argument was malformed or out of range.
+    #[error("Invalid input: {}", TextDiagnostic(.0))]
+    InvalidInput(String),
+
+    /// An operation did not complete within its allotted time.
+    #[error("Timeout: {}", TextDiagnostic(.0))]
+    Timeout(String),
+
+    /// A transport-level network error occurred.
+    #[error("Network error: {}", TextDiagnostic(.0))]
+    NetworkError(String),
+
+    /// A SIP protocol violation was detected.
+    #[error("Protocol error: {}", TextDiagnostic(.0))]
+    ProtocolError(String),
+
+    /// RFC 3262 — the remote peer did not advertise `Supported: 100rel` on the
+    /// INVITE, so we cannot send a reliable 183 Session Progress. Raised by
+    /// `send_early_media`. Today we fail fast; a future `send_progress(sdp)`
+    /// API could fall back to an unreliable 183.
+    #[error("peer did not advertise 100rel; cannot send reliable 183")]
+    UnreliableProvisionalsNotSupported,
+
+    /// RFC 3261 §22.2 — the server challenged our INVITE with 401/407 but the
+    /// session has no credentials on file. Set credentials via
+    /// `StreamPeerBuilder::with_credentials` (per-peer default) or
+    /// `control.invite(...).with_credentials(...)` (per-call).
+    #[error("server challenged INVITE but no credentials are on file")]
+    MissingCredentialsForInviteAuth,
+
+    /// RFC 3261 §22.2 — the server challenged an outbound request with 401/407
+    /// but the request flow has no credentials on file.
+    #[error(
+        "server challenged {} but no credentials are on file",
+        MethodDiagnostic(.method)
+    )]
+    MissingCredentialsForRequestAuth {
+        /// SIP method that was challenged.
+        method: rvoip_sip_core::Method,
+    },
+
+    /// RFC 3261 §22.2 — INVITE auth has already been retried once and the
+    /// server challenged again. Prevents loops against a broken server or
+    /// wrong credentials.
+    #[error("INVITE auth retry limit exceeded")]
+    InviteAuthRetryExhausted,
+
+    /// RFC 3261 §22.2 — outbound request auth has already been retried once and
+    /// the server challenged again.
+    #[error("{} auth retry limit exceeded", MethodDiagnostic(.method))]
+    RequestAuthRetryExhausted {
+        /// SIP method whose auth retry limit was exceeded.
+        method: rvoip_sip_core::Method,
+    },
+
+    /// An unexpected internal invariant was violated.
+    #[error("Internal error: {}", TextDiagnostic(.0))]
+    InternalError(String),
+
+    /// An underlying `std::io` error (transport sockets, file I/O).
+    #[error("I/O operation failed")]
+    IoError(#[from] std::io::Error),
+
+    /// The requested capability is recognized but not yet implemented.
+    #[error("Not implemented: {}", TextDiagnostic(.0))]
+    NotImplemented(String),
+
+    /// A call transfer (REFER flow) failed.
+    #[error("Transfer failed: {}", TextDiagnostic(.0))]
+    TransferFailed(String),
+
+    /// Authentication failed or could not be completed.
+    ///
+    /// The retained string remains matchable for compatibility, but only
+    /// library-owned fixed diagnostic classes are rendered by `Display` or
+    /// `Debug`. Arbitrary provider/application strings render as a fixed
+    /// redacted class.
+    #[error("Authentication error: {}", AuthErrorDiagnostic(.0))]
+    AuthError(String),
+
+    /// An outbound INVITE challenge could not be converted into a safe
+    /// Authorization response. Lower parser/provider diagnostics are omitted.
+    #[error("outbound INVITE authentication failed (class=challenge-response)")]
+    InviteAuthConstructionFailed,
+
+    /// A non-INVITE outbound challenge could not be converted into a safe
+    /// Authorization response. Lower parser/provider diagnostics are omitted.
+    #[error("outbound request authentication failed (class=challenge-response)")]
+    RequestAuthConstructionFailed,
+
+    /// An outbound REGISTER challenge could not be converted into a safe
+    /// Authorization response. Lower parser/provider diagnostics are omitted.
+    #[error("outbound REGISTER authentication failed (class=challenge-response)")]
+    RegisterAuthConstructionFailed,
+
+    /// A REGISTER flow failed after any supported retry path.
+    #[error("Registration failed: {}", TextDiagnostic(.0))]
+    RegistrationFailed(String),
+
+    /// A flattened/stringly error from a lower layer that has no dedicated variant.
+    #[error("Other error: {}", TextDiagnostic(.0))]
+    Other(String),
+
+    /// SIP_API_DESIGN_2 §8 — a builder setter or `with_header` call
+    /// staged a header that violates the per-method policy. The most
+    /// common case is staging a stack-managed name (Call-ID, CSeq,
+    /// Via, Max-Forwards) or a method-shaped name that has a
+    /// dedicated setter (e.g. Authorization -> `with_credentials` / `with_auth`).
+    #[error(
+        "header policy violation on {}: {} — {reason}",
+        MethodDiagnostic(.method),
+        HeaderNameDiagnostic(.header)
+    )]
+    HeaderPolicy {
+        /// SIP method whose per-method header policy was violated.
+        method: rvoip_sip_core::Method,
+        /// The offending header name.
+        header: rvoip_sip_core::types::headers::HeaderName,
+        /// Why the header was rejected.
+        reason: crate::api::headers::ViolationReason,
+    },
+
+    /// SIP_API_DESIGN_2 §8 — `HeaderPolicy::validate_outbound`
+    /// reported one or more required application-supplied headers
+    /// were missing for the chosen method.
+    #[error(
+        "required application header(s) missing for {}: {:?}",
+        MethodDiagnostic(.method),
+        HeaderNamesDiagnostic(.names)
+    )]
+    MissingRequiredHeader {
+        /// SIP method that requires the missing header(s).
+        method: rvoip_sip_core::Method,
+        /// The required header names that were not supplied.
+        names: Vec<rvoip_sip_core::types::headers::HeaderName>,
+    },
+
+    /// SIP_API_DESIGN_2 §7.3 invariant #5 — a second `.send()` was
+    /// attempted on the same session for a method whose
+    /// `pending_<method>_options` stash slot is still occupied by an
+    /// in-flight prior `.send()`. Wait for the first future to
+    /// complete (or drop cleanly) before starting another of the
+    /// same method.
+    #[error(
+        "another {} is already in flight on this session",
+        MethodDiagnostic(.method)
+    )]
+    Conflict {
+        /// SIP method whose in-flight `.send()` blocks a second concurrent send.
+        method: rvoip_sip_core::Method,
+    },
+}
+
+// Keep the established derived-Debug shape for every fixed/string variant,
+// while substituting diagnostic-only views for application-controlled SIP
+// method and header fields. The live error fields remain exact and matchable.
+impl fmt::Debug for SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionNotFound(value) => formatter
+                .debug_tuple("SessionNotFound")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::InvalidTransition(value) => formatter
+                .debug_tuple("InvalidTransition")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::DialogError(value) => formatter
+                .debug_tuple("DialogError")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::MediaError(value) => formatter
+                .debug_tuple("MediaError")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::MediaIntegration { reason } => formatter
+                .debug_struct("MediaIntegration")
+                .field("reason", &TextDiagnostic(reason))
+                .finish(),
+            Self::SDPNegotiationFailed(value) => formatter
+                .debug_tuple("SDPNegotiationFailed")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::ConfigurationError(value) => formatter
+                .debug_tuple("ConfigurationError")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::ConfigError(value) => formatter
+                .debug_tuple("ConfigError")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::InvalidInput(value) => formatter
+                .debug_tuple("InvalidInput")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::Timeout(value) => formatter
+                .debug_tuple("Timeout")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::NetworkError(value) => formatter
+                .debug_tuple("NetworkError")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::ProtocolError(value) => formatter
+                .debug_tuple("ProtocolError")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::UnreliableProvisionalsNotSupported => {
+                formatter.write_str("UnreliableProvisionalsNotSupported")
+            }
+            Self::MissingCredentialsForInviteAuth => {
+                formatter.write_str("MissingCredentialsForInviteAuth")
+            }
+            Self::MissingCredentialsForRequestAuth { method } => formatter
+                .debug_struct("MissingCredentialsForRequestAuth")
+                .field("method", &MethodDiagnostic(method))
+                .finish(),
+            Self::InviteAuthRetryExhausted => formatter.write_str("InviteAuthRetryExhausted"),
+            Self::RequestAuthRetryExhausted { method } => formatter
+                .debug_struct("RequestAuthRetryExhausted")
+                .field("method", &MethodDiagnostic(method))
+                .finish(),
+            Self::InternalError(value) => formatter
+                .debug_tuple("InternalError")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::IoError(value) => formatter
+                .debug_struct("IoError")
+                .field("kind", &value.kind())
+                .finish(),
+            Self::NotImplemented(value) => formatter
+                .debug_tuple("NotImplemented")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::TransferFailed(value) => formatter
+                .debug_tuple("TransferFailed")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::AuthError(value) => formatter
+                .debug_tuple("AuthError")
+                .field(&AuthErrorDiagnostic(value))
+                .finish(),
+            Self::InviteAuthConstructionFailed => {
+                formatter.write_str("InviteAuthConstructionFailed")
+            }
+            Self::RequestAuthConstructionFailed => {
+                formatter.write_str("RequestAuthConstructionFailed")
+            }
+            Self::RegisterAuthConstructionFailed => {
+                formatter.write_str("RegisterAuthConstructionFailed")
+            }
+            Self::RegistrationFailed(value) => formatter
+                .debug_tuple("RegistrationFailed")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::Other(value) => formatter
+                .debug_tuple("Other")
+                .field(&TextDiagnostic(value))
+                .finish(),
+            Self::HeaderPolicy {
+                method,
+                header,
+                reason,
+            } => formatter
+                .debug_struct("HeaderPolicy")
+                .field("method", &MethodDiagnostic(method))
+                .field("header", &HeaderNameDiagnostic(header))
+                .field("reason", reason)
+                .finish(),
+            Self::MissingRequiredHeader { method, names } => formatter
+                .debug_struct("MissingRequiredHeader")
+                .field("method", &MethodDiagnostic(method))
+                .field("names", &HeaderNamesDiagnostic(names))
+                .finish(),
+            Self::Conflict { method } => formatter
+                .debug_struct("Conflict")
+                .field("method", &MethodDiagnostic(method))
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutboundAuthOperation {
+    Invite,
+    Request,
+    Register,
+}
+
+/// Fixed authentication dependency stage retained in outward diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthFailureStage {
+    CorePrimitive,
+    AkaClientProvider,
+    PrincipalProjection,
+    RateLimitCheck,
+    RateLimitRecord,
+    AuditSink,
+    BearerValidator,
+    BasicVerifier,
+    AkaVectorProvider,
+    DigestSecretProvider,
+    ReplayNonceRecord,
+    ReplayNonceStatus,
+    ReplayNonceCount,
+    ErasedCredentialProvider,
+}
+
+impl AuthFailureStage {
+    const ALL: [Self; 14] = [
+        Self::CorePrimitive,
+        Self::AkaClientProvider,
+        Self::PrincipalProjection,
+        Self::RateLimitCheck,
+        Self::RateLimitRecord,
+        Self::AuditSink,
+        Self::BearerValidator,
+        Self::BasicVerifier,
+        Self::AkaVectorProvider,
+        Self::DigestSecretProvider,
+        Self::ReplayNonceRecord,
+        Self::ReplayNonceStatus,
+        Self::ReplayNonceCount,
+        Self::ErasedCredentialProvider,
+    ];
+
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::CorePrimitive => "authentication failed (stage=core-primitive)",
+            Self::AkaClientProvider => "authentication failed (stage=aka-client-provider)",
+            Self::PrincipalProjection => "authentication failed (stage=principal-projection)",
+            Self::RateLimitCheck => "authentication failed (stage=rate-limit-check)",
+            Self::RateLimitRecord => "authentication failed (stage=rate-limit-record)",
+            Self::AuditSink => "authentication failed (stage=audit-sink)",
+            Self::BearerValidator => "authentication failed (stage=bearer-validator)",
+            Self::BasicVerifier => "authentication failed (stage=basic-verifier)",
+            Self::AkaVectorProvider => "authentication failed (stage=aka-vector-provider)",
+            Self::DigestSecretProvider => "authentication failed (stage=digest-secret-provider)",
+            Self::ReplayNonceRecord => "authentication failed (stage=replay-nonce-record)",
+            Self::ReplayNonceStatus => "authentication failed (stage=replay-nonce-status)",
+            Self::ReplayNonceCount => "authentication failed (stage=replay-nonce-count)",
+            Self::ErasedCredentialProvider => {
+                "authentication failed (stage=erased-credential-provider)"
+            }
+        }
+    }
+}
+
+/// Collapse a provider, validator, or shared-store failure without retaining
+/// its arbitrary diagnostic string in the session error.
+pub(crate) fn redacted_auth_failure<E>(stage: AuthFailureStage, _source: E) -> SessionError {
+    SessionError::AuthError(stage.message().to_string())
+}
+
+struct AuthErrorDiagnostic<'a>(&'a str);
+
+impl fmt::Display for AuthErrorDiagnostic<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(safe_auth_error_message(self.0))
+    }
+}
+
+impl fmt::Debug for AuthErrorDiagnostic<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(safe_auth_error_message(self.0), formatter)
+    }
+}
+
+fn safe_auth_error_message(value: &str) -> &str {
+    if AuthFailureStage::ALL
+        .iter()
+        .any(|stage| stage.message() == value)
+        || matches!(
+            value,
+            "Digest credentials cannot answer a non-Digest challenge"
+                | "Bearer token cannot answer a non-Bearer challenge"
+                | "Bearer authentication over cleartext SIP is disabled"
+                | "Bearer token cannot be empty"
+                | "Basic credentials cannot answer a non-Basic challenge"
+                | "Basic authentication over cleartext SIP is disabled"
+                | "AKA credentials cannot answer a non-AKA challenge"
+                | "generated SIP authorization header failed wire-safety validation"
+                | "no configured auth option can answer the challenge"
+                | "unsupported outbound SIP authorization header name"
+                | "outbound SIP authorization header failed wire-safety validation"
+        )
+    {
+        value
+    } else {
+        "authentication failed (stage=opaque-source)"
+    }
+}
+
+/// Collapse a lower challenge parser, Digest algorithm, or authentication
+/// provider failure into a value-free typed operation class.
+pub(crate) fn redacted_outbound_auth_error<E>(
+    operation: OutboundAuthOperation,
+    _source: E,
+) -> SessionError {
+    match operation {
+        OutboundAuthOperation::Invite => SessionError::InviteAuthConstructionFailed,
+        OutboundAuthOperation::Request => SessionError::RequestAuthConstructionFailed,
+        OutboundAuthOperation::Register => SessionError::RegisterAuthConstructionFailed,
+    }
+}
+
+impl From<crate::api::headers::HeaderPolicyViolation> for SessionError {
+    fn from(v: crate::api::headers::HeaderPolicyViolation) -> Self {
+        SessionError::HeaderPolicy {
+            method: v.method,
+            header: v.header,
+            reason: v.reason,
+        }
+    }
+}
+
+impl SessionError {
+    /// True if this error means "the session is already gone from the
+    /// registry" — covers both the typed `SessionNotFound` variant and the
+    /// legacy stringly-wrapped `Other("Session not found: …")` form.
+    ///
+    /// Useful for fire-and-forget teardown paths (e.g. `SessionHandle::hangup`)
+    /// that race against a natural call-ended cleanup: if the race is lost,
+    /// the goal is already achieved and the error should be silent.
+    pub fn is_session_gone(&self) -> bool {
+        matches!(self, SessionError::SessionNotFound(_))
+            || matches!(self, SessionError::Other(msg) if msg.starts_with("Session not found"))
+            || matches!(self, SessionError::Other(msg) if msg.starts_with("Session ") && msg.ends_with(" not found"))
+    }
+}
+
+impl From<Box<dyn std::error::Error>> for SessionError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        let err = match err.downcast::<SessionError>() {
+            Ok(error) => return *error,
+            Err(error) => error,
+        };
+        let err = match err.downcast::<rvoip_auth_core::AuthError>() {
+            Ok(error) => return SessionError::from(*error),
+            Err(error) => error,
+        };
+        if err
+            .downcast_ref::<rvoip_auth_core::CredentialAuthError>()
+            .is_some()
+        {
+            return redacted_auth_failure(AuthFailureStage::ErasedCredentialProvider, ());
+        }
+        SessionError::Other("lower-layer operation failed (class=opaque-erased)".to_string())
+    }
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for SessionError {
+    fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        let err = match err.downcast::<SessionError>() {
+            Ok(error) => return *error,
+            Err(error) => error,
+        };
+        let err = match err.downcast::<rvoip_auth_core::AuthError>() {
+            Ok(error) => return SessionError::from(*error),
+            Err(error) => error,
+        };
+        if err
+            .downcast_ref::<rvoip_auth_core::CredentialAuthError>()
+            .is_some()
+        {
+            return redacted_auth_failure(AuthFailureStage::ErasedCredentialProvider, ());
+        }
+        SessionError::Other("lower-layer operation failed (class=opaque-erased)".to_string())
+    }
+}
+
+impl From<rvoip_auth_core::AuthError> for SessionError {
+    fn from(err: rvoip_auth_core::AuthError) -> Self {
+        redacted_auth_failure(AuthFailureStage::CorePrimitive, err)
+    }
+}
+
+#[cfg(test)]
+mod method_diagnostic_tests {
+    use super::*;
+    use crate::api::headers::ViolationReason;
+    use rvoip_sip_core::types::headers::HeaderName;
+    use rvoip_sip_core::Method;
+
+    const METHOD_CANARY: &str = "CUSTOM\r\nX-Method-Canary: exposed";
+    const HEADER_CANARY: &str = "X-Header-Canary\r\nInjected";
+
+    fn assert_redacted(error: &SessionError) {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains(METHOD_CANARY),
+                "extension method leaked: {rendered}"
+            );
+            assert!(
+                !rendered.contains(HEADER_CANARY),
+                "custom header leaked: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_method_bearing_error_redacts_extension_spelling() {
+        let extension = || Method::Extension(METHOD_CANARY.to_string());
+        let errors = [
+            SessionError::MissingCredentialsForRequestAuth {
+                method: extension(),
+            },
+            SessionError::RequestAuthRetryExhausted {
+                method: extension(),
+            },
+            SessionError::HeaderPolicy {
+                method: extension(),
+                header: HeaderName::Other(HEADER_CANARY.to_string()),
+                reason: ViolationReason::StackManaged,
+            },
+            SessionError::MissingRequiredHeader {
+                method: extension(),
+                names: vec![HeaderName::Other(HEADER_CANARY.to_string())],
+            },
+            SessionError::Conflict {
+                method: extension(),
+            },
+        ];
+
+        for error in &errors {
+            assert_redacted(error);
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(display.contains(&format!("extension(len={})", METHOD_CANARY.len())));
+            assert!(debug.contains(&format!("value_len: {}", METHOD_CANARY.len())));
+        }
+
+        match &errors[2] {
+            SessionError::HeaderPolicy { method, header, .. } => {
+                assert_eq!(method, &Method::Extension(METHOD_CANARY.to_string()));
+                assert_eq!(header, &HeaderName::Other(HEADER_CANARY.to_string()));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixed_error_debug_shapes_remain_derived_compatible() {
+        assert_eq!(
+            format!("{:?}", SessionError::SessionNotFound("call-1".to_string())),
+            "SessionNotFound(redacted(bytes=6))"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                SessionError::MissingCredentialsForRequestAuth {
+                    method: Method::Invite,
+                }
+            ),
+            "MissingCredentialsForRequestAuth { method: Invite }"
+        );
+        assert_eq!(
+            SessionError::Conflict {
+                method: Method::Message,
+            }
+            .to_string(),
+            "another MESSAGE is already in flight on this session"
+        );
+    }
+}
+
+#[cfg(test)]
+mod auth_error_diagnostic_tests {
+    use super::*;
+
+    const SOURCE_CANARY: &str = "provider-secret\r\nX-Auth-Canary: exposed";
+
+    #[test]
+    fn arbitrary_public_auth_error_value_is_matchable_but_never_rendered() {
+        let error = SessionError::AuthError(SOURCE_CANARY.to_string());
+        assert_eq!(
+            error.to_string(),
+            "Authentication error: authentication failed (stage=opaque-source)"
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "AuthError(\"authentication failed (stage=opaque-source)\")"
+        );
+        assert!(!error.to_string().contains(SOURCE_CANARY));
+        assert!(!format!("{error:?}").contains(SOURCE_CANARY));
+        match error {
+            SessionError::AuthError(value) => assert_eq!(value, SOURCE_CANARY),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_core_conversion_discards_lower_diagnostic_content() {
+        let error = SessionError::from(rvoip_auth_core::AuthError::ProviderError(
+            SOURCE_CANARY.to_string(),
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Authentication error: authentication failed (stage=core-primitive)"
+        );
+        assert!(!error.to_string().contains(SOURCE_CANARY));
+        assert!(!format!("{error:?}").contains(SOURCE_CANARY));
+        assert!(matches!(
+            error,
+            SessionError::AuthError(value)
+                if value == AuthFailureStage::CorePrimitive.message()
+        ));
+    }
+
+    #[test]
+    fn fixed_library_auth_policy_messages_remain_actionable() {
+        let error = SessionError::AuthError(
+            "Basic authentication over cleartext SIP is disabled".to_string(),
+        );
+        assert!(error.to_string().contains("cleartext SIP"));
+        assert!(format!("{error:?}").contains("cleartext SIP"));
+    }
+}
+
+#[cfg(test)]
+mod outbound_auth_redaction_tests {
+    use super::*;
+    use crate::auth::{
+        AkaClientConfig, AkaClientProvider, SipClientAuth, SipTransportSecurityContext,
+    };
+    use std::sync::Arc;
+
+    const ALGORITHM_SECRET: &str = "MALICIOUS-ALGORITHM-CANARY";
+    const PROVIDER_SECRET: &str = "ARBITRARY-AKA-PROVIDER-CANARY";
+
+    struct FailingAkaProvider;
+
+    impl AkaClientProvider for FailingAkaProvider {
+        fn authorization(
+            &self,
+            _challenge_header: &str,
+            _method: &str,
+            _request_uri: &str,
+            _nonce_count: u32,
+        ) -> Result<String> {
+            Err(SessionError::AuthError(format!(
+                "AKA provider failure: {PROVIDER_SECRET}"
+            )))
+        }
+    }
+
+    fn assert_redacted(error: SessionError, secret: &str) {
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for rendered in [&display, &debug] {
+            assert!(!rendered.contains(secret), "auth source leaked: {rendered}");
+        }
+        assert!(display.contains("challenge-response"));
+        assert!(matches!(error, SessionError::InviteAuthConstructionFailed));
+    }
+
+    #[test]
+    fn malicious_digest_algorithm_is_collapsed_before_retry_dispatch() {
+        let challenge = format!(
+            "Digest realm=\"pbx\", nonce=\"n1\", algorithm={ALGORITHM_SECRET}, qop=\"auth\""
+        );
+        let lower = SipClientAuth::digest("alice", "secret")
+            .authorization_for_challenge_with_transport_context(
+                &challenge,
+                "INVITE",
+                "sip:bob@example.test",
+                1,
+                None,
+                &SipTransportSecurityContext::from_transport_name("TLS"),
+            )
+            .expect_err("unsupported peer algorithm must fail");
+        assert!(!lower.to_string().contains(ALGORITHM_SECRET));
+        assert!(lower.to_string().contains("stage=core-primitive"));
+
+        assert_redacted(
+            redacted_outbound_auth_error(OutboundAuthOperation::Invite, lower),
+            ALGORITHM_SECRET,
+        );
+    }
+
+    #[test]
+    fn arbitrary_aka_provider_error_is_collapsed_before_retry_dispatch() {
+        let lower = SipClientAuth::aka(AkaClientConfig::new(Arc::new(FailingAkaProvider)))
+            .authorization_for_challenge_with_transport_context(
+                r#"Digest realm="ims", nonce="n1", algorithm=AKAv1-MD5"#,
+                "INVITE",
+                "sip:bob@example.test",
+                1,
+                None,
+                &SipTransportSecurityContext::from_transport_name("TLS"),
+            )
+            .expect_err("provider failure must fail auth construction");
+        assert!(!lower.to_string().contains(PROVIDER_SECRET));
+        assert!(lower.to_string().contains("stage=aka-client-provider"));
+
+        assert_redacted(
+            redacted_outbound_auth_error(OutboundAuthOperation::Invite, lower),
+            PROVIDER_SECRET,
+        );
+    }
+
+    #[test]
+    fn every_outbound_auth_operation_maps_to_a_fixed_typed_class() {
+        for (operation, expected) in [
+            (
+                OutboundAuthOperation::Invite,
+                SessionError::InviteAuthConstructionFailed,
+            ),
+            (
+                OutboundAuthOperation::Request,
+                SessionError::RequestAuthConstructionFailed,
+            ),
+            (
+                OutboundAuthOperation::Register,
+                SessionError::RegisterAuthConstructionFailed,
+            ),
+        ] {
+            let mapped = redacted_outbound_auth_error(
+                operation,
+                SessionError::AuthError(PROVIDER_SECRET.to_string()),
+            );
+            assert_eq!(mapped.to_string(), expected.to_string());
+            assert!(!mapped.to_string().contains(PROVIDER_SECRET));
+        }
+    }
+}
+
+#[cfg(test)]
+mod erased_error_boundary_tests {
+    use super::*;
+
+    const CANARY: &str = "erased-lower-error-canary\r\nAuthorization: exposed";
+
+    #[derive(Debug)]
+    struct ArbitraryLowerError;
+
+    impl fmt::Display for ArbitraryLowerError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(CANARY)
+        }
+    }
+
+    impl std::error::Error for ArbitraryLowerError {}
+
+    fn assert_no_canary(error: &SessionError) {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains(CANARY), "lower error leaked: {rendered}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_erased_errors_collapse_to_fixed_class() {
+        let plain: SessionError =
+            (Box::new(ArbitraryLowerError) as Box<dyn std::error::Error>).into();
+        let send_sync: SessionError =
+            (Box::new(ArbitraryLowerError) as Box<dyn std::error::Error + Send + Sync>).into();
+        for error in [plain, send_sync] {
+            assert_no_canary(&error);
+            assert!(matches!(
+                error,
+                SessionError::Other(ref value)
+                    if value == "lower-layer operation failed (class=opaque-erased)"
+            ));
+        }
+    }
+
+    #[test]
+    fn erased_auth_errors_are_downcast_and_classified() {
+        let core: SessionError =
+            (Box::new(rvoip_auth_core::AuthError::ProviderError(CANARY.into()))
+                as Box<dyn std::error::Error>)
+                .into();
+        let provider = Box::new(rvoip_auth_core::CredentialAuthError::Unavailable(
+            CANARY.into(),
+        )) as Box<dyn std::error::Error + Send + Sync>;
+        let provider = SessionError::from(provider);
+
+        assert_no_canary(&core);
+        assert_no_canary(&provider);
+        assert!(matches!(
+            core,
+            SessionError::AuthError(ref value)
+                if value == "authentication failed (stage=core-primitive)"
+        ));
+        assert!(matches!(
+            provider,
+            SessionError::AuthError(ref value)
+                if value == "authentication failed (stage=erased-credential-provider)"
+        ));
+    }
+
+    #[test]
+    fn boxed_session_errors_keep_their_typed_variant() {
+        let error: SessionError = (Box::new(SessionError::SessionNotFound("call-1".into()))
+            as Box<dyn std::error::Error + Send + Sync>)
+            .into();
+        assert!(matches!(error, SessionError::SessionNotFound(ref id) if id == "call-1"));
+    }
+}

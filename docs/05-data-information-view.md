@@ -50,7 +50,8 @@ The `Account` structure uses serde defaults and camelCase JSON keys. Missing fie
   "authUsername": "",
   "outboundProxy": "",
   "secure": false,
-  "rememberPassword": false
+  "rememberPassword": false,
+  "codecs": "opusFirst"
 }
 ```
 
@@ -64,6 +65,7 @@ This example contains no working credentials.
 | `outboundProxy` | String / empty | Explicit host/IPv4 and optional port; empty enables automatic proxy selection for Twilio domains |
 | `secure` | Boolean / false | UDP/RTP or TLS with required SDES-SRTP |
 | `rememberPassword` | Boolean / false | Whether to use OS credential persistence |
+| `codecs` | `"opusFirst"` / `"g711Only"`, default `opusFirst` | Offered payload types: Opus 111, PCMU 0, PCMA 8, telephone-event 101, or the same without Opus. Files saved before this field existed load as `opusFirst` |
 
 On Linux, settings normally live at `$XDG_CONFIG_HOME/com.softphone.desktop/account.json` or `~/.config/com.softphone.desktop/account.json`. The app uses `dirs::config_dir()` to find the base directory, rather than the repository's `docs/` or `logs/` folders.
 

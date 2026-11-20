@@ -1,6 +1,6 @@
 # Softphone
 
-A Rust desktop app for voice calls over SIP, tested on Linux. It uses **egui / eframe 0.37** with OpenGL for the interface and CPAL for the microphone and speaker. **RVoIP 0.4** handles SIP Digest registration, SDP, G.711 (PCMU / PCMA), RTP / SRTP, and RFC 4733 keypad tones.
+A Rust desktop app for voice calls over SIP, tested on Linux. It uses **egui / eframe 0.37** with OpenGL for the interface and CPAL for the microphone and speaker. **RVoIP 0.4** handles SIP Digest registration, SDP, Opus and G.711 (PCMU / PCMA), RTP / SRTP, and RFC 4733 keypad tones.
 
 ## System documentation
 
@@ -11,7 +11,7 @@ The [documentation index](docs/README.md) covers the app's purpose, context, des
 Install Rust 1.95 or newer. On Debian / Ubuntu, install the native dependencies:
 
 ```sh
-sudo apt install build-essential pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
+sudo apt install build-essential pkg-config cmake libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
 cargo run --locked
 ```
 
@@ -22,14 +22,14 @@ cargo build --locked --release
 ./target/release/softphone
 ```
 
-Cargo builds the whole app from `src/` and the root `Cargo.toml`. No JavaScript, webview, Tauri CLI, or Node tools are needed.
+CMake builds the libopus copy bundled with `audiopus_sys`, which is linked statically (see `.cargo/config.toml`), so no system libopus is needed. Cargo builds the whole app from `src/` and the root `Cargo.toml`. No JavaScript, webview, Tauri CLI, or Node tools are needed.
 
 ## Connect to a PBX
 
 1. Enter the server hostname or IPv4 address, SIP username, and password. Append `:port` for a custom server port.
-2. Under **Connection options**, enter a separate authentication username if required. Select **TLS + required SRTP** for a compatible secure PBX. Default ports are UDP 5060 and TLS 5061. Secure mode validates the server certificate against the system trust store and requires SDES-SRTP.
+2. Under **Connection options**, enter a separate authentication username if required. Select **TLS + required SRTP** for a compatible secure PBX. **Audio codecs** defaults to *Opus first, G.711 fallback*; choose *G.711 only* for a PBX whose Opus support misbehaves. Default ports are UDP 5060 and TLS 5061. Secure mode validates the server certificate against the system trust store and requires SDES-SRTP.
 3. Choose **Register account**. Once registered, dial an extension or `sip:1002@pbx.example.com`.
-4. Use **Answer**, **Decline**, **Hang up**, and **Mute microphone** as appropriate. During a connected call, the keypad sends DTMF. Microphone and speaker selection is available between calls.
+4. Use **Answer**, **Decline**, **Hang up**, and **Mute microphone** as appropriate. The call timer shows the negotiated codec, for example `Opus wideband` or `G.711 µ-law`. During a connected call, the keypad sends DTMF. Microphone and speaker selection is available between calls.
 
 The app supports one account and one call. RVoIP refreshes registration. After a connection failure, register again. If registration fails while the endpoint is still open, choose **Disconnect** first. Calls are not redialed automatically.
 
@@ -39,7 +39,7 @@ Incoming calls request desktop attention, show answer controls, and ring through
 
 ## Asterisk interoperability
 
-Use a reachable PJSIP extension with Digest authentication, `allow=ulaw,alaw`, `dtmf_mode=rfc4733`, and `direct_media=no`. Configure `rewrite_contact=yes` and `force_rport=yes` as needed. For secure calls, enable TLS with a trusted certificate and `media_encryption=sdes`.
+Use a reachable PJSIP extension with Digest authentication, `allow=opus,ulaw,alaw` (Opus needs Asterisk's `codec_opus` / `res_format_attr_opus`; use `allow=ulaw,alaw` without it), `dtmf_mode=rfc4733`, and `direct_media=no`. Configure `rewrite_contact=yes` and `force_rport=yes` as needed. For secure calls, enable TLS with a trusted certificate and `media_encryption=sdes`.
 
 This build targets a PBX reachable over an IPv4 LAN or VPN. IPv6, ICE/TURN configuration, hold, transfer, conferencing, video, and messaging are outside this implementation.
 

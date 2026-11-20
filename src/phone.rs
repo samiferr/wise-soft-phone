@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, interval, timeout};
 
 use crate::account::Account;
-use crate::audio::{AudioSelection, CallAudio, DeviceList};
+use crate::audio::{AudioSelection, CallAudio, DeviceList, codec_label, negotiated_media};
 use crate::ringer::Ringer;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -121,6 +121,8 @@ pub struct CallStatus {
     pub peer: String,
     pub phase: CallPhase,
     pub muted: bool,
+    /// Negotiated audio codec, once the call is connected.
+    pub codec: Option<String>,
 }
 
 enum Call {
@@ -135,6 +137,7 @@ enum Call {
         call: EndpointCall,
         peer: String,
         muted: Arc<AtomicBool>,
+        codec: Option<String>,
         audio: Option<CallAudio>,
         audio_started: Instant,
     },
@@ -162,6 +165,7 @@ impl Call {
                     peer: caller_label(incoming.from()),
                     phase: CallPhase::Incoming,
                     muted: false,
+                    codec: None,
                 };
             }
             Self::Outgoing { peer, ringing, .. } => (
@@ -180,11 +184,16 @@ impl Call {
             ),
             Self::Ending { peer, .. } => (peer.as_str(), CallPhase::Ending, false),
         };
+        let codec = match self {
+            Self::Connected { codec, .. } => codec.clone(),
+            _ => None,
+        };
         CallStatus {
             id: self.id().to_string(),
             peer: peer.into(),
             phase,
             muted,
+            codec,
         }
     }
 }
@@ -630,10 +639,28 @@ impl Phone {
         self.watch_call_end(&call);
         let muted = Arc::new(AtomicBool::new(false));
         self.status.notice = None;
-        let audio = if self.audio_enabled() {
-            match timeout(
+        let media = match negotiated_media(&call).await {
+            Ok(media) => {
+                tracing::info!(
+                    codec = %media.codec,
+                    sample_rate = media.sample_rate,
+                    channels = media.channels,
+                    payload_type = media.payload_type,
+                    "Negotiated call audio"
+                );
+                Some(media)
+            }
+            Err(error) => {
+                tracing::warn!("Negotiated call audio is unavailable");
+                self.status.notice = Some(error);
+                None
+            }
+        };
+        let codec = media.as_ref().map(codec_label);
+        let audio = match media.as_ref().filter(|_| self.audio_enabled()) {
+            Some(media) => match timeout(
                 ACTION_TIMEOUT,
-                CallAudio::start(&call, &self.status.audio, muted.clone()),
+                CallAudio::start(&call, media, &self.status.audio, muted.clone()),
             )
             .await
             {
@@ -646,15 +673,15 @@ impl Phone {
                     self.status.notice = Some("Opening the call audio timed out.".into());
                     None
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
 
         self.call = Some(Call::Connected {
             call,
             peer,
             muted,
+            codec,
             audio,
             audio_started: Instant::now(),
         });
@@ -1365,6 +1392,7 @@ mod hangup_tests {
                 call,
                 peer: target,
                 muted: Arc::new(AtomicBool::new(false)),
+                codec: None,
                 audio: None,
                 audio_started: Instant::now(),
             });

@@ -14,7 +14,10 @@ src/
   diagnostics.rs               Filtered console/file logging and rotation
   call_operations_tests.rs     Real actor + loopback SIP integration fixtures
   sip_routing_tests.rs         Synthetic provider wire regressions
+  codec_tests.rs               Opus / G.711 negotiation and media regressions
 vendor/rvoip-sip-dialog/        RVoIP dialog source with documented local patch
+vendor/rvoip-sip/               RVoIP SIP source: negotiated-audio accessor, Opus fmtp
+vendor/rvoip-audio-device/      RVoIP device bridge: negotiated PCM format, resampler
 docs/                          Seven-view system documentation and SVG overview
 README.md                      Quick start and user/developer entry point
 TESTING.md                     Operation coverage and optional acceptance checks
@@ -40,7 +43,8 @@ flowchart LR
 ```mermaid
 flowchart LR
     App[softphone binary] --> SIP[RVoIP SIP and audio device crates]
-    SIP --> Patch[Vendored rvoip-sip-dialog]
+    SIP --> Patch[Vendored rvoip-sip-dialog, rvoip-sip, rvoip-audio-device]
+    SIP --> Opus[libopus, bundled and static]
     App --> Device[CPAL]
 ```
 
@@ -57,7 +61,8 @@ flowchart LR
 | Rust | Edition 2024, minimum compiler 1.95 |
 | eframe | Exact 0.37.0; default fonts, clipboard, Glow/OpenGL, X11 and Wayland |
 | RVoIP crates | Exact 0.4.0 for SIP, SIP core, and audio-device bridge |
-| Local patch | `[patch.crates-io]` selects `vendor/rvoip-sip-dialog` |
+| Local patch | `[patch.crates-io]` selects `vendor/rvoip-sip-dialog`, `vendor/rvoip-sip`, and `vendor/rvoip-audio-device` |
+| Opus | `rvoip-sip` `opus` feature; `audiopus_sys` `static` with `LIBOPUS_NO_PKG` in `.cargo/config.toml` builds bundled libopus with CMake |
 | CPAL | 0.15.3; enumeration, ringtone output, bridge integration |
 | Tokio | Runtime, networking, synchronization, timing, background work |
 | keyring | 4.2 with v1 API; platform credential-store integration |
@@ -96,7 +101,7 @@ These guidelines follow the current design. The [architecture view](03-architect
 
 ## Dependency patch maintenance
 
-The vendored source includes its upstream license and origin note. [SOFTPHONE.patch](../vendor/rvoip-sip-dialog/SOFTPHONE.patch) lists the changes; [SOFTPHONE_PATCH.md](../vendor/rvoip-sip-dialog/SOFTPHONE_PATCH.md) explains them.
+The vendored sources include an origin note; each directory has its own `SOFTPHONE.patch` and `SOFTPHONE_PATCH.md`. The `rvoip-sip` and `rvoip-audio-device` patches are described in [their](../vendor/rvoip-sip/SOFTPHONE_PATCH.md) [notes](../vendor/rvoip-audio-device/SOFTPHONE_PATCH.md). For `rvoip-sip-dialog`, [SOFTPHONE.patch](../vendor/rvoip-sip-dialog/SOFTPHONE.patch) lists the changes, and [SOFTPHONE_PATCH.md](../vendor/rvoip-sip-dialog/SOFTPHONE_PATCH.md) explains them.
 
 The patch keeps ACK routes, handles private IPv4 routes through the configured edge, and selects hostname next hops in the transaction manager. Tests using only numeric addresses missed the hostname bug. Keep the `localhost` proxy and Record-Route tests when upgrading.
 

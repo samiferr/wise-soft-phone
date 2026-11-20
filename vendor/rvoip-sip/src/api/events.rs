@@ -1,0 +1,1626 @@
+//! Typed application events emitted by `rvoip-sip`.
+//!
+//! [`Event`] is the common event contract used by [`StreamPeer`], per-call
+//! [`SessionHandle`](crate::SessionHandle) receivers, and direct
+//! [`UnifiedCoordinator`](crate::UnifiedCoordinator) subscribers. Events are
+//! translated from lower-level dialog/media notifications into
+//! application-facing call, registration, transfer, NOTIFY, and media events.
+//! Helper methods provide typed views over compatibility fields such as REFER
+//! transfer kind and NOTIFY subscription state.
+//!
+//! [`StreamPeer`]: crate::StreamPeer
+
+use crate::api::dialog_package::{DialogInfo, DialogInfoDocument};
+use crate::state_table::types::SessionId;
+pub use rvoip_infra_common::events::cross_crate::{SipTraceConfig, SipTraceDirection};
+use rvoip_sip_core::types::sdp::CryptoSuite;
+
+/// Type alias for call ID (same as SessionId)
+pub type CallId = SessionId;
+
+/// Public SIP trace event emitted when [`SipTraceConfig::enabled`] is true.
+///
+/// `raw_message` is the rendered on-wire bytes (after optional header
+/// redaction and body stripping). Pass it through
+/// [`rvoip_sip_core::parse_message`] to get a typed
+/// [`rvoip_sip_core::Message`] back if the consumer wants to inspect headers
+/// programmatically.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SipTrace {
+    /// Inbound or outbound at the local transport boundary.
+    pub direction: SipTraceDirection,
+    /// Transport flavour, for example `UDP`, `TCP`, or `TLS`.
+    pub transport: String,
+    /// Local socket address.
+    pub local_addr: String,
+    /// Remote socket address.
+    pub remote_addr: String,
+    /// Milliseconds since Unix epoch when the trace event was created.
+    pub timestamp_unix_millis: u64,
+    /// SIP start line, for example `INVITE sip:bob@example.com SIP/2.0`.
+    pub start_line: String,
+    /// Trace-policy result for the SIP `Call-ID` header when present. This is
+    /// the original only when the active policy keeps or passes it through.
+    pub sip_call_id: Option<String>,
+    /// rvoip-sip session id after mapping, when known.
+    pub session_id: Option<CallId>,
+    /// Redacted, optionally body-stripped SIP message text.
+    pub raw_message: String,
+    /// Original rendered message byte length before redaction/body stripping/truncation.
+    pub original_len: usize,
+    /// Whether `raw_message` was truncated for bounded diagnostics.
+    pub truncated: bool,
+    /// Whether headers or body content were redacted.
+    pub redacted: bool,
+}
+
+impl std::fmt::Debug for SipTrace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SipTrace")
+            .field("direction", &self.direction)
+            .field("original_len", &self.original_len)
+            .field("raw_message_bytes", &self.raw_message.len())
+            .field("truncated", &self.truncated)
+            .field("redacted", &self.redacted)
+            .field("session_present", &self.session_id.is_some())
+            .finish()
+    }
+}
+
+/// Typed classification for REFER transfer requests.
+///
+/// The wire-facing `Event::ReferReceived::transfer_type` field remains a
+/// string for compatibility. Use [`Event::transfer_kind`] when application
+/// code wants a typed view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    /// Standard blind transfer REFER.
+    Blind,
+    /// REFER carrying attended-transfer context such as `Replaces`.
+    Attended,
+    /// Unrecognized or vendor-specific transfer flavor.
+    Unknown,
+}
+
+/// Evidence that a transfer target actually progressed beyond REFER receipt.
+// Keep the public evidence payloads source-compatible; callers construct and
+// pattern-match these variants directly.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, PartialEq, Eq)]
+pub enum TransferTargetEvidence {
+    /// A REFER `message/sipfrag` produced provisional target progress before
+    /// the final successful sipfrag.
+    ReferProgressThenFinal {
+        /// Status code from the provisional progress sipfrag.
+        progress_status_code: u16,
+        /// Reason phrase from the provisional progress sipfrag.
+        progress_reason: String,
+        /// Status code from the final successful sipfrag.
+        final_status_code: u16,
+        /// Reason phrase from the final successful sipfrag.
+        final_reason: String,
+    },
+    /// The target leg is local to this coordinator and reached answered state.
+    LocalTargetLeg {
+        /// Session identifier of the local target leg.
+        call_id: CallId,
+    },
+    /// An RFC 4235 dialog-package NOTIFY reported matching target state.
+    DialogPackage {
+        /// Dialog state reported by the dialog-package NOTIFY.
+        dialog: DialogInfo,
+    },
+}
+
+impl std::fmt::Debug for TransferTargetEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReferProgressThenFinal {
+                progress_status_code,
+                progress_reason,
+                final_status_code,
+                final_reason,
+            } => formatter
+                .debug_struct("ReferProgressThenFinal")
+                .field("progress_status_code", progress_status_code)
+                .field("progress_reason_bytes", &progress_reason.len())
+                .field("final_status_code", final_status_code)
+                .field("final_reason_bytes", &final_reason.len())
+                .finish(),
+            Self::LocalTargetLeg { .. } => formatter.write_str("LocalTargetLeg"),
+            Self::DialogPackage { .. } => formatter.write_str("DialogPackage"),
+        }
+    }
+}
+
+impl TransferKind {
+    /// Convert the raw transfer type field into a typed classification.
+    pub fn from_header_value(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "blind" => Self::Blind,
+            "attended" => Self::Attended,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Stable lowercase label for logs and UI display.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blind => "blind",
+            Self::Attended => "attended",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Parsed view of a `Subscription-State` header.
+///
+/// This intentionally preserves the raw header value while extracting the
+/// common `state`, `expires`, and `reason` parameters. Use
+/// [`Event::subscription_state`] to parse a NOTIFY event on demand.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SubscriptionState {
+    /// Primary state token, such as `active`, `pending`, or `terminated`.
+    pub state: String,
+    /// Parsed `expires` parameter, if present and numeric.
+    pub expires: Option<u32>,
+    /// Parsed `reason` parameter, if present.
+    pub reason: Option<String>,
+    /// Original header value.
+    pub raw: String,
+}
+
+impl std::fmt::Debug for SubscriptionState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubscriptionState")
+            .field("state_bytes", &self.state.len())
+            .field("expires", &self.expires)
+            .field("reason_present", &self.reason.is_some())
+            .field("reason_bytes", &self.reason.as_ref().map_or(0, String::len))
+            .field("raw_bytes", &self.raw.len())
+            .finish()
+    }
+}
+
+impl SubscriptionState {
+    /// Parse a raw `Subscription-State` header value.
+    pub fn parse(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        let mut parts = raw.split(';').map(str::trim);
+        let state = parts.next().unwrap_or_default().to_string();
+        let mut expires = None;
+        let mut reason = None;
+
+        for part in parts {
+            if let Some(value) = part.strip_prefix("expires=") {
+                expires = value.parse::<u32>().ok();
+            } else if let Some(value) = part.strip_prefix("reason=") {
+                reason = Some(value.to_string());
+            }
+        }
+
+        Self {
+            state,
+            expires,
+            reason,
+            raw,
+        }
+    }
+}
+
+/// Media-security keying mechanism negotiated for a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSecurityKeying {
+    /// SDP Security Descriptions (RFC 4568).
+    Sdes,
+    /// DTLS-SRTP key agreement (RFC 5763/5764).
+    DtlsSrtp,
+}
+
+/// RTP profile negotiated for protected media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSecurityProfile {
+    /// Secure RTP Audio/Video Profile (`RTP/SAVP`).
+    RtpSavp,
+    /// DTLS-SRTP transport profile (`UDP/TLS/RTP/SAVP`).
+    UdpTlsRtpSavp,
+}
+
+/// Current negotiated media-security state for a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaSecurityState {
+    /// Keying mechanism used to derive SRTP contexts.
+    pub keying: MediaSecurityKeying,
+    /// SRTP protection profile represented by the shared crypto-suite API.
+    pub suite: CryptoSuite,
+    /// RTP profile used by the negotiated media stream.
+    pub profile: MediaSecurityProfile,
+    /// Whether SRTP send/receive contexts have been installed in media-core.
+    pub contexts_installed: bool,
+}
+
+/// Per-call media quality, as returned by
+/// [`UnifiedCoordinator::media_quality`](crate::UnifiedCoordinator::media_quality)
+/// and carried by [`Event::MediaQualityChanged`].
+///
+/// Two viewpoints are reported:
+///
+/// - **Local** fields (`packets_received`, `packets_lost`,
+///   `packet_loss_percent`, `jitter_ms`, `mos`) describe the stream this
+///   endpoint *receives*, measured from arriving RTP. They need no RTCP.
+/// - **Peer-reported** fields (`rtt_ms`, `remote_*`) come from the RTCP
+///   sender/receiver reports the peer sends about the stream this endpoint
+///   *sends*. They are `None` until the first such report arrives (allow a
+///   few seconds of media for the first RTCP interval), and stay `None`
+///   for a call whose RTCP never reaches this endpoint — in practice, a call
+///   that did not negotiate RTCP multiplexing (`a=rtcp-mux`, see
+///   [`Config::rtcp_mux_required`](crate::Config::rtcp_mux_required)).
+///
+/// `rtt_ms` additionally needs the peer to reflect one of our RTCP sender
+/// reports, so it appears only once this endpoint has sent media.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct MediaQualityStats {
+    /// RTP packets sent on this call.
+    pub packets_sent: u64,
+    /// RTP packets received on this call.
+    pub packets_received: u64,
+    /// Packets missing from the received stream (sequence-number gaps).
+    pub packets_lost: u64,
+    /// Locally observed loss on the received stream, percent (0–100).
+    pub packet_loss_percent: f32,
+    /// Interarrival jitter of the received stream (RFC 3550 §6.4.1), ms.
+    pub jitter_ms: f32,
+    /// Estimated MOS (1.0–5.0) of the received stream, derived from loss,
+    /// jitter and RTT. An estimate, not a perceptual measurement. `None`
+    /// until packets have been received.
+    pub mos: Option<f32>,
+    /// Round-trip time from RTCP LSR/DLSR, ms.
+    pub rtt_ms: Option<f32>,
+    /// Loss the peer reported on our sent stream over its last RTCP
+    /// interval, percent (0–100).
+    pub remote_packet_loss_percent: Option<f32>,
+    /// Cumulative number of our packets the peer reported lost. Can be
+    /// negative when the peer received duplicates (RFC 3550 §6.4.1).
+    pub remote_packets_lost: Option<i64>,
+    /// Interarrival jitter the peer reported on our sent stream, ms.
+    pub remote_jitter_ms: Option<f32>,
+}
+
+impl MediaQualityStats {
+    /// Whether any peer-reported (RTCP) value is present.
+    pub fn has_peer_report(&self) -> bool {
+        self.remote_packet_loss_percent.is_some()
+            || self.remote_packets_lost.is_some()
+            || self.remote_jitter_ms.is_some()
+    }
+}
+
+impl From<&rvoip_infra_common::events::cross_crate::MediaQualityMetrics> for MediaQualityStats {
+    fn from(metrics: &rvoip_infra_common::events::cross_crate::MediaQualityMetrics) -> Self {
+        Self {
+            packets_sent: metrics.packets_sent,
+            packets_received: metrics.packets_received,
+            packets_lost: metrics.packets_lost,
+            packet_loss_percent: (metrics.packet_loss * 100.0) as f32,
+            jitter_ms: metrics.jitter_ms as f32,
+            // media-core reports 0.0 when it has no estimate yet.
+            mos: (metrics.mos_score > 0.0).then_some(metrics.mos_score as f32),
+            rtt_ms: metrics.rtt_ms.map(|rtt| rtt as f32),
+            remote_packet_loss_percent: metrics
+                .remote_packet_loss
+                .map(|fraction| (fraction * 100.0) as f32),
+            remote_packets_lost: metrics.remote_packets_lost,
+            remote_jitter_ms: metrics.remote_jitter_ms.map(|jitter| jitter as f32),
+        }
+    }
+}
+
+/// Detailed Digest retry observation emitted alongside the source-compatible
+/// [`Event::CallAuthRetrying`] event.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CallAuthRetryDetails {
+    /// Session identifier for the challenged outgoing call.
+    pub call_id: CallId,
+    /// 401 or 407.
+    pub status_code: u16,
+    /// Digest realm selected from the challenge.
+    pub realm: String,
+    /// Digest algorithm selected from the challenge alternatives.
+    pub algorithm: rvoip_auth_core::DigestAlgorithm,
+    /// Selected quality-of-protection mode, or `None` for legacy Digest.
+    pub qop: Option<String>,
+}
+
+impl std::fmt::Debug for CallAuthRetryDetails {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CallAuthRetryDetails")
+            .field("status_code", &self.status_code)
+            .field("realm_bytes", &self.realm.len())
+            .field("algorithm", &self.algorithm)
+            .field("qop", &self.qop)
+            .finish()
+    }
+}
+
+/// Secret-safe details for a failed mid-dialog or delayed-offer exchange.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenegotiationFailure {
+    /// Session identifier for the failed exchange.
+    pub call_id: CallId,
+    /// `INVITE`, `UPDATE`, or `ACK`.
+    pub method: String,
+    /// Bounded diagnostic category; SDP bodies are never included.
+    pub reason: String,
+}
+
+impl std::fmt::Debug for RenegotiationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenegotiationFailure")
+            .field("method", &self.method)
+            .field("reason_bytes", &self.reason.len())
+            .finish()
+    }
+}
+
+/// Secret-safe details for an RFC 4568 SDES negotiation failure.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct SdesNegotiationFailure {
+    /// Session identifier for the failed exchange.
+    pub call_id: CallId,
+    /// Response envelope for the failed exchange. Answer failures retain the
+    /// received response; offer failures carry the locally authored 488
+    /// outcome and the rejected remote offer in the compatibility envelope.
+    pub response: crate::api::incoming::IncomingResponse,
+    /// Structured diagnostic that never contains key material.
+    pub diagnostic: crate::errors::SdesNegotiationDiagnostic,
+}
+
+impl std::fmt::Debug for SdesNegotiationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SdesNegotiationFailure")
+            .field("status_code", &self.response.status_code)
+            .field("response_has_sdp", &self.response.sdp.is_some())
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
+}
+
+/// Bounded, opt-in diagnostic stream for details that cannot be added to the
+/// exhaustive [`Event`] enum without breaking existing callers.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum DiagnosticEvent {
+    /// A Digest-authenticated retry was successfully dispatched.
+    CallAuthRetrying(CallAuthRetryDetails),
+    /// A mid-dialog or delayed-offer SDP exchange failed.
+    RenegotiationFailed(RenegotiationFailure),
+    /// An inbound RFC 4568 SDES offer or answer failed validation.
+    SdesNegotiationFailed(SdesNegotiationFailure),
+}
+
+impl DiagnosticEvent {
+    /// Return the session identifier associated with this diagnostic.
+    pub fn call_id(&self) -> &CallId {
+        match self {
+            Self::CallAuthRetrying(details) => &details.call_id,
+            Self::RenegotiationFailed(details) => &details.call_id,
+            Self::SdesNegotiationFailed(details) => &details.call_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for DiagnosticEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CallAuthRetrying(details) => formatter
+                .debug_tuple("CallAuthRetrying")
+                .field(details)
+                .finish(),
+            Self::RenegotiationFailed(details) => formatter
+                .debug_tuple("RenegotiationFailed")
+                .field(details)
+                .finish(),
+            Self::SdesNegotiationFailed(details) => formatter
+                .debug_tuple("SdesNegotiationFailed")
+                .field(details)
+                .finish(),
+        }
+    }
+}
+
+/// Typed session events delivered to applications.
+///
+/// These events are published by the state machine and adapters when SIP,
+/// media, registration, or transfer activity occurs. Use
+/// [`Event::call_id`] to route per-call events, or one of the `is_*`
+/// helpers to classify events in generic event loops.
+#[derive(Clone)]
+pub enum Event {
+    // ===== Call Lifecycle Events =====
+    /// Incoming call received
+    ///
+    /// The state machine has already sent 180 Ringing when
+    /// `Config::auto_180_ringing` is enabled. Developer must call
+    /// `accept()` or `reject()` to complete the call handling.
+    IncomingCall {
+        /// Session identifier assigned to this incoming INVITE.
+        call_id: CallId,
+        /// Caller URI from the SIP `From` header.
+        from: String,
+        /// Called URI from the SIP `To` or request URI context.
+        to: String,
+        /// Remote SDP offer, if the INVITE contained one.
+        sdp: Option<String>,
+    },
+
+    /// Listener authentication completed for an inbound call.
+    ///
+    /// This follows [`Event::IncomingCall`] and carries no credential material.
+    IncomingCallAuthenticated {
+        /// Session identifier assigned to the authenticated INVITE.
+        call_id: CallId,
+        /// Complete canonical principal retained from listener enforcement.
+        principal: rvoip_core_traits::identity::AuthenticatedPrincipal,
+    },
+
+    /// Call was answered (200 OK received for outgoing call)
+    CallAnswered {
+        /// Session identifier for the answered call.
+        call_id: CallId,
+        /// SDP answer received from the remote peer, if present.
+        sdp: Option<String>,
+    },
+
+    /// The INVITE dialog reached the established state.
+    ///
+    /// This role-neutral lifecycle event is emitted for both outgoing and
+    /// incoming calls. On an incoming (UAS) call it is emitted only after the
+    /// caller's ACK commits the `Answering` to `Active` transition.
+    CallEstablished {
+        /// Session identifier for the established call.
+        call_id: CallId,
+    },
+
+    /// Provisional call progress response received for an outgoing call.
+    ///
+    /// Emitted for SIP 1xx responses such as `180 Ringing` and
+    /// `183 Session Progress`. The state machine still maintains
+    /// `CallState::Ringing` / `CallState::EarlyMedia`, but applications can
+    /// observe the actual response code, phrase, and early-media SDP here
+    /// without polling state.
+    CallProgress {
+        /// Session identifier for the call.
+        call_id: CallId,
+        /// SIP provisional status code.
+        status_code: u16,
+        /// SIP reason phrase.
+        reason: String,
+        /// SDP body carried by the provisional response, if present.
+        sdp: Option<String>,
+    },
+
+    /// Call ended (BYE sent/received)
+    CallEnded {
+        /// Session identifier for the ended call.
+        call_id: CallId,
+        /// Human-readable teardown reason.
+        reason: String,
+    },
+
+    /// Call failed (4xx/5xx response or timeout)
+    CallFailed {
+        /// Session identifier for the failed call.
+        call_id: CallId,
+        /// SIP status code or synthesized failure code.
+        status_code: u16,
+        /// Human-readable failure reason.
+        reason: String,
+    },
+
+    /// SIP_API_DESIGN_2 Phase A — typed inspection of every inbound 1xx
+    /// provisional response. Carries an [`crate::api::incoming::IncomingResponse`] so B2BUA /
+    /// SBC code can inspect `Contact:`, `Allow:`, `Supported:`,
+    /// `Server:`, RFC 3262 reliability markers, and any custom headers
+    /// the upstream sent before mirroring them to the downstream 1xx.
+    /// Fires alongside the legacy [`Event::CallProgress`] variant; new
+    /// code subscribes to the detailed form.
+    CallProgressDetailed(crate::api::incoming::IncomingResponse),
+
+    /// SIP_API_DESIGN_2 Phase A — typed inspection of the inbound 200 OK
+    /// that established a call. Use for downstream 200 OK
+    /// carry-through (Allow / Supported / Session-Expires).
+    CallEstablishedDetailed(crate::api::incoming::IncomingResponse),
+
+    /// SIP_API_DESIGN_2 Phase A — typed inspection of an inbound final
+    /// failure response. Use to inspect `Retry-After:`, `Warning:`,
+    /// RFC 3326 `Reason:`, and similar fields that the legacy
+    /// [`Event::CallFailed`] discards.
+    CallFailedDetailed(crate::api::incoming::IncomingResponse),
+
+    /// Caller cancelled before the call was answered (RFC 3261 §15.1.2 —
+    /// 487 Request Terminated following CANCEL). Distinct from `CallFailed`
+    /// so UIs can render "missed call" rather than "call rejected".
+    CallCancelled {
+        /// Session identifier for the cancelled incoming call.
+        call_id: CallId,
+    },
+
+    /// RFC 4028 session timer refresh succeeded (UPDATE or re-INVITE
+    /// round-tripped). Emitted once per successful refresh — applications
+    /// can use this to reset connection-health dashboards or log activity.
+    SessionRefreshed {
+        /// Session identifier for the refreshed dialog.
+        call_id: CallId,
+        /// Negotiated session expiration interval in seconds.
+        expires_secs: u32,
+    },
+
+    /// RFC 4028 session-timer refresh failed; the dialog has been torn
+    /// down with BYE (§10). Follow-up `CallEnded` will still fire.
+    SessionRefreshFailed {
+        /// Session identifier for the dialog whose refresh failed.
+        call_id: CallId,
+        /// Human-readable refresh failure reason.
+        reason: String,
+    },
+
+    /// RFC 3261 §22.2 — a server challenged our INVITE with 401/407 and the
+    /// authenticated retry was successfully dispatched. Informational; no
+    /// action is required from the app. If the retry is subsequently rejected,
+    /// `CallFailed` follows.
+    CallAuthRetrying {
+        /// Session identifier for the challenged outgoing call.
+        call_id: CallId,
+        /// 401 or 407.
+        status_code: u16,
+        /// Digest realm the server asked us to authenticate against.
+        realm: String,
+    },
+
+    // ===== Transfer Events =====
+    /// REFER request received
+    ///
+    /// Callback handlers may accept or reject the REFER through their return
+    /// value. Stream/unified users can call `accept_refer` or `reject_refer`;
+    /// if they do nothing, rvoip-sip preserves the legacy behavior and
+    /// accepts the REFER after a short grace period.
+    ReferReceived {
+        /// Session identifier for the dialog that received REFER.
+        call_id: CallId,
+        /// Raw `Refer-To` target URI.
+        refer_to: String,
+        /// Optional `Referred-By` header value.
+        referred_by: Option<String>,
+        /// Optional `Replaces` parameter/header value for attended transfer.
+        replaces: Option<String>,
+        /// Dialog-core transaction ID used to correlate REFER response/NOTIFY.
+        transaction_id: String, // For NOTIFY correlation
+        /// Raw transfer flavor. Prefer [`Event::transfer_kind`] for typed
+        /// classification.
+        transfer_type: String, // "blind" or "attended"
+        /// SIP_API_DESIGN_2 Phase E: typed `IncomingRequest` view of
+        /// the inbound REFER. Carries every header on the request
+        /// (custom routing hints, Target-Dialog per RFC 4538, etc.).
+        /// `None` for legacy publish sites that have not been migrated
+        /// yet.
+        request: Option<crate::api::incoming::IncomingRequest>,
+    },
+
+    /// Transfer accepted by recipient
+    TransferAccepted {
+        /// Session identifier for the call whose REFER was accepted.
+        call_id: CallId,
+        /// Target URI from the accepted REFER.
+        refer_to: String,
+    },
+
+    /// Terminal successful REFER NOTIFY received.
+    ///
+    /// This means the REFER subscription reported a final 2xx sipfrag for the
+    /// referenced INVITE. It does not prove that a replacement call later
+    /// remained up or was torn down.
+    ReferCompleted {
+        /// Session identifier for the REFER subscription/dialog.
+        call_id: CallId,
+        /// Transfer target URI, when known.
+        target: String,
+        /// Final 2xx status code from the sipfrag.
+        status_code: u16,
+        /// Final reason phrase from the sipfrag.
+        reason: String,
+    },
+
+    /// Transfer failed
+    TransferFailed {
+        /// Session identifier for the failed transfer.
+        call_id: CallId,
+        /// Human-readable failure reason.
+        reason: String,
+        /// SIP status code reported by REFER/NOTIFY handling.
+        status_code: u16,
+    },
+
+    /// REFER progress update from a `message/sipfrag` NOTIFY.
+    ReferProgress {
+        /// Session identifier for the REFER subscription/dialog.
+        call_id: CallId,
+        /// SIP status code from the progress NOTIFY sipfrag.
+        status_code: u16,
+        /// Reason phrase from the progress NOTIFY sipfrag.
+        reason: String,
+    },
+
+    /// Parsed REFER NOTIFY status surfaced before derived transfer events.
+    ///
+    /// This preserves the PBX-specific REFER subscription report so
+    /// applications can distinguish an immediate terminal NOTIFY from real
+    /// target progress.
+    ReferNotify {
+        /// Session identifier for the REFER subscription/dialog.
+        call_id: CallId,
+        /// SIP status code parsed from the `message/sipfrag` body.
+        status_code: u16,
+        /// Reason phrase parsed from the `message/sipfrag` body.
+        reason: String,
+        /// Parsed `Subscription-State`, if the NOTIFY carried one.
+        subscription_state: Option<SubscriptionState>,
+        /// Raw NOTIFY body, if any.
+        body: Option<String>,
+    },
+
+    /// Evidence that the transfer target answered.
+    TransferTargetAnswered {
+        /// Session identifier of the transferring (REFER-issuing) call.
+        transfer_call_id: CallId,
+        /// URI of the transfer target that answered.
+        target_uri: String,
+        /// How the target's answer was observed.
+        evidence: TransferTargetEvidence,
+    },
+
+    /// RFC 4235 observed a replacement dialog that appears related to a transfer.
+    TransferReplacementDialogObserved {
+        /// Session identifier of the transferring call.
+        transfer_call_id: CallId,
+        /// The observed replacement dialog's state.
+        dialog: DialogInfo,
+    },
+
+    /// RFC 4235 or local target-leg evidence observed replacement dialog teardown.
+    TransferReplacementDialogTerminated {
+        /// Session identifier of the transferring call.
+        transfer_call_id: CallId,
+        /// The replacement dialog's final state.
+        dialog: DialogInfo,
+        /// Teardown reason, when reported.
+        reason: Option<String>,
+    },
+
+    // ===== Subscription / NOTIFY =====
+    /// Inbound NOTIFY surfaced to the application (RFC 6665).
+    ///
+    /// Fires for every NOTIFY received on any event package — REFER
+    /// progress, dialog, presence, message-summary, etc. The session
+    /// layer does not interpret the body; if `event_package == "refer"`
+    /// and `content_type` is `message/sipfrag`, `ReferNotify` plus the
+    /// derived `ReferProgress` / `ReferCompleted` / `TransferFailed` events
+    /// are also emitted with the parsed status line.
+    NotifyReceived {
+        /// Session identifier for the dialog that received NOTIFY.
+        call_id: CallId,
+        /// SIP `Event` package name.
+        event_package: String,
+        /// Raw `Subscription-State:` header value (unparsed).
+        subscription_state: Option<String>,
+        /// Raw `Content-Type:` header value.
+        content_type: Option<String>,
+        /// NOTIFY body, if any.
+        body: Option<String>,
+        /// SIP_API_DESIGN_2 Phase E: typed view of the inbound NOTIFY
+        /// for B2BUA carry-through / generic header inspection. `None`
+        /// for legacy publish sites that have not been migrated yet.
+        request: Option<crate::api::incoming::IncomingRequest>,
+    },
+
+    /// SIP_API_DESIGN_2 Phase E — inbound in-dialog INFO (RFC 6086).
+    /// Today's stack drops INFO at the dialog layer; this variant
+    /// surfaces it to applications so SIP-INFO DTMF, fax flow control,
+    /// and other application-layer signalling can be observed.
+    InfoReceived {
+        /// Session identifier for the dialog that received INFO.
+        call_id: CallId,
+        /// Typed `IncomingRequest` view (raw INFO bytes re-parsed by
+        /// the receiving handler).
+        request: crate::api::incoming::IncomingRequest,
+    },
+
+    /// SIP_API_DESIGN_2 Phase E — inbound in-dialog MESSAGE
+    /// (RFC 3428). Distinct from the out-of-dialog `MessageDelivered`
+    /// confirmation — this is *receiving* a MESSAGE.
+    MessageReceived {
+        /// Session identifier for the dialog that received MESSAGE.
+        call_id: CallId,
+        /// Typed `IncomingRequest` view.
+        request: crate::api::incoming::IncomingRequest,
+    },
+
+    /// SIP_API_DESIGN_2 Phase E — inbound OPTIONS (RFC 3261 §11).
+    /// `call_id` is `None` when the OPTIONS arrived out-of-dialog
+    /// (capability query against the AOR).
+    OptionsReceived {
+        /// Session identifier for the dialog that received OPTIONS,
+        /// when one exists.
+        call_id: Option<CallId>,
+        /// Typed `IncomingRequest` view.
+        request: crate::api::incoming::IncomingRequest,
+    },
+
+    /// SIP_API_DESIGN_2 Phase E — inbound UPDATE (RFC 3311). This
+    /// fires alongside the legacy hold/resume state transitions that
+    /// run inside the state machine; subscribe to this variant for
+    /// header-level inspection (Session-Expires, RFC 6086 INFO over
+    /// UPDATE, custom X-* hints).
+    UpdateReceived {
+        /// Session identifier for the dialog that received UPDATE.
+        call_id: CallId,
+        /// Typed `IncomingRequest` view.
+        request: crate::api::incoming::IncomingRequest,
+    },
+
+    /// SIP_API_DESIGN_2 Phase D — inbound REGISTER (RFC 3261 §10).
+    /// Surfaces the typed `IncomingRegister` view so registrar
+    /// applications can author the response via `accept_builder` /
+    /// `challenge_builder` / `reject_builder` with Service-Route /
+    /// Path / P-Associated-URI under their full control.
+    IncomingRegister {
+        /// Typed `IncomingRegister` view of the inbound REGISTER.
+        register: crate::api::incoming::IncomingRegister,
+    },
+
+    /// Parsed RFC 4235 dialog-package NOTIFY.
+    DialogPackageNotify {
+        /// Session identifier of the dialog-package subscription.
+        subscription_id: CallId,
+        /// `entity` attribute of the dialog-info document, when present.
+        entity: Option<String>,
+        /// `version` attribute of the dialog-info document, when present.
+        version: Option<u32>,
+        /// Per-dialog states reported by this NOTIFY.
+        dialogs: Vec<DialogInfo>,
+        /// The full parsed dialog-info document.
+        document: DialogInfoDocument,
+    },
+
+    /// Derived per-dialog state transition from an RFC 4235 NOTIFY.
+    DialogStateChanged {
+        /// Session identifier of the dialog-package subscription.
+        subscription_id: CallId,
+        /// The dialog whose state changed.
+        dialog: DialogInfo,
+    },
+
+    // ===== Call State Events =====
+    /// Local hold was accepted by the remote peer.
+    ///
+    /// Emitted after the hold re-INVITE/answer exchange succeeds.
+    CallOnHold {
+        /// Session identifier for the held call.
+        call_id: CallId,
+    },
+
+    /// Local resume was accepted by the remote peer.
+    ///
+    /// Emitted after the resume re-INVITE/answer exchange succeeds.
+    CallResumed {
+        /// Session identifier for the resumed call.
+        call_id: CallId,
+    },
+
+    /// The remote peer placed this call on hold with a mid-call offer.
+    RemoteCallOnHold {
+        /// Session identifier for the remotely held call.
+        call_id: CallId,
+    },
+
+    /// The remote peer resumed this call with a mid-call offer.
+    RemoteCallResumed {
+        /// Session identifier for the remotely resumed call.
+        call_id: CallId,
+    },
+
+    /// Call was muted locally
+    CallMuted {
+        /// Session identifier for the muted call.
+        call_id: CallId,
+    },
+
+    /// Call was unmuted locally
+    CallUnmuted {
+        /// Session identifier for the unmuted call.
+        call_id: CallId,
+    },
+
+    // ===== Media Events =====
+    /// DTMF digit received
+    DtmfReceived {
+        /// Session identifier for the call that received DTMF.
+        call_id: CallId,
+        /// Received digit.
+        digit: char,
+    },
+
+    /// Periodic per-call media quality sample.
+    ///
+    /// Emitted every [`Config::media_quality_interval`](crate::Config::media_quality_interval)
+    /// for each call that has sent or received RTP (off by default). The
+    /// same values are available on demand from
+    /// [`UnifiedCoordinator::media_quality`](crate::UnifiedCoordinator::media_quality).
+    MediaQualityChanged {
+        /// Session identifier for the media stream.
+        call_id: CallId,
+        /// Local packet loss percentage on the received stream, truncated
+        /// to an integer. See [`MediaQualityStats::packet_loss_percent`].
+        packet_loss_percent: u32,
+        /// Local jitter in milliseconds, truncated to an integer.
+        jitter_ms: u32,
+        /// Estimated Mean Opinion Score, when media-core produced one.
+        ///
+        /// Carried as the estimate it is: media-core derives it from loss,
+        /// jitter, and latency rather than measuring perceived quality, so
+        /// it tracks trends well and should not be quoted as a measurement.
+        mos: Option<f32>,
+        /// The full sample: packet counters, RTT and the peer-reported
+        /// (`remote_*`) values, which are `None` without RTCP.
+        quality: MediaQualityStats,
+    },
+
+    /// SRTP media security was negotiated and installed.
+    MediaSecurityNegotiated {
+        /// Session identifier for the protected media stream.
+        call_id: CallId,
+        /// Keying mechanism used to derive SRTP contexts.
+        keying: MediaSecurityKeying,
+        /// SRTP protection profile represented by the shared crypto-suite API.
+        suite: CryptoSuite,
+        /// RTP profile used by the negotiated media stream.
+        profile: MediaSecurityProfile,
+        /// Whether SRTP send/receive contexts have been installed in media-core.
+        contexts_installed: bool,
+    },
+
+    // ===== Registration Events =====
+    /// Registration successful.
+    ///
+    /// `expires` is the registrar-accepted expiry, not necessarily the value
+    /// requested by the application. Use
+    /// [`UnifiedCoordinator::registration_info`](crate::UnifiedCoordinator::registration_info)
+    /// for refresh timing, Service-Route, GRUU, and failure metadata.
+    RegistrationSuccess {
+        /// Registrar URI used for the REGISTER.
+        registrar: String,
+        /// Expiration interval accepted by the registrar.
+        expires: u32,
+        /// Contact URI that was registered.
+        contact: String,
+    },
+
+    /// Registration failed.
+    ///
+    /// Final failure after any supported retry path, such as auth retry
+    /// or 423 Interval Too Brief retry.
+    RegistrationFailed {
+        /// Registrar URI used for the failed REGISTER.
+        registrar: String,
+        /// SIP status code returned by the registrar.
+        status_code: u16,
+        /// Human-readable failure reason.
+        reason: String,
+    },
+
+    /// Unregistration successful.
+    ///
+    /// Automatic refresh for the registration has been aborted.
+    UnregistrationSuccess {
+        /// Registrar URI used for the unregistration.
+        registrar: String,
+    },
+
+    /// Unregistration failed.
+    UnregistrationFailed {
+        /// Registrar URI used for the failed unregistration.
+        registrar: String,
+        /// Human-readable failure reason.
+        reason: String,
+    },
+
+    /// An [`OPTIONS` keep-alive](crate::Config::options_keepalive_targets)
+    /// target's reachability was first learned or changed.
+    ///
+    /// Published once for each target's first ping outcome and again
+    /// whenever it flips, never for a repeat of the same outcome. Use it to
+    /// mark a trunk or SBC peer up or down.
+    PeerReachabilityChanged {
+        /// The configured target URI, exactly as it appears in
+        /// [`Config::options_keepalive_targets`](crate::Config::options_keepalive_targets).
+        target: String,
+        /// Whether the target answered with a final response other than
+        /// `408` or `503`.
+        reachable: bool,
+        /// Status code of the response, or `None` when the ping timed out
+        /// or failed at the transport.
+        status_code: Option<u16>,
+    },
+
+    // ===== Diagnostics Events =====
+    /// SIP message observed at the transport boundary.
+    SipTrace(SipTrace),
+
+    // ===== Error Events =====
+    /// Network error occurred
+    NetworkError {
+        /// Session identifier, if the transport error can be tied to one call.
+        call_id: Option<CallId>,
+        /// Human-readable error text.
+        error: String,
+    },
+
+    /// Authentication required (401/407 response)
+    AuthenticationRequired {
+        /// Session identifier for the challenged request.
+        call_id: CallId,
+        /// Digest-auth realm from the challenge.
+        realm: String,
+    },
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncomingCall { from, to, sdp, .. } => formatter
+                .debug_struct("IncomingCall")
+                .field("from_bytes", &from.len())
+                .field("to_bytes", &to.len())
+                .field("sdp_present", &sdp.is_some())
+                .field("sdp_bytes", &sdp.as_ref().map_or(0, String::len))
+                .finish(),
+            Self::IncomingCallAuthenticated { principal, .. } => formatter
+                .debug_struct("IncomingCallAuthenticated")
+                .field("principal", principal)
+                .finish(),
+            Self::CallAnswered { sdp, .. } => formatter
+                .debug_struct("CallAnswered")
+                .field("sdp_present", &sdp.is_some())
+                .field("sdp_bytes", &sdp.as_ref().map_or(0, String::len))
+                .finish(),
+            Self::CallEstablished { .. } => formatter.write_str("CallEstablished"),
+            Self::CallProgress {
+                status_code,
+                reason,
+                sdp,
+                ..
+            } => formatter
+                .debug_struct("CallProgress")
+                .field("status_code", status_code)
+                .field("reason_bytes", &reason.len())
+                .field("sdp_present", &sdp.is_some())
+                .field("sdp_bytes", &sdp.as_ref().map_or(0, String::len))
+                .finish(),
+            Self::CallEnded { reason, .. } => formatter
+                .debug_struct("CallEnded")
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::CallFailed {
+                status_code,
+                reason,
+                ..
+            } => formatter
+                .debug_struct("CallFailed")
+                .field("status_code", status_code)
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::CallProgressDetailed(response) => formatter
+                .debug_tuple("CallProgressDetailed")
+                .field(response)
+                .finish(),
+            Self::CallEstablishedDetailed(response) => formatter
+                .debug_tuple("CallEstablishedDetailed")
+                .field(response)
+                .finish(),
+            Self::CallFailedDetailed(response) => formatter
+                .debug_tuple("CallFailedDetailed")
+                .field(response)
+                .finish(),
+            Self::CallCancelled { .. } => formatter.write_str("CallCancelled"),
+            Self::SessionRefreshed { expires_secs, .. } => formatter
+                .debug_struct("SessionRefreshed")
+                .field("expires_secs", expires_secs)
+                .finish(),
+            Self::SessionRefreshFailed { reason, .. } => formatter
+                .debug_struct("SessionRefreshFailed")
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::CallAuthRetrying {
+                status_code, realm, ..
+            } => formatter
+                .debug_struct("CallAuthRetrying")
+                .field("status_code", status_code)
+                .field("realm_present", &!realm.is_empty())
+                .field("realm_bytes", &realm.len())
+                .finish(),
+            Self::ReferReceived {
+                refer_to,
+                referred_by,
+                replaces,
+                transaction_id,
+                transfer_type,
+                request,
+                ..
+            } => formatter
+                .debug_struct("ReferReceived")
+                .field("refer_to_bytes", &refer_to.len())
+                .field("referred_by_present", &referred_by.is_some())
+                .field(
+                    "referred_by_bytes",
+                    &referred_by.as_ref().map_or(0, String::len),
+                )
+                .field("replaces_present", &replaces.is_some())
+                .field("replaces_bytes", &replaces.as_ref().map_or(0, String::len))
+                .field("transaction_id_bytes", &transaction_id.len())
+                .field(
+                    "transfer_kind",
+                    &TransferKind::from_header_value(transfer_type),
+                )
+                .field("request_present", &request.is_some())
+                .finish(),
+            Self::TransferAccepted { refer_to, .. } => formatter
+                .debug_struct("TransferAccepted")
+                .field("refer_to_bytes", &refer_to.len())
+                .finish(),
+            Self::ReferCompleted {
+                target,
+                status_code,
+                reason,
+                ..
+            } => formatter
+                .debug_struct("ReferCompleted")
+                .field("target_bytes", &target.len())
+                .field("status_code", status_code)
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::TransferFailed {
+                reason,
+                status_code,
+                ..
+            } => formatter
+                .debug_struct("TransferFailed")
+                .field("status_code", status_code)
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::ReferProgress {
+                status_code,
+                reason,
+                ..
+            } => formatter
+                .debug_struct("ReferProgress")
+                .field("status_code", status_code)
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::ReferNotify {
+                status_code,
+                reason,
+                subscription_state,
+                body,
+                ..
+            } => formatter
+                .debug_struct("ReferNotify")
+                .field("status_code", status_code)
+                .field("reason_bytes", &reason.len())
+                .field("subscription_state_present", &subscription_state.is_some())
+                .field(
+                    "subscription_state_bytes",
+                    &subscription_state
+                        .as_ref()
+                        .map_or(0, |state| state.raw.len()),
+                )
+                .field("body_present", &body.is_some())
+                .field("body_bytes", &body.as_ref().map_or(0, String::len))
+                .finish(),
+            Self::TransferTargetAnswered { evidence, .. } => {
+                let evidence_kind = match evidence {
+                    TransferTargetEvidence::ReferProgressThenFinal { .. } => "refer-progress-final",
+                    TransferTargetEvidence::LocalTargetLeg { .. } => "local-target-leg",
+                    TransferTargetEvidence::DialogPackage { .. } => "dialog-package",
+                };
+                formatter
+                    .debug_struct("TransferTargetAnswered")
+                    .field("evidence_kind", &evidence_kind)
+                    .finish()
+            }
+            Self::TransferReplacementDialogObserved { .. } => {
+                formatter.write_str("TransferReplacementDialogObserved")
+            }
+            Self::TransferReplacementDialogTerminated { reason, .. } => formatter
+                .debug_struct("TransferReplacementDialogTerminated")
+                .field("reason_present", &reason.is_some())
+                .field("reason_bytes", &reason.as_ref().map_or(0, String::len))
+                .finish(),
+            Self::NotifyReceived {
+                event_package,
+                subscription_state,
+                content_type,
+                body,
+                request,
+                ..
+            } => formatter
+                .debug_struct("NotifyReceived")
+                .field("event_package_bytes", &event_package.len())
+                .field("subscription_state_present", &subscription_state.is_some())
+                .field(
+                    "subscription_state_bytes",
+                    &subscription_state.as_ref().map_or(0, String::len),
+                )
+                .field("content_type_present", &content_type.is_some())
+                .field(
+                    "content_type_bytes",
+                    &content_type.as_ref().map_or(0, String::len),
+                )
+                .field("body_present", &body.is_some())
+                .field("body_bytes", &body.as_ref().map_or(0, String::len))
+                .field("request_present", &request.is_some())
+                .finish(),
+            Self::InfoReceived { request, .. } => formatter
+                .debug_tuple("InfoReceived")
+                .field(request)
+                .finish(),
+            Self::MessageReceived { request, .. } => formatter
+                .debug_tuple("MessageReceived")
+                .field(request)
+                .finish(),
+            Self::OptionsReceived { request, .. } => formatter
+                .debug_tuple("OptionsReceived")
+                .field(request)
+                .finish(),
+            Self::UpdateReceived { request, .. } => formatter
+                .debug_tuple("UpdateReceived")
+                .field(request)
+                .finish(),
+            Self::IncomingRegister { register } => formatter
+                .debug_tuple("IncomingRegister")
+                .field(register)
+                .finish(),
+            Self::DialogPackageNotify { dialogs, .. } => formatter
+                .debug_struct("DialogPackageNotify")
+                .field("dialog_count", &dialogs.len())
+                .finish(),
+            Self::DialogStateChanged { .. } => formatter.write_str("DialogStateChanged"),
+            Self::CallOnHold { .. } => formatter.write_str("CallOnHold"),
+            Self::CallResumed { .. } => formatter.write_str("CallResumed"),
+            Self::RemoteCallOnHold { .. } => formatter.write_str("RemoteCallOnHold"),
+            Self::RemoteCallResumed { .. } => formatter.write_str("RemoteCallResumed"),
+            Self::CallMuted { .. } => formatter.write_str("CallMuted"),
+            Self::CallUnmuted { .. } => formatter.write_str("CallUnmuted"),
+            Self::DtmfReceived { .. } => formatter.write_str("DtmfReceived"),
+            Self::MediaQualityChanged {
+                packet_loss_percent,
+                jitter_ms,
+                quality,
+                ..
+            } => formatter
+                .debug_struct("MediaQualityChanged")
+                .field("packet_loss_percent", packet_loss_percent)
+                .field("jitter_ms", jitter_ms)
+                .field("quality", quality)
+                .finish(),
+            Self::MediaSecurityNegotiated {
+                keying,
+                suite,
+                profile,
+                contexts_installed,
+                ..
+            } => formatter
+                .debug_struct("MediaSecurityNegotiated")
+                .field("keying", keying)
+                .field("suite", suite)
+                .field("profile", profile)
+                .field("contexts_installed", contexts_installed)
+                .finish(),
+            Self::RegistrationSuccess {
+                registrar,
+                expires,
+                contact,
+            } => formatter
+                .debug_struct("RegistrationSuccess")
+                .field("registrar_bytes", &registrar.len())
+                .field("expires", expires)
+                .field("contact_bytes", &contact.len())
+                .finish(),
+            Self::RegistrationFailed {
+                registrar,
+                status_code,
+                reason,
+            } => formatter
+                .debug_struct("RegistrationFailed")
+                .field("registrar_bytes", &registrar.len())
+                .field("status_code", status_code)
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::UnregistrationSuccess { registrar } => formatter
+                .debug_struct("UnregistrationSuccess")
+                .field("registrar_bytes", &registrar.len())
+                .finish(),
+            Self::UnregistrationFailed { registrar, reason } => formatter
+                .debug_struct("UnregistrationFailed")
+                .field("registrar_bytes", &registrar.len())
+                .field("reason_bytes", &reason.len())
+                .finish(),
+            Self::PeerReachabilityChanged {
+                target,
+                reachable,
+                status_code,
+            } => formatter
+                .debug_struct("PeerReachabilityChanged")
+                .field("target_bytes", &target.len())
+                .field("reachable", reachable)
+                .field("status_code", status_code)
+                .finish(),
+            Self::SipTrace(trace) => formatter.debug_tuple("SipTrace").field(trace).finish(),
+            Self::NetworkError { error, .. } => formatter
+                .debug_struct("NetworkError")
+                .field("error_bytes", &error.len())
+                .finish(),
+            Self::AuthenticationRequired { realm, .. } => formatter
+                .debug_struct("AuthenticationRequired")
+                .field("realm_present", &!realm.is_empty())
+                .field("realm_bytes", &realm.len())
+                .finish(),
+        }
+    }
+}
+
+impl Event {
+    /// Get the call ID associated with this event (if any)
+    pub fn call_id(&self) -> Option<&CallId> {
+        match self {
+            Event::IncomingCall { call_id, .. }
+            | Event::IncomingCallAuthenticated { call_id, .. }
+            | Event::CallAnswered { call_id, .. }
+            | Event::CallEstablished { call_id, .. }
+            | Event::CallProgress { call_id, .. }
+            | Event::CallEnded { call_id, .. }
+            | Event::CallFailed { call_id, .. }
+            | Event::CallCancelled { call_id, .. }
+            | Event::SessionRefreshed { call_id, .. }
+            | Event::SessionRefreshFailed { call_id, .. }
+            | Event::CallAuthRetrying { call_id, .. }
+            | Event::ReferReceived { call_id, .. }
+            | Event::TransferAccepted { call_id, .. }
+            | Event::TransferFailed { call_id, .. }
+            | Event::ReferProgress { call_id, .. }
+            | Event::ReferNotify { call_id, .. }
+            | Event::ReferCompleted { call_id, .. }
+            | Event::CallOnHold { call_id, .. }
+            | Event::CallResumed { call_id, .. }
+            | Event::RemoteCallOnHold { call_id, .. }
+            | Event::RemoteCallResumed { call_id, .. }
+            | Event::CallMuted { call_id, .. }
+            | Event::CallUnmuted { call_id, .. }
+            | Event::DtmfReceived { call_id, .. }
+            | Event::MediaQualityChanged { call_id, .. }
+            | Event::MediaSecurityNegotiated { call_id, .. }
+            | Event::NotifyReceived { call_id, .. }
+            | Event::AuthenticationRequired { call_id, .. } => Some(call_id),
+            Event::TransferTargetAnswered {
+                transfer_call_id, ..
+            }
+            | Event::TransferReplacementDialogObserved {
+                transfer_call_id, ..
+            }
+            | Event::TransferReplacementDialogTerminated {
+                transfer_call_id, ..
+            } => Some(transfer_call_id),
+            Event::DialogPackageNotify {
+                subscription_id, ..
+            }
+            | Event::DialogStateChanged {
+                subscription_id, ..
+            } => Some(subscription_id),
+            Event::SipTrace(trace) => trace.session_id.as_ref(),
+            Event::NetworkError { call_id, .. } => call_id.as_ref(),
+            Event::CallProgressDetailed(r)
+            | Event::CallEstablishedDetailed(r)
+            | Event::CallFailedDetailed(r) => Some(&r.call_id),
+            Event::InfoReceived { call_id, .. }
+            | Event::MessageReceived { call_id, .. }
+            | Event::UpdateReceived { call_id, .. } => Some(call_id),
+            Event::OptionsReceived { call_id, .. } => call_id.as_ref(),
+            // Registration events don't have call_id
+            Event::RegistrationSuccess { .. }
+            | Event::RegistrationFailed { .. }
+            | Event::UnregistrationSuccess { .. }
+            | Event::UnregistrationFailed { .. }
+            | Event::IncomingRegister { .. }
+            | Event::PeerReachabilityChanged { .. } => None,
+        }
+    }
+
+    /// Check if this is a call lifecycle event
+    pub fn is_call_event(&self) -> bool {
+        matches!(
+            self,
+            Event::IncomingCall { .. }
+                | Event::IncomingCallAuthenticated { .. }
+                | Event::CallAnswered { .. }
+                | Event::CallEstablished { .. }
+                | Event::CallProgress { .. }
+                | Event::CallEnded { .. }
+                | Event::CallFailed { .. }
+                | Event::CallCancelled { .. }
+                | Event::CallProgressDetailed(_)
+                | Event::CallEstablishedDetailed(_)
+                | Event::CallFailedDetailed(_)
+                | Event::InfoReceived { .. }
+                | Event::MessageReceived { .. }
+                | Event::OptionsReceived { .. }
+                | Event::UpdateReceived { .. }
+        )
+    }
+
+    /// Check if this is a call state/control event
+    pub fn is_call_state_event(&self) -> bool {
+        matches!(
+            self,
+            Event::CallOnHold { .. }
+                | Event::CallResumed { .. }
+                | Event::RemoteCallOnHold { .. }
+                | Event::RemoteCallResumed { .. }
+                | Event::CallMuted { .. }
+                | Event::CallUnmuted { .. }
+        )
+    }
+
+    /// Check if this is a transfer-related event
+    pub fn is_transfer_event(&self) -> bool {
+        matches!(
+            self,
+            Event::ReferReceived { .. }
+                | Event::TransferAccepted { .. }
+                | Event::ReferCompleted { .. }
+                | Event::TransferFailed { .. }
+                | Event::ReferProgress { .. }
+                | Event::ReferNotify { .. }
+                | Event::TransferTargetAnswered { .. }
+                | Event::TransferReplacementDialogObserved { .. }
+                | Event::TransferReplacementDialogTerminated { .. }
+        )
+    }
+
+    /// Check if this is a media-related event
+    pub fn is_media_event(&self) -> bool {
+        matches!(
+            self,
+            Event::DtmfReceived { .. }
+                | Event::MediaQualityChanged { .. }
+                | Event::MediaSecurityNegotiated { .. }
+        )
+    }
+
+    /// Typed transfer kind for `ReferReceived`.
+    ///
+    /// Returns `None` for non-REFER events.
+    pub fn transfer_kind(&self) -> Option<TransferKind> {
+        match self {
+            Event::ReferReceived { transfer_type, .. } => {
+                Some(TransferKind::from_header_value(transfer_type))
+            }
+            _ => None,
+        }
+    }
+
+    /// Parsed `Subscription-State` for `NotifyReceived`.
+    ///
+    /// Returns `None` when the event is not NOTIFY or the header was absent.
+    pub fn subscription_state(&self) -> Option<SubscriptionState> {
+        match self {
+            Event::NotifyReceived {
+                subscription_state: Some(raw),
+                ..
+            } => Some(SubscriptionState::parse(raw.clone())),
+            Event::ReferNotify {
+                subscription_state: Some(parsed),
+                ..
+            } => Some(parsed.clone()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_diagnostic_tests {
+    use super::{DiagnosticEvent, SdesNegotiationFailure};
+    use crate::errors::{
+        SdesBase64Padding, SdesNegotiationDiagnostic, SdesNegotiationFailureClass,
+        SdesNegotiationStage,
+    };
+    use crate::state_table::types::SessionId;
+    use rvoip_sip_core::types::sdp::CryptoSuite;
+
+    #[test]
+    fn sdes_failure_debug_never_renders_response_sdp_or_key_material() {
+        let key_material = "SECRET_INLINE_KEY_MATERIAL==";
+        let event = DiagnosticEvent::SdesNegotiationFailed(SdesNegotiationFailure {
+            call_id: SessionId("sdes-failure".to_string()),
+            response: crate::api::incoming::IncomingResponse::synthetic(
+                SessionId("sdes-failure".to_string()),
+                200,
+                "OK".to_string(),
+                Some(format!(
+                    "v=0\r\na=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:{key_material}\r\n"
+                )),
+            ),
+            diagnostic: SdesNegotiationDiagnostic {
+                stage: SdesNegotiationStage::RemoteAnswer,
+                failure_class: SdesNegotiationFailureClass::InvalidBase64,
+                tag: 1,
+                suite: CryptoSuite::AesCm256HmacSha1_80,
+                encoded_bytes: key_material.len(),
+                padding: SdesBase64Padding::Malformed,
+                expected_decoded_bytes: 46,
+                actual_decoded_bytes: None,
+            },
+        });
+
+        let debug = format!("{event:?}");
+        assert!(debug.contains("SdesNegotiationFailed"));
+        assert!(debug.contains("expected_decoded_bytes"));
+        assert!(!debug.contains(key_material));
+        assert!(!debug.contains("a=crypto"));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_safety_tests {
+    use super::*;
+    use chrono::Utc;
+    use rvoip_core_traits::identity::{
+        AuthenticatedPrincipal, AuthenticationMethod, IdentityAssurance,
+    };
+
+    #[test]
+    fn principal_refer_register_and_trace_events_never_debug_raw_values() {
+        const SUBJECT: &str = "app-principal-subject-secret-canary";
+        const TENANT: &str = "app-principal-tenant-secret-canary";
+        const REFER_TO: &str = "sip:app-refer-target-secret-canary@example.com";
+        const REFERRED_BY: &str = "sip:app-referrer-secret-canary@example.com";
+        const REPLACES: &str = "app-replaces-secret-canary";
+        const TRANSACTION: &str = "app-transaction-secret-canary";
+        const REGISTRAR: &str = "sip:app-registrar-secret-canary@example.com";
+        const CONTACT: &str = "sip:app-contact-secret-canary@example.com";
+        const AUTHORIZATION: &str = "Digest response=app-auth-secret-canary";
+        const RAW_MESSAGE: &str = "REGISTER sip:app-raw-secret-canary SIP/2.0";
+
+        let principal = AuthenticatedPrincipal {
+            subject: SUBJECT.into(),
+            tenant: Some(TENANT.into()),
+            scopes: vec!["app-scope-secret-canary".into()],
+            issuer: Some("app-issuer-secret-canary".into()),
+            expires_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+            method: AuthenticationMethod::Jwt,
+            assurance: IdentityAssurance::Anonymous,
+        };
+        let register = crate::api::incoming::IncomingRegister::synthetic(
+            TRANSACTION.into(),
+            "sip:app-from-secret-canary@example.com".into(),
+            REGISTRAR.into(),
+            CONTACT.into(),
+            300,
+            Some(AUTHORIZATION.into()),
+            "app-call-id-secret-canary".into(),
+        );
+        let events = [
+            Event::IncomingCallAuthenticated {
+                call_id: "app-call-secret-canary".into(),
+                principal,
+            },
+            Event::ReferReceived {
+                call_id: "app-call-secret-canary".into(),
+                refer_to: REFER_TO.into(),
+                referred_by: Some(REFERRED_BY.into()),
+                replaces: Some(REPLACES.into()),
+                transaction_id: TRANSACTION.into(),
+                transfer_type: "blind".into(),
+                request: None,
+            },
+            Event::IncomingRegister { register },
+            Event::RegistrationSuccess {
+                registrar: REGISTRAR.into(),
+                expires: 300,
+                contact: CONTACT.into(),
+            },
+            Event::SipTrace(SipTrace {
+                direction: SipTraceDirection::Inbound,
+                transport: "UDP".into(),
+                local_addr: "127.0.0.1:5060".into(),
+                remote_addr: "127.0.0.1:5070".into(),
+                timestamp_unix_millis: 1,
+                start_line: RAW_MESSAGE.into(),
+                sip_call_id: Some("app-trace-call-id-secret-canary".into()),
+                session_id: Some("app-trace-session-secret-canary".into()),
+                raw_message: RAW_MESSAGE.into(),
+                original_len: RAW_MESSAGE.len(),
+                truncated: false,
+                redacted: false,
+            }),
+        ];
+
+        let rendered = events
+            .iter()
+            .map(|event| {
+                let wrapped = crate::adapters::SessionApiCrossCrateEvent::new(event.clone());
+                format!("{event:?} {wrapped:?}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        for variant in [
+            "IncomingCallAuthenticated",
+            "ReferReceived",
+            "IncomingRegister",
+            "RegistrationSuccess",
+            "SipTrace",
+        ] {
+            assert!(rendered.contains(variant));
+        }
+        for secret in [
+            SUBJECT,
+            TENANT,
+            REFER_TO,
+            REFERRED_BY,
+            REPLACES,
+            TRANSACTION,
+            REGISTRAR,
+            CONTACT,
+            AUTHORIZATION,
+            RAW_MESSAGE,
+            "app-scope-secret-canary",
+            "app-issuer-secret-canary",
+            "app-call-id-secret-canary",
+            "app-trace-session-secret-canary",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "debug leaked {secret}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_event_source_keeps_payload_containers_on_manual_debug() {
+        let source = include_str!("events.rs");
+        for declaration in [
+            "pub struct SipTrace",
+            "pub enum TransferTargetEvidence",
+            "pub struct SubscriptionState",
+            "pub enum Event",
+        ] {
+            let declaration_offset = source
+                .find(declaration)
+                .unwrap_or_else(|| panic!("missing declaration {declaration}"));
+            let prefix = &source[..declaration_offset];
+            let derive_offset = prefix
+                .rfind("#[derive(")
+                .unwrap_or_else(|| panic!("missing derive for {declaration}"));
+            assert!(
+                !prefix[derive_offset..].contains("Debug"),
+                "{declaration} regained derived Debug"
+            );
+        }
+    }
+}

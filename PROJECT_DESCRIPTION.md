@@ -22,7 +22,7 @@ The actor owns the endpoint and call. It rejects commands for a call that has en
 
 ## Signaling and voice
 
-The pinned `rvoip-sip` 0.4 Endpoint API provides Digest registration, refresh, SIP dialog handling, SDP negotiation, PCMU / PCMA, and RTP telephone events. UDP accounts use unencrypted RTP. TLS accounts require trusted certificates and SDES-SRTP. The application chooses a local IPv4 address using the operating system route to the PBX.
+The pinned `rvoip-sip` 0.4 Endpoint API provides Digest registration, refresh, SIP dialog handling, SDP negotiation, Opus, PCMU / PCMA, and RTP telephone events. Opus is offered first by default (payload type 111, `opus/48000/2`), with G.711 as fallback. Local patches in `vendor/rvoip-sip` and `vendor/rvoip-audio-device` expose the negotiated audio format and run the device bridge at that rate (48 kHz for Opus), instead of a fixed 8 kHz. UDP accounts use unencrypted RTP. TLS accounts require trusted certificates and SDES-SRTP. The application chooses a local IPv4 address using the operating system route to the PBX.
 
 `rvoip-audio-device` connects call PCM to CPAL input and output devices. Mute sends silence while keeping RTP packets on schedule. Input callbacks update a heartbeat so the actor can report a microphone stream that never starts or later stops. The heartbeat cannot confirm speaker output or usable audio at the other end.
 

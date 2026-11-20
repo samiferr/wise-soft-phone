@@ -1,6 +1,6 @@
 # Plan: Opus codec support
 
-Status: proposal. Nothing here is implemented yet.
+Status: implemented on this branch except for the manual interop checks in step 15. See "Implementation notes" at the end for where the work departed from the plan.
 
 ## Goal
 
@@ -146,3 +146,14 @@ Phases 0–1 (half a day) work end to end on the signalling side only. The calls
 are not usable until Phase 2 lands, so ship 0–2 together behind the
 `OpusFirst` default. Phase 2 is most of the effort (1–2 days). Phases 3–5 take
 another day including interop testing.
+
+## Implementation notes
+
+- **Format discovery (step 7):** rvoip-sip 0.4.0 has no public accessor for the negotiated codec, and SIP traces strip SDP bodies. The work therefore vendors `rvoip-sip` with a small `SessionHandle::negotiated_audio()` patch (`vendor/rvoip-sip/SOFTPHONE_PATCH.md`). This matters more than expected: the first frame of the wrong shape ends the call's send task for the rest of the call. Audio therefore never starts without a negotiated format.
+- **fmtp (step 6):** done, because rvoip-sip had to be vendored anyway. The change found an upstream bug: Opus offered on Asterisk's PT 107 was answered with AMR-NB `octet-align`/`max-red` parameters. Fixed and covered by a test.
+- **Stereo:** `opus/48000/2` negotiates 2 channels, and the encoder requires interleaved stereo. The bridge duplicates the mono microphone signal, and playback now mixes received stereo down to mono. Upstream would have played it at half speed.
+- **Resampling (step 9):** instead of adding `rubato`, the upstream linear interpolator became a streaming, phase-continuous resampler with the existing Butterworth band limit. Opus at a 48 kHz device rate is a pass-through. Tests cover drift, clicks, and the band limit.
+- **libopus (step 2):** bundled and static through `.cargo/config.toml` (`LIBOPUS_NO_PKG`, `LIBOPUS_STATIC`). The build needs CMake, but no system libopus.
+- **SRTP + Opus (step 14):** not covered by an automated test, because there is no loopback TLS fixture. It belongs to the manual TLS check in step 15.
+- **Mid-call codec change:** not handled. A re-INVITE that changes the codec leaves the bridge in its initial format, as planned for the first version.
+

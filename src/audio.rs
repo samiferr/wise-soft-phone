@@ -6,8 +6,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use rvoip_audio_device::{AudioDirection, DeviceBridge, DeviceOptions, RunningAudio};
-use rvoip_sip::{AudioSender, EndpointCall};
+use rvoip_audio_device::{AudioDirection, AudioFormat, DeviceBridge, DeviceOptions, RunningAudio};
+use rvoip_sip::{AudioSender, EndpointCall, NegotiatedAudio};
+
+/// How long to wait for SDP negotiation to be recorded after a call connects.
+const NEGOTIATION_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
 pub struct AudioSelection {
@@ -81,6 +84,46 @@ fn selector(direction: AudioDirection, name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("The selected audio device is unavailable: {name}."))
 }
 
+/// Read the codec negotiated for a connected call. Frames sent to RVoIP must
+/// match its rate and channel count exactly, so audio does not start without it.
+pub async fn negotiated_media(call: &EndpointCall) -> Result<NegotiatedAudio, String> {
+    let handle = call.as_session_handle();
+    let deadline = Instant::now() + NEGOTIATION_WAIT;
+    loop {
+        match handle.negotiated_audio().await {
+            Ok(Some(media)) => return Ok(media),
+            Ok(None) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(None) | Err(_) => {
+                return Err("Could not read the negotiated call audio codec.".into());
+            }
+        }
+    }
+}
+
+/// PCM shape the device bridge must produce for `media`.
+pub fn bridge_format(media: &NegotiatedAudio) -> AudioFormat {
+    AudioFormat {
+        sample_rate: media.sample_rate,
+        channels: media.channels.clamp(1, 2),
+    }
+}
+
+/// Short user-facing codec name.
+pub fn codec_label(media: &NegotiatedAudio) -> String {
+    let codec = media.codec.as_str();
+    if codec.eq_ignore_ascii_case("opus") {
+        "Opus wideband".into()
+    } else if codec.eq_ignore_ascii_case("PCMU") {
+        "G.711 µ-law".into()
+    } else if codec.eq_ignore_ascii_case("PCMA") {
+        "G.711 A-law".into()
+    } else {
+        codec.to_owned()
+    }
+}
+
 pub struct CallAudio {
     _bridge: RunningAudio,
     heartbeat: Arc<AtomicU64>,
@@ -106,6 +149,7 @@ impl CallAudio {
 
     pub async fn start(
         call: &EndpointCall,
+        media: &NegotiatedAudio,
         selected: &AudioSelection,
         muted: Arc<AtomicBool>,
     ) -> Result<Self, String> {
@@ -135,6 +179,7 @@ impl CallAudio {
         let pulse = heartbeat.clone();
         let started = Instant::now();
         let mut options = DeviceOptions::new()
+            .with_format(bridge_format(media))
             .with_mute_flag(muted)
             .with_level_callback(move |level| {
                 if level.direction == AudioDirection::Input {
@@ -162,6 +207,33 @@ impl CallAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media(codec: &str, sample_rate: u32, channels: u8, payload_type: u8) -> NegotiatedAudio {
+        NegotiatedAudio {
+            codec: codec.into(),
+            sample_rate,
+            channels,
+            payload_type,
+        }
+    }
+
+    #[test]
+    fn bridge_format_follows_negotiated_codec() {
+        let opus = bridge_format(&media("opus", 48_000, 2, 111));
+        assert_eq!((opus.sample_rate, opus.channels), (48_000, 2));
+        assert_eq!(opus.frame_samples(), 960);
+        let pcmu = bridge_format(&media("PCMU", 8_000, 1, 0));
+        assert_eq!((pcmu.sample_rate, pcmu.channels), (8_000, 1));
+        assert_eq!(pcmu.frame_samples(), 160);
+        assert_eq!(bridge_format(&media("opus", 48_000, 0, 107)).channels, 1);
+    }
+
+    #[test]
+    fn codec_labels_are_readable() {
+        assert_eq!(codec_label(&media("opus", 48_000, 2, 107)), "Opus wideband");
+        assert_eq!(codec_label(&media("PCMU", 8_000, 1, 0)), "G.711 µ-law");
+        assert_eq!(codec_label(&media("PCMA", 8_000, 1, 8)), "G.711 A-law");
+    }
     #[test]
     fn device_selection_rejects_disconnected_input_and_output() {
         let devices = DeviceList {
