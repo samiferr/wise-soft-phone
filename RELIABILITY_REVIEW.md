@@ -94,3 +94,13 @@ The next live trace still sent ACK to private provider addresses, while BYE used
 Incoming calls now play a repeating tone on the selected output. Answer, decline, cancel, and disconnect silence it immediately. Answer waits briefly for speaker release before opening call audio. Tests cover cadence, stopping, and output release. A virtual ALSA test passed and produced nonzero PCM samples; it did not prove physical-speaker audibility.
 
 Final recorded results: native build, formatting, and application Clippy checks passed. The binary contains `ack-hostname-v3`. The default suite had 35 passed and 2 optional tests ignored. The virtual ringtone device test also passed. Live Twilio still needs a call with the rebuilt app; external PBX and audio-device tests remain optional.
+
+## Opus codec support
+
+Opus (PT 111, `opus/48000/2`) is now offered first, with G.711 as fallback; *G.711 only* restores the previous offer. [OPUS_PLAN.md](OPUS_PLAN.md) records the design and where it departed from the plan.
+
+Two hazards were found while reading the RVoIP 0.4.0 source. First, the encoder rejects any frame whose rate or channel count differs from the negotiated codec, and one rejected frame ends the call's send task. The upstream bridge always sent 8 kHz mono, so an Opus call would have had a silent microphone. Second, an Opus offer on Asterisk's usual PT 107 was answered with AMR-NB fmtp. Vendored patches to `rvoip-sip` and `rvoip-audio-device` fix both, and loopback tests in `src/codec_tests.rs` cover them.
+
+Recorded results: native build, `cargo fmt --check`, and application Clippy with warnings denied passed; libopus is linked statically. The default suite had 44 passed and 2 optional tests ignored in most runs, and the vendored bridge suite had 4 passed. `shutdown_while_incoming_call_rings_ends_peer` failed intermittently: 2 of 6 full runs on this branch and 5 of 8 on the commit before Opus. That makes it an existing race, not a regression. It passes when run alone.
+
+Still not verified: audible two-way Opus voice on physical devices, Asterisk `codec_opus` interop, Opus with TLS/SRTP, RFC 4733 DTMF alongside Opus, and codec changes by re-INVITE mid-call (not handled; the bridge keeps its initial format).

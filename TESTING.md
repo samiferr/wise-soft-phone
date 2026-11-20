@@ -9,7 +9,7 @@ cargo fmt --check
 
 Tests use local UDP sockets, so run them where local networking is permitted. SIP tests create local endpoints and a simulated provider. They do not call Twilio or the PSTN, use saved credentials, or open a microphone. Only these fixtures disable the phone actor's audio hardware startup.
 
-Latest recorded local result: **44 passed, 0 failed, 2 optional external-PBX/audio-device tests ignored**. `shutdown_while_incoming_call_rings_ends_peer` fails intermittently under full-suite load; see `RELIABILITY_REVIEW.md`.
+Latest recorded local result: **44 passed, 0 failed, 2 optional external-PBX/audio-device tests ignored**. `shutdown_while_incoming_call_rings_ends_peer` fails intermittently in full-suite runs, both on this branch and on the code before Opus; see `RELIABILITY_REVIEW.md`.
 
 The vendored audio bridge has its own unit tests: `cargo test --locked -p rvoip-audio-device --lib` (4 passed).
 
