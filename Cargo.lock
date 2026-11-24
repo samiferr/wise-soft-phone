@@ -129,6 +129,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys 0.6.0+11769913",
  "num_enum",
+ "simd_cesu8",
  "thiserror 2.0.21",
 ]
 
@@ -5462,15 +5463,20 @@ dependencies = [
 name = "softphone"
 version = "0.2.0"
 dependencies = [
+ "android-activity",
+ "chrono",
  "cpal",
  "dirs",
  "eframe",
+ "jni 0.21.1",
  "keyring",
+ "ndk-context",
  "rvoip-audio-device",
  "rvoip-sip",
  "rvoip-sip-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -10,9 +10,51 @@ use std::{
 };
 use tokio::runtime::Handle;
 
-const GREEN: Color32 = Color32::from_rgb(78, 210, 163);
-const RED: Color32 = Color32::from_rgb(239, 113, 122);
-const MUTED: Color32 = Color32::from_rgb(157, 173, 194);
+mod design;
+mod screens;
+use crate::library::{self, AddressBook, CallType, Contact};
+pub use design::PHONE_SIZE;
+use design::*;
+use std::path::PathBuf;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum Page {
+    #[default]
+    History,
+    Keypad,
+    Contacts,
+    Profile,
+    Settings,
+    AddContact,
+}
+
+impl Page {
+    fn title(self) -> &'static str {
+        match self {
+            Self::History => "Call history",
+            Self::Keypad => "Keypad",
+            Self::Contacts => "Contacts",
+            Self::Profile => "Profile",
+            Self::Settings => "Settings",
+            Self::AddContact => "New contact",
+        }
+    }
+}
+
+#[derive(Default)]
+struct Navigation {
+    page: Page,
+    drawer: bool,
+    searching: bool,
+    query: String,
+    filter: Option<CallType>,
+    book_path: Option<PathBuf>,
+    book: AddressBook,
+    draft: Contact,
+    profile_name: String,
+    profile_description: String,
+    signed_in: bool,
+}
 
 enum Completion {
     Action {
@@ -24,6 +66,8 @@ enum Completion {
 }
 
 pub struct SoftphoneApp {
+    account_path: PathBuf,
+    nav: Navigation,
     phone: Arc<PhoneHandle>,
     runtime: Handle,
     sender: mpsc::Sender<Completion>,
@@ -43,23 +87,22 @@ pub struct SoftphoneApp {
 }
 
 impl SoftphoneApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, phone: Arc<PhoneHandle>, runtime: Handle) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        phone: Arc<PhoneHandle>,
+        runtime: Handle,
+        account_path: PathBuf,
+    ) -> Self {
         let ctx = &cc.egui_ctx;
-        ctx.set_theme(egui::Theme::Dark);
-        let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.panel_fill = Color32::from_rgb(17, 26, 40);
-        style.visuals.window_fill = Color32::from_rgb(23, 35, 52);
-        style.visuals.selection.bg_fill = Color32::from_rgb(38, 103, 91);
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(12.0, 5.0);
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
-        ctx.set_style_of(egui::Theme::Dark, style);
+        configure(ctx);
+        let theme = library::load::<Option<bool>>(&account_path.with_file_name("appearance.json"));
+        if let Ok(Some(dark)) = theme {
+            ctx.set_theme(if dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            });
+        }
         let account = phone.status.borrow().account.clone();
         let (sender, replies) = mpsc::channel();
         // Wake even when minimized so incoming calls can request user attention.
@@ -72,6 +115,8 @@ impl SoftphoneApp {
         });
         let mut app = Self {
             phone,
+            account_path,
+            nav: Navigation::default(),
             runtime,
             sender,
             replies,
@@ -85,7 +130,7 @@ impl SoftphoneApp {
             closing: false,
             closed: false,
             ringing: false,
-            error: None,
+            error: theme.err(),
             connected: None,
         };
         app.scan(ctx);
@@ -143,88 +188,7 @@ impl SoftphoneApp {
         });
     }
 
-    fn account_panel(&mut self, ui: &mut egui::Ui, status: &Status) {
-        ui.heading("Your account");
-        ui.label(RichText::new("Voice over SIP").color(MUTED));
-        ui.add_space(12.0);
-        ui.add_enabled_ui(
-            status.registration == Registration::Offline && !self.pending && !self.closing,
-            |ui| {
-                field(
-                    ui,
-                    "SIP server",
-                    &mut self.account.registrar,
-                    "pbx.example.com:5060",
-                    false,
-                );
-                field(ui, "Username", &mut self.account.username, "1001", false);
-                field(
-                    ui,
-                    "Password",
-                    &mut self.password,
-                    if self.account.remember_password {
-                        "Use saved password"
-                    } else {
-                        "SIP password"
-                    },
-                    true,
-                );
-                ui.checkbox(
-                    &mut self.account.remember_password,
-                    "Remember in system keyring",
-                );
-                ui.collapsing("Connection options", |ui| {
-                    field(
-                        ui,
-                        "Authentication username",
-                        &mut self.account.auth_username,
-                        "Same as username",
-                        false,
-                    );
-                    field(
-                        ui,
-                        "Outbound proxy",
-                        &mut self.account.outbound_proxy,
-                        "Automatic for Twilio",
-                        false,
-                    );
-                    ui.checkbox(&mut self.account.secure, "TLS + required SRTP");
-                    ui.small("Secure mode requires a trusted PBX certificate.");
-                });
-            },
-        );
-        ui.add_space(8.0);
-        let offline = status.registration == Registration::Offline;
-        let label = if offline {
-            "Register account"
-        } else {
-            "Disconnect"
-        };
-        if ui
-            .add_enabled(
-                self.can_dispatch(!offline),
-                egui::Button::new(label).min_size(egui::vec2(ui.available_width(), 42.0)),
-            )
-            .clicked()
-        {
-            let action = if offline {
-                let password = if self.password.is_empty() {
-                    None
-                } else {
-                    Some(std::mem::take(&mut self.password))
-                };
-                Action::Register {
-                    account: self.account.clone(),
-                    password,
-                }
-            } else {
-                Action::Disconnect
-            };
-            self.dispatch(ui.ctx(), action);
-        }
-        ui.add_space(18.0);
-        ui.separator();
-        ui.heading("Audio devices");
+    fn audio_devices(&mut self, ui: &mut egui::Ui, status: &Status) {
         let mut input = status.audio.input.clone();
         let mut output = status.audio.output.clone();
         ui.add_enabled_ui(
@@ -250,12 +214,6 @@ impl SoftphoneApp {
         if input != status.audio.input || output != status.audio.output {
             self.dispatch(ui.ctx(), Action::SelectAudio { input, output });
         }
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Select devices between calls.\nOne account · One active call")
-                .small()
-                .color(MUTED),
-        );
     }
 
     fn call_controls(&mut self, ui: &mut egui::Ui, call: &crate::phone::CallStatus) -> egui::Rect {
@@ -267,7 +225,8 @@ impl SoftphoneApp {
                     if ui
                         .add_enabled(
                             available,
-                            egui::Button::new("Answer").fill(Color32::from_rgb(26, 105, 78)),
+                            egui::Button::new(RichText::new("Answer").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(26, 105, 78)),
                         )
                         .clicked()
                     {
@@ -294,11 +253,7 @@ impl SoftphoneApp {
                         && ui
                             .add_enabled(
                                 available,
-                                egui::Button::new(if call.muted {
-                                    "Unmute microphone"
-                                } else {
-                                    "Mute microphone"
-                                }),
+                                egui::Button::new(if call.muted { "Unmute" } else { "Mute" }),
                             )
                             .clicked()
                     {
@@ -312,11 +267,14 @@ impl SoftphoneApp {
                     }
                     let hangup = ui.add_enabled(
                         self.can_dispatch(true),
-                        egui::Button::new(if call.phase == CallPhase::Ending {
-                            "Disconnect now"
-                        } else {
-                            "Hang up"
-                        })
+                        egui::Button::new(
+                            RichText::new(if call.phase == CallPhase::Ending {
+                                "Disconnect now"
+                            } else {
+                                "Hang up"
+                            })
+                            .color(Color32::WHITE),
+                        )
                         .fill(Color32::from_rgb(139, 48, 60)),
                     );
                     hangup_rect = hangup.rect;
@@ -332,116 +290,6 @@ impl SoftphoneApp {
             });
         });
         hangup_rect
-    }
-
-    fn dialer(&mut self, ui: &mut egui::Ui, status: &Status) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(8.0);
-            let call = status.call.as_ref();
-            ui.label(
-                RichText::new(call.map_or("Ready when you are", |c| c.phase.label()))
-                    .size(25.0)
-                    .strong(),
-            );
-            if let Some(call) = call {
-                ui.add(
-                    egui::Label::new(RichText::new(&call.peer).size(20.0).color(GREEN)).truncate(),
-                );
-                if let Some((_, started)) = &self.connected {
-                    let seconds = started.elapsed().as_secs();
-                    ui.label(
-                        RichText::new(format!("{:02}:{:02}", seconds / 60, seconds % 60))
-                            .monospace()
-                            .color(MUTED),
-                    );
-                } else {
-                    ui.label(" ");
-                }
-            } else {
-                ui.label(RichText::new("Dial an extension or SIP address").color(MUTED));
-                ui.label(" ");
-            }
-            ui.add_space(14.0);
-            let response = ui.add_enabled(
-                call.is_none() && !self.closing,
-                egui::TextEdit::singleline(&mut self.target)
-                    .hint_text("Number or sip:user@server")
-                    .font(egui::TextStyle::Heading)
-                    .desired_width(360.0),
-            );
-            let dial =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            ui.add_space(12.0);
-            let connected = call.is_some_and(|c| c.phase == CallPhase::Connected);
-            ui.add_enabled_ui(
-                !self.pending && !self.closing && (call.is_none() || connected),
-                |ui| {
-                    for row in [
-                        ["1", "2", "3"],
-                        ["4", "5", "6"],
-                        ["7", "8", "9"],
-                        ["*", "0", "#"],
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.add_space(((ui.available_width() - 314.0) / 2.0).max(0.0));
-                            for digit in row {
-                                if ui
-                                    .add_sized(
-                                        [98.0, 52.0],
-                                        egui::Button::new(RichText::new(digit).size(24.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    if let Some(call) = call {
-                                        self.dispatch(
-                                            ui.ctx(),
-                                            Action::SendDtmf {
-                                                call_id: call.id.clone(),
-                                                digit: digit.chars().next().unwrap(),
-                                            },
-                                        );
-                                    } else {
-                                        self.target.push_str(digit);
-                                    }
-                                }
-                            }
-                        });
-                    }
-                },
-            );
-            ui.add_space(14.0);
-            let available = !self.pending && !self.closing;
-            if call.is_none() {
-                let can_dial = available
-                    && status.registration == Registration::Registered
-                    && !self.target.trim().is_empty();
-                let clicked = ui
-                    .add_enabled(
-                        can_dial,
-                        egui::Button::new(RichText::new("Call").strong())
-                            .fill(Color32::from_rgb(26, 105, 78))
-                            .min_size(egui::vec2(314.0, 46.0)),
-                    )
-                    .clicked();
-                if can_dial && (clicked || dial) {
-                    self.dispatch(
-                        ui.ctx(),
-                        Action::Dial {
-                            target: self.target.clone(),
-                        },
-                    );
-                }
-                if ui
-                    .add_enabled(
-                        available && !self.target.is_empty(),
-                        egui::Button::new("Clear number"),
-                    )
-                    .clicked()
-                {
-                    self.target.clear();
-                }
-            }
-        });
     }
 }
 
@@ -516,85 +364,8 @@ impl eframe::App for SoftphoneApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let status = self.phone.status.borrow().clone();
-        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-            && let Some(call) = &status.call
-        {
-            let action = if call.phase == CallPhase::Incoming {
-                Action::Decline {
-                    call_id: call.id.clone(),
-                }
-            } else {
-                Action::HangUp {
-                    call_id: call.id.clone(),
-                }
-            };
-            self.dispatch(ui.ctx(), action);
-        }
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("SOFTPHONE").size(27.0).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (label, color) = match status.registration {
-                        Registration::Offline => ("Offline", MUTED),
-                        Registration::Registering => ("Registering…", MUTED),
-                        Registration::Registered => ("Registered", GREEN),
-                        Registration::Failed => ("Registration failed", RED),
-                    };
-                    ui.label(RichText::new(label).color(color).strong());
-                    if self.pending {
-                        ui.spinner();
-                    }
-                });
-            });
-            ui.add_space(12.0);
-            ui.separator();
-            if self.closing {
-                ui.label("Ending calls and disconnecting…");
-            }
-            if let Some(error) = self.error.as_ref().or(status.registration_error.as_ref()) {
-                ui.colored_label(RED, error);
-            }
-            if let Some(notice) = &status.notice {
-                ui.label(notice);
-            }
-            if let Some(call) = &status.call {
-                self.call_controls(ui, call);
-                ui.separator();
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(300.0, 540.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| self.account_panel(ui, &status),
-                    );
-                    ui.add_space(12.0);
-                    ui.vertical(|ui| self.dialer(ui, &status));
-                });
-                ui.separator();
-                ui.label(
-                    RichText::new(if self.account.secure {
-                        "TLS signaling · SRTP voice · G.711"
-                    } else {
-                        "UDP signaling · RTP voice · G.711"
-                    })
-                    .small()
-                    .color(MUTED),
-                );
-            });
-        });
+        self.show(ui, &status);
     }
-}
-
-fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, password: bool) {
-    ui.label(label);
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .hint_text(hint)
-            .password(password)
-            .desired_width(f32::INFINITY),
-    );
 }
 
 fn device_picker(
@@ -605,12 +376,21 @@ fn device_picker(
 ) {
     ui.label(label);
     egui::ComboBox::from_id_salt(label)
-        .width(280.0)
+        .width(ui.available_width())
+        .truncate()
         .selected_text(selected.as_deref().unwrap_or("System default"))
         .show_ui(ui, |ui| {
             ui.selectable_value(selected, None, "System default");
             for device in devices {
-                ui.selectable_value(selected, Some(device.clone()), device);
+                if ui
+                    .add(
+                        egui::Button::selectable(selected.as_ref() == Some(device), device)
+                            .truncate(),
+                    )
+                    .clicked()
+                {
+                    *selected = Some(device.clone());
+                }
             }
         });
 }
@@ -618,15 +398,106 @@ fn device_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[tokio::test]
-    async fn hangup_can_be_submitted_while_another_operation_is_pending() {
-        let phone = Arc::new(PhoneHandle::start(
-            std::env::temp_dir().join("softphone-ui-test/account.json"),
-        ));
+    async fn history_drawer_and_tabs_work_inside_a_large_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path().join("account.json"));
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut status = app.phone.status.borrow().clone();
+        status.account.username = "1001".into();
+        status.account.registrar = "example.test".into();
+        status.registration = Registration::Registered;
+        status.history = Arc::new(vec![library::Record {
+            peer: "Test caller".into(),
+            target: Some("1002".into()),
+            kind: CallType::Incoming,
+            timestamp: chrono::Local::now().timestamp(),
+            seconds: Some(31),
+        }]);
+        let desktop = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 720.));
+        let phone = egui::Rect::from_center_size(desktop.center(), PHONE_SIZE);
+        let mut time = 0.;
+        let mut frame = |app: &mut SoftphoneApp, events| {
+            time += 0.25;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(desktop),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show(ui, &status),
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| {
+                    let egui::Shape::Text(text) = shape.shape else {
+                        return None;
+                    };
+                    let center = text.visual_bounding_rect().center();
+                    shape
+                        .clip_rect
+                        .contains(center)
+                        .then(|| (text.galley.text().to_owned(), center))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let click = |pos| {
+            [true, false].map(|pressed| {
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ]
+            })
+        };
+        frame(&mut app, vec![]);
+        let labels = frame(&mut app, vec![]);
+        assert_eq!(app.nav.page, Page::History);
+        assert!(labels.values().all(|pos| phone.contains(*pos)));
+        for events in click(labels["Missed"]) {
+            frame(&mut app, events);
+        }
+        assert_eq!(app.nav.filter, Some(CallType::Missed));
+        let labels = frame(&mut app, vec![]);
+        assert!(labels.contains_key("No matching calls"));
+        for events in click(labels["All"]) {
+            frame(&mut app, events);
+        }
+        let labels = frame(&mut app, vec![]);
+        for events in click(labels["Test caller"]) {
+            frame(&mut app, events);
+        }
+        assert_eq!(app.nav.page, Page::Keypad);
+        assert_eq!(app.target, "1002");
+        for events in click(phone.min + egui::vec2(34., 27.)) {
+            frame(&mut app, events);
+        }
+        frame(&mut app, vec![]);
+        let labels = frame(&mut app, vec![]);
+        assert!(app.nav.drawer);
+        for events in click(labels["Profile"]) {
+            frame(&mut app, events);
+        }
+        assert_eq!(app.nav.page, Page::Profile);
+        assert!(!app.nav.drawer);
+        app.phone.shutdown().await;
+    }
+
+    fn test_app(account_path: PathBuf) -> SoftphoneApp {
+        let phone = Arc::new(PhoneHandle::start(account_path.clone()));
         let (sender, replies) = mpsc::channel();
-        let mut app = SoftphoneApp {
-            phone: phone.clone(),
+        SoftphoneApp {
+            phone,
+            account_path,
+            nav: Navigation::default(),
             runtime: Handle::current(),
             sender,
             replies,
@@ -635,14 +506,22 @@ mod tests {
             target: String::new(),
             devices: DeviceList::default(),
             scanning: false,
-            pending: true,
+            pending: false,
             hangup_pending: false,
             closing: false,
             closed: false,
             ringing: false,
             error: None,
             connected: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn hangup_can_be_submitted_while_another_operation_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path().join("account.json"));
+        let phone = app.phone.clone();
+        app.pending = true;
         assert!(!app.can_dispatch(false));
         assert!(app.can_dispatch(true));
         let ctx = egui::Context::default();

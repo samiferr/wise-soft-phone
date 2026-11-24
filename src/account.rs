@@ -11,8 +11,6 @@ use tokio::time::timeout;
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
-const KEYRING_SERVICE: &str = "com.softphone.desktop";
-
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Account {
@@ -105,16 +103,12 @@ impl Account {
         let previous = Self::load(path)?;
         let saved =
             previous.remember_password && previous.credential_name() == self.credential_name();
-        let entry = || {
-            keyring::v1::Entry::new(KEYRING_SERVICE, &self.credential_name())
-                .map_err(|_| "The system credential store is unavailable.".to_owned())
-        };
-
         let password = match password.filter(|password| !password.is_empty()) {
             Some(password) => password,
-            None if self.remember_password && saved => entry()?
-                .get_password()
-                .map_err(|_| "Could not read the saved password. Enter it again.".to_owned())?,
+            None if self.remember_password && saved => {
+                crate::credentials::get(&self.credential_name())
+                    .map_err(|_| "Could not read the saved password. Enter it again.".to_owned())?
+            }
             None => return Err("Enter the SIP password.".into()),
         };
 
@@ -126,18 +120,13 @@ impl Account {
         // A full transaction spanning a filesystem and Secret Service is not available.
         let staged = StagedSettings::new(path, &self)?;
         if self.remember_password {
-            entry()?.set_password(&password).map_err(|_| {
+            crate::credentials::set(&self.credential_name(), &password).map_err(|_| {
                 "Could not save the SIP password in the system credential store.".to_owned()
             })?;
         }
         if previous.remember_password && (!saved || !self.remember_password) {
-            let previous_entry =
-                keyring::v1::Entry::new(KEYRING_SERVICE, &previous.credential_name())
-                    .map_err(|_| "The system credential store is unavailable.".to_owned())?;
-            match previous_entry.delete_credential() {
-                Ok(()) | Err(keyring::v1::Error::NoEntry) => {}
-                Err(_) => return Err("Could not remove the previous saved SIP password.".into()),
-            }
+            crate::credentials::remove(&previous.credential_name())
+                .map_err(|_| "Could not remove the previous saved SIP password.".to_owned())?;
         }
 
         fs::rename(&staged.0, path).map_err(

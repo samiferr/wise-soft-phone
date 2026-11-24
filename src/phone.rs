@@ -16,6 +16,7 @@ use tokio::time::{Instant, interval, timeout};
 
 use crate::account::Account;
 use crate::audio::{AudioSelection, CallAudio, DeviceList};
+use crate::library::{self, CallLog, Record};
 use crate::ringer::Ringer;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -82,6 +83,7 @@ pub struct Status {
     pub account: Account,
     pub registration: Registration,
     pub registration_error: Option<String>,
+    pub history: Arc<Vec<Record>>,
     pub call: Option<CallStatus>,
     pub audio: AudioSelection,
     pub notice: Option<String>,
@@ -215,6 +217,7 @@ impl PhoneHandle {
             account,
             registration: Registration::Offline,
             registration_error: None,
+            history: Default::default(),
             call: None,
             audio: AudioSelection::default(),
             notice,
@@ -224,6 +227,8 @@ impl PhoneHandle {
         tokio::spawn(
             Phone {
                 account_path: path,
+                log: None,
+                history_path: None,
                 link: None,
                 call: None,
                 teardown: None,
@@ -263,6 +268,8 @@ impl PhoneHandle {
 }
 
 struct Phone {
+    log: Option<CallLog>,
+    history_path: Option<PathBuf>,
     account_path: PathBuf,
     link: Option<Link>,
     call: Option<Call>,
@@ -353,8 +360,26 @@ impl Phone {
         {
             tracing::debug!(previous = ?self.status.call.as_ref().map(|c| c.phase), next = ?call.as_ref().map(|c| c.phase), call_id = ?call.as_ref().map(|c| &c.id), "Call state changed");
         }
+        if call.is_none()
+            && let Some(log) = self.log.take()
+        {
+            self.record(log);
+        }
         self.status.call = call;
         self.publish.send_replace(self.status.clone());
+    }
+
+    fn record(&mut self, log: CallLog) {
+        let history = Arc::make_mut(&mut self.status.history);
+        let record = log.finish();
+        let index = history.partition_point(|other| other.timestamp > record.timestamp);
+        history.insert(index, record);
+        history.truncate(500);
+        if let Some(path) = &self.history_path
+            && let Err(error) = library::save(path, history)
+        {
+            self.status.notice = Some(error);
+        }
     }
 
     async fn perform(&mut self, action: Action) -> Result<(), String> {
@@ -487,6 +512,19 @@ impl Phone {
         .map_err(|_| "The credential store timed out. Unlock it and try again.")?
         .map_err(|_| "Could not load SIP credentials.")??;
         self.status.account = account.clone();
+        let history_path =
+            library::line_directory(&self.account_path, &account).join("history.json");
+        self.history_path = None;
+        self.status.history = Arc::new(match library::load(&history_path) {
+            Ok(history) => {
+                self.history_path = Some(history_path);
+                history
+            }
+            Err(error) => {
+                self.status.notice = Some(error);
+                Vec::new()
+            }
+        });
 
         let endpoint = timeout(ACTION_TIMEOUT + ACTION_TIMEOUT, account.endpoint(password))
             .await
@@ -572,6 +610,7 @@ impl Phone {
                 return Err("Starting the call failed. Register again to reconnect.".into());
             }
         };
+        self.log = Some(CallLog::new(target.into(), Some(target.into()), false));
         self.call = Some(Call::Outgoing {
             call: link.control.wrap_call(call_id),
             peer: target.into(),
@@ -627,6 +666,9 @@ impl Phone {
     }
 
     async fn attach_audio(&mut self, call: EndpointCall, peer: String) {
+        if let Some(log) = &mut self.log {
+            log.answer();
+        }
         self.watch_call_end(&call);
         let muted = Arc::new(AtomicBool::new(false));
         self.status.notice = None;
@@ -666,6 +708,9 @@ impl Phone {
         let Some(current) = self.call.take() else {
             return;
         };
+        if let Some(log) = &mut self.log {
+            log.stop_timer();
+        }
         let id = current.id();
         let peer = current.status().peer;
         let call = match current {
@@ -730,10 +775,15 @@ impl Phone {
         let active = self.call.as_ref().map(Call::id);
         match event {
             EndpointEvent::IncomingCall(incoming) => {
+                let (name, target) = caller_identity(incoming.from());
+                let log = CallLog::new(name, target, true);
                 if self.call.is_some() {
+                    self.record(log);
+                    self.update();
                     let _ = timeout(ACTION_TIMEOUT, incoming.busy()).await;
                     return;
                 }
+                self.log = Some(log);
                 self.call = Some(Call::Incoming(incoming));
                 self.status.notice = None;
                 tracing::info!("Incoming call ringing");
@@ -925,30 +975,38 @@ async fn next_event(link: &mut Option<Link>) -> Option<EndpointEvent> {
 }
 
 fn caller_label(from: &str) -> String {
+    caller_identity(from).0
+}
+
+fn caller_identity(from: &str) -> (String, Option<String>) {
     // FromStr on SipFrom parses an address only and rejects a trailing SIP tag.
     let Ok((remaining, SipFrom(address))) =
         rvoip_sip_core::parser::headers::parse_from(from.trim().as_bytes())
     else {
-        return "Unknown caller".into();
+        return ("Unknown caller".into(), None);
     };
     if !remaining.is_empty() {
-        return "Unknown caller".into();
-    }
-    if let Some(name) = address.display_name.filter(|name| !name.trim().is_empty()) {
-        return name
-            .chars()
-            .filter(|character| !character.is_control())
-            .take(128)
-            .collect();
+        return ("Unknown caller".into(), None);
     }
     let mut uri = address.uri;
     uri.password = None;
     uri.parameters.clear();
     uri.headers.clear();
-    uri.to_string()
+    let target = uri.to_string();
+    let name = address
+        .display_name
+        .map(|s| {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(128)
+                .collect::<String>()
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| target.clone());
+    (name, Some(target))
 }
 
-fn validate_target(target: &str, secure: bool) -> Result<(), String> {
+pub(crate) fn validate_target(target: &str, secure: bool) -> Result<(), String> {
     let address = target
         .strip_prefix("sip:")
         .or_else(|| target.strip_prefix("sips:"))
@@ -1312,6 +1370,7 @@ mod hangup_tests {
             account: Account::default(),
             registration: Registration::Registered,
             registration_error: None,
+            history: Default::default(),
             call: None,
             audio: AudioSelection::default(),
             notice: None,
@@ -1319,6 +1378,8 @@ mod hangup_tests {
         let (publish, _receive) = watch::channel(status.clone());
         let mut phone = Phone {
             account_path: PathBuf::new(),
+            log: None,
+            history_path: None,
             link: Some(Link {
                 control,
                 events,

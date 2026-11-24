@@ -64,10 +64,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
     }
 }
 
-pub fn init() {
+pub fn init(default_directory: PathBuf) {
     let directory = std::env::var_os("SOFTPHONE_LOG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("logs"));
+        .unwrap_or(default_directory);
     let path = directory.join("softphone.log");
     // Only opt in to application-owned fields. Upstream wire logs can contain
     // credentials, so broad RUST_LOG settings are deliberately not applied.
@@ -84,7 +84,7 @@ pub fn init() {
             None
         }
     };
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
@@ -95,7 +95,7 @@ pub fn init() {
                 ),
         )
         .with(file_layer)
-        .init();
+        .try_init();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), routing_revision = "ack-hostname-v3", log_path = %path.display(), "Softphone session started");
 }
 

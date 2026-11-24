@@ -38,6 +38,7 @@ impl Pair {
             account: Account::default(),
             registration: Registration::Registered,
             registration_error: None,
+            history: Default::default(),
             call: None,
             audio: AudioSelection::default(),
             notice: None,
@@ -47,6 +48,8 @@ impl Pair {
         let actor = tokio::spawn(
             Phone {
                 account_path: PathBuf::new(),
+                log: None,
+                history_path: None,
                 link: Some(Link {
                     control,
                     events,
@@ -139,13 +142,18 @@ impl Pair {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outgoing_remote_hangup_clears_actor_and_allows_another_call() {
     let mut pair = Pair::new().await;
-    for _ in 0..3 {
+    for count in 1..=3 {
         let (_, remote) = pair.outgoing().await;
         remote
             .hangup_and_wait(Some(Duration::from_secs(2)))
             .await
             .unwrap();
-        pair.wait(|s| s.call.is_none()).await;
+        let finished = pair.wait(|s| s.call.is_none()).await;
+        assert_eq!(finished.history.len(), count);
+        let row = &finished.history[0];
+        assert_eq!(row.kind, library::CallType::Outgoing);
+        assert_eq!(row.target.as_ref(), Some(&pair.remote_target));
+        assert!(row.seconds.is_some());
     }
     pair.close().await;
 }
@@ -281,6 +289,13 @@ async fn incoming_decline_and_remote_cancellation_clear_ringing() {
         .await
         .unwrap();
     pair.wait(|s| s.call.is_none()).await;
+    let history = pair.phone.status.borrow().history.clone();
+    assert_eq!(history.len(), 2);
+    assert!(
+        history
+            .iter()
+            .all(|row| row.kind == library::CallType::Missed && row.seconds.is_none())
+    );
     pair.close().await;
 }
 
@@ -312,7 +327,9 @@ async fn incoming_answer_can_end_from_either_side() {
                 .await
                 .unwrap();
         }
-        pair.wait(|s| s.call.is_none()).await;
+        let ended = pair.wait(|s| s.call.is_none()).await;
+        assert_eq!(ended.history[0].kind, library::CallType::Incoming);
+        assert!(ended.history[0].seconds.is_some());
         remote
             .wait_for_end(Some(Duration::from_secs(2)))
             .await
@@ -558,6 +575,7 @@ async fn direct_phone() -> (Phone, Endpoint) {
         account: Account::default(),
         registration: Registration::Registered,
         registration_error: None,
+        history: Default::default(),
         call: None,
         audio: AudioSelection::default(),
         notice: None,
@@ -566,6 +584,8 @@ async fn direct_phone() -> (Phone, Endpoint) {
     (
         Phone {
             account_path: PathBuf::new(),
+            log: None,
+            history_path: None,
             link: Some(Link {
                 control,
                 events,

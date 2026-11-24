@@ -4,3 +4,9 @@
 
 /vendor/**/.cargo-ok
 /vendor/**/.cargo_vcs_info.json
+
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/.android-signing/

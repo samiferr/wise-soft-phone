@@ -24,12 +24,27 @@ cargo build --locked --release
 
 Cargo builds the whole app from `src/` and the root `Cargo.toml`. No JavaScript, webview, Tauri CLI, or Node tools are needed.
 
+## Android APK
+
+The ARM64 distribution runs on Android 9 or later. Open the APK on the phone and allow microphone access for calls. Keep the app open to receive incoming calls. Android may suspend the SIP connection in the background.
+
+To rebuild on Linux or macOS, install JDK 17, Android SDK Platform 35, Build Tools 35.0.1, and NDK r28c. Set `JAVA_HOME`, `ANDROID_HOME`, and `ANDROID_NDK_HOME` to those installations. From the repository root, run:
+
+```sh
+rustup target add aarch64-linux-android
+android/package-apk.sh
+```
+
+The script builds and verifies `dist/wise-softphone-0.2.0-arm64-v8a.apk`. It creates the signing key and password in the private, Git-ignored `.android-signing/` directory on the first build. Back up that directory securely to sign subsequent updates with the same identity. Saved SIP passwords on Android use an Android Keystore key.
+
 ## Connect to a PBX
 
 1. Enter the server hostname or IPv4 address, SIP username, and password. Append `:port` for a custom server port.
 2. Under **Connection options**, enter a separate authentication username if required. Select **TLS + required SRTP** for a compatible secure PBX. Default ports are UDP 5060 and TLS 5061. Secure mode validates the server certificate against the system trust store and requires SDES-SRTP.
-3. Choose **Register account**. Once registered, dial an extension or `sip:1002@pbx.example.com`.
-4. Use **Answer**, **Decline**, **Hang up**, and **Mute microphone** as appropriate. During a connected call, the keypad sends DTMF. Microphone and speaker selection is available between calls.
+3. Choose **Sign In**. History opens when registration succeeds. Open **Keypad** to dial an extension or `sip:1002@pbx.example.com`.
+4. Use **Answer**, **Decline**, **Hang up**, and **Mute** as appropriate. During a connected call, the keypad sends DTMF. Choose your microphone and speaker between calls under **Menu → Settings**.
+
+The phone-sized window supports light and dark appearances. Search or filter recent calls in **History**. Selecting a call or a saved contact fills the keypad. Press **Call** to place the call. **Menu → Profile** lets you edit your display name and description or log out. The latest 500 calls, contacts, and profile are stored locally per SIP account.
 
 The app supports one account and one call. RVoIP refreshes registration. After a connection failure, register again. If registration fails while the endpoint is still open, choose **Disconnect** first. Calls are not redialed automatically.
 
