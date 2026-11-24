@@ -6,6 +6,7 @@ mod credentials;
 mod diagnostics;
 mod library;
 mod phone;
+mod recording;
 mod ringer;
 mod ui;
 

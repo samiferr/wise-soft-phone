@@ -60,6 +60,8 @@ pub struct Record {
     pub kind: CallType,
     pub timestamp: i64,
     pub seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<String>,
 }
 
 pub struct CallLog {
@@ -80,6 +82,7 @@ impl CallLog {
                 },
                 timestamp: Local::now().timestamp(),
                 seconds: None,
+                recording: None,
             },
             connected: None,
         }
@@ -101,6 +104,10 @@ impl CallLog {
     pub fn finish(mut self) -> Record {
         self.stop_timer();
         self.record
+    }
+
+    pub fn set_recording(&mut self, filename: String) {
+        self.record.recording = Some(filename);
     }
 }
 

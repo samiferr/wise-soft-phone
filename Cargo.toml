@@ -12,6 +12,7 @@ crate-type = ["rlib", "cdylib"]
 eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow"] }
 dirs = "6"
 chrono = "0.4"
+hound = "3.5"
 tempfile = "3"
 cpal = "0.15.3"
 rvoip-audio-device = "=0.4.0"
@@ -42,5 +43,7 @@ strip = "debuginfo"
 strip = "symbols"
 
 [patch.crates-io]
+# Tap decoded PCM without opening another microphone or speaker stream.
+rvoip-audio-device = { path = "vendor/rvoip-audio-device" }
 # Preserve outbound-proxy routing for ACK/BYE with private provider Contacts.
 rvoip-sip-dialog = { path = "vendor/rvoip-sip-dialog" }

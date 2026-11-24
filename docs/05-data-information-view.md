@@ -26,6 +26,7 @@ flowchart TB
 flowchart LR
     Stack[SIP/media stack memory] --> Call[Call and Status snapshots]
     Stack <--> PCM[Temporary PCM / RTP media]
+    PCM -->|Recording enabled| WAV[Local stereo WAV]
 ```
 
 ### Diagnostic records
@@ -37,7 +38,7 @@ flowchart TB
     Filter --> Log[Rotating local logs]
 ```
 
-The app saves account settings but does not keep a database, contact list, call history, or recordings. Call state and voice samples exist only in memory. The provider keeps its own records under its own policies.
+The app saves account settings, contacts, and call history in local files. When recording is enabled, it saves the local and remote audio in separate channels of a WAV file. The provider keeps its own records under its own policies.
 
 ## Account file schema
 
@@ -81,15 +82,15 @@ A mutex allows one settings save at a time within the process. The app writes JS
 | --- | --- | --- |
 | `Action` | Request until handled | Operation plus parameters; call controls include current call ID |
 | `Status` | Actor; latest UI snapshot | Account, registration/error, optional call, audio choices, notice |
-| `CallStatus` | Snapshot | Internal ID, sanitized peer label, phase, mute flag |
+| `CallStatus` | Snapshot | Internal ID, sanitized peer label, phase, mute and recording flags |
 | `Call` | Actor until terminal/reset | Incoming handle, outgoing/connected handle, or ending identity/deadline |
 | Audio selection | In-memory status | Optional exact input/output device names; defaults use system devices |
-| Mute / heartbeat | Connected audio owner | Atomic flag and elapsed-time heartbeat; no captured audio persisted |
+| Mute / heartbeat | Connected audio owner | Atomic flag and elapsed-time heartbeat |
 | Ringtone state | Incoming-call owner | Stop signal, active/failure flags, output-release completion |
 | Display duration | UI memory | Elapsed time since observed connection; not provider billing duration |
 | Media/security material | SIP/media stack memory | Negotiated addresses, PCM packets, SDP/SRTP parameters; excluded from application logs |
 
-Audio selections and call duration are not saved. The app refreshes device names and rejects unavailable selections. Caller labels come from SIP From, with URI passwords and routing details removed and length limited. This cleanup does not verify the caller's identity.
+Audio selections apply to the current app session. The app refreshes device names and rejects unavailable selections. Caller labels come from SIP From, with URI passwords and routing details removed and length limited.
 
 ## Diagnostic data and retention
 
@@ -99,7 +100,9 @@ Audio selections and call duration are not saved. The app refreshes device names
 | `logs/softphone.log.1` | Previous rotated file | One retained predecessor; later rotation replaces it |
 | OS keyring | Optional SIP password | OS-controlled; app removes a previous credential when identity/persistence changes as applicable |
 | Account JSON | Non-secret settings | Until replaced or removed by the user/operator |
-| Media and call state | In-process objects | Released on call termination/disconnect; no durable media/call-history store |
+| Call history | Recent call metadata and recording filenames | Latest 500 calls per SIP account |
+| `recordings/` | WAV audio from connected calls while recording is enabled | Files remain on the device until removed |
+| Media and call state | In-process objects | Released on call termination or disconnect |
 
 Logs default to the project path saved at build time (`CARGO_MANIFEST_DIR`), regardless of the launch directory. Use `SOFTPHONE_LOG_DIR` to choose a writable location. Logs rotate by size, not age. Individual writes and errors mean rotation is not a strict 10 MiB total limit.
 

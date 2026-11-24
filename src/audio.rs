@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait};
 use rvoip_audio_device::{AudioDirection, DeviceBridge, DeviceOptions, RunningAudio};
 use rvoip_sip::{AudioSender, EndpointCall};
+use std::path::Path;
+
+use crate::recording::Recording;
 
 #[derive(Clone, Default)]
 pub struct AudioSelection {
@@ -86,6 +89,7 @@ pub struct CallAudio {
     heartbeat: Arc<AtomicU64>,
     sender: AudioSender,
     started: Instant,
+    pub recording: Option<Recording>,
 }
 
 impl CallAudio {
@@ -108,7 +112,8 @@ impl CallAudio {
         call: &EndpointCall,
         selected: &AudioSelection,
         muted: Arc<AtomicBool>,
-    ) -> Result<Self, String> {
+        recordings: Option<&Path>,
+    ) -> Result<(Self, Option<String>), String> {
         let selected = selected.clone();
         let (input, output) = tokio::task::spawn_blocking(move || {
             Ok::<_, String>((
@@ -147,15 +152,27 @@ impl CallAudio {
         if let Some(output) = output {
             options = options.with_output_device(output);
         }
+        let (recording, warning) = match recordings.map(Recording::start).transpose() {
+            Ok(Some((recording, sink))) => {
+                options = options.with_frame_callback(sink);
+                (Some(recording), None)
+            }
+            Ok(None) => (None, None),
+            Err(error) => (None, Some(error)),
+        };
         let sender = stream.sender.clone();
         let bridge = DeviceBridge::start(stream, options)
             .map_err(|_| "Could not start the microphone and speaker.")?;
-        Ok(Self {
-            _bridge: bridge,
-            heartbeat,
-            sender,
-            started,
-        })
+        Ok((
+            Self {
+                _bridge: bridge,
+                heartbeat,
+                sender,
+                started,
+                recording,
+            },
+            warning,
+        ))
     }
 }
 

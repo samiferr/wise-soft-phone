@@ -1,10 +1,15 @@
 package com.wise.softphone;
 
 import android.app.Application;
+import android.content.ClipData;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
+import androidx.core.content.FileProvider;
+import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import javax.crypto.Cipher;
@@ -15,6 +20,17 @@ import android.util.Base64;
 
 public final class WiseApplication extends Application {
     private static final String KEY_ALIAS = "wise.softphone.sip";
+
+    public void shareRecording(String path) {
+        Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".recordings", new File(path));
+        Intent share = new Intent(Intent.ACTION_SEND)
+            .setType("audio/wav")
+            .putExtra(Intent.EXTRA_STREAM, uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        share.setClipData(ClipData.newRawUri("Call recording", uri));
+        startActivity(Intent.createChooser(share, "Share recording")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+    }
 
     // Called by the Rust credential worker. Only ciphertext and the IV go into app storage.
     private SharedPreferences credentials() { return getSharedPreferences("sip", Context.MODE_PRIVATE); }

@@ -180,6 +180,9 @@ impl SoftphoneApp {
             if let Some((_, start)) = &self.connected {
                 caption(&mut body_ui, &duration(start.elapsed().as_secs()));
             }
+            if call.recording {
+                body_ui.label(RichText::new("● Recording").color(c.danger));
+            }
             self.call_controls(&mut body_ui, call);
             body_ui.add_space(8.);
         }
@@ -265,6 +268,7 @@ impl SoftphoneApp {
                 c.danger,
             ),
             (status.notice.as_deref(), c.muted),
+            (status.recording_error.as_deref(), c.danger),
         ] {
             if let Some(text) = message {
                 ui.label(RichText::new(text).size(13.).color(color));
@@ -655,6 +659,20 @@ impl SoftphoneApp {
             {
                 destination = Some(target.to_owned());
             }
+            if let Some(filename) = &record.recording {
+                let label = if cfg!(target_os = "android") {
+                    "Share recording"
+                } else {
+                    "Open recording"
+                };
+                if ui.small_button(label).clicked() {
+                    self.error = crate::recording::open(
+                        &self.account_path.with_file_name("recordings"),
+                        filename,
+                    )
+                    .err();
+                }
+            }
         }
         if !any {
             let empty = status.history.is_empty();
@@ -959,6 +977,19 @@ impl SoftphoneApp {
         ui.add_space(6.);
         ui.label(RichText::new("Audio devices").size(17.).family(semibold()));
         self.audio_devices(ui, status);
+        ui.add_space(12.);
+        ui.separator();
+        let mut record_calls = status.record_calls;
+        if ui
+            .add_enabled(
+                self.can_dispatch(false),
+                egui::Checkbox::new(&mut record_calls, "Record calls automatically"),
+            )
+            .changed()
+        {
+            self.dispatch(ui.ctx(), Action::SetCallRecording(record_calls));
+        }
+        caption(ui, "Saves both sides of connected calls to this device.");
         ui.add_space(12.);
         ui.separator();
         caption(

@@ -48,6 +48,7 @@ pub enum Action {
         call_id: String,
         digit: char,
     },
+    SetCallRecording(bool),
     SelectAudio {
         input: Option<String>,
         output: Option<String>,
@@ -65,6 +66,7 @@ impl Action {
             Self::HangUp { .. } => "hang_up",
             Self::SetMute { .. } => "set_mute",
             Self::SendDtmf { .. } => "send_dtmf",
+            Self::SetCallRecording(_) => "set_call_recording",
             Self::SelectAudio { .. } => "select_audio",
         }
     }
@@ -87,6 +89,8 @@ pub struct Status {
     pub call: Option<CallStatus>,
     pub audio: AudioSelection,
     pub notice: Option<String>,
+    pub record_calls: bool,
+    pub recording_error: Option<String>,
 }
 
 impl Status {
@@ -123,6 +127,7 @@ pub struct CallStatus {
     pub peer: String,
     pub phase: CallPhase,
     pub muted: bool,
+    pub recording: bool,
 }
 
 enum Call {
@@ -164,6 +169,7 @@ impl Call {
                     peer: caller_label(incoming.from()),
                     phase: CallPhase::Incoming,
                     muted: false,
+                    recording: false,
                 };
             }
             Self::Outgoing { peer, ringing, .. } => (
@@ -187,6 +193,8 @@ impl Call {
             peer: peer.into(),
             phase,
             muted,
+            recording: matches!(self, Self::Connected { audio: Some(audio), .. }
+                if audio.recording.as_ref().is_some_and(|recording| !recording.failed())),
         }
     }
 }
@@ -213,6 +221,11 @@ impl PhoneHandle {
             Ok(account) => (account, None),
             Err(err) => (Account::default(), Some(err)),
         };
+        let recording_setting = library::load::<bool>(&path.with_file_name("call-recording.json"));
+        let (record_calls, recording_error) = match recording_setting {
+            Ok(enabled) => (enabled, None),
+            Err(error) => (false, Some(error)),
+        };
         let status = Status {
             account,
             registration: Registration::Offline,
@@ -221,6 +234,8 @@ impl PhoneHandle {
             call: None,
             audio: AudioSelection::default(),
             notice,
+            record_calls,
+            recording_error,
         };
         let (publish, receive) = watch::channel(status.clone());
         let (requests, inbox) = mpsc::channel(16);
@@ -436,6 +451,18 @@ impl Phone {
                     .map_err(|_| "Sending the keypad tone timed out.")?
                     .map_err(|_| "The peer did not negotiate keypad tones.".into())
             }
+            Action::SetCallRecording(enabled) => {
+                if self.call.is_some() {
+                    return Err("Change call recording between calls.".into());
+                }
+                library::save(
+                    &self.account_path.with_file_name("call-recording.json"),
+                    &enabled,
+                )?;
+                self.status.record_calls = enabled;
+                self.status.recording_error = None;
+                Ok(())
+            }
             Action::SelectAudio { input, output } => {
                 if self.call.is_some() {
                     return Err("Change audio devices between calls.".into());
@@ -569,7 +596,9 @@ impl Phone {
     async fn close_link(&mut self) {
         self.teardown = None;
         self.call_end = None;
-        self.call = None;
+        if let Some(mut call) = self.call.take() {
+            self.save_recording(&mut call);
+        }
         if let Some(link) = self.link.take() {
             let _ = timeout(
                 Duration::from_secs(3),
@@ -672,14 +701,20 @@ impl Phone {
         self.watch_call_end(&call);
         let muted = Arc::new(AtomicBool::new(false));
         self.status.notice = None;
+        self.status.recording_error = None;
+        let recordings = self.account_path.with_file_name("recordings");
+        let record_to = self.status.record_calls.then_some(recordings.as_path());
         let audio = if self.audio_enabled() {
             match timeout(
                 ACTION_TIMEOUT,
-                CallAudio::start(&call, &self.status.audio, muted.clone()),
+                CallAudio::start(&call, &self.status.audio, muted.clone(), record_to),
             )
             .await
             {
-                Ok(Ok(audio)) => Some(audio),
+                Ok(Ok((audio, recording_error))) => {
+                    self.status.recording_error = recording_error;
+                    Some(audio)
+                }
                 Ok(Err(error)) => {
                     self.status.notice = Some(error);
                     None
@@ -705,12 +740,13 @@ impl Phone {
 
     async fn hang_up(&mut self) {
         self.ringer = None;
-        let Some(current) = self.call.take() else {
+        let Some(mut current) = self.call.take() else {
             return;
         };
         if let Some(log) = &mut self.log {
             log.stop_timer();
         }
+        self.save_recording(&mut current);
         let id = current.id();
         let peer = current.status().peer;
         let call = match current {
@@ -762,11 +798,33 @@ impl Phone {
         });
     }
 
+    fn save_recording(&mut self, call: &mut Call) {
+        if let Call::Connected {
+            audio: Some(audio), ..
+        } = call
+            && let Some(recording) = audio.recording.take()
+        {
+            match recording.finish() {
+                Ok(Some(filename)) => {
+                    if let Some(log) = &mut self.log {
+                        log.set_recording(filename);
+                    }
+                }
+                Ok(None) => {
+                    self.status.recording_error = Some("No call audio was recorded.".into())
+                }
+                Err(error) => self.status.recording_error = Some(error),
+            }
+        }
+    }
+
     fn finish_call(&mut self, notice: &str) {
         self.ringer = None;
         self.teardown = None;
         self.call_end = None;
-        self.call = None;
+        if let Some(mut call) = self.call.take() {
+            self.save_recording(&mut call);
+        }
         self.status.notice = Some(notice.into());
         tracing::info!("Call ended");
     }
@@ -898,6 +956,15 @@ impl Phone {
                     self.update();
                 }
             }
+        }
+
+        if matches!(&self.call, Some(Call::Connected { audio: Some(audio), .. })
+            if audio.recording.as_ref().is_some_and(|recording| recording.failed()))
+            && self.status.recording_error.is_none()
+        {
+            self.status.recording_error =
+                Some("Call recording stopped because audio could not be saved.".into());
+            self.update();
         }
 
         match &mut self.call {
@@ -1033,6 +1100,26 @@ pub(crate) fn validate_target(target: &str, secure: bool) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn call_recording_defaults_to_off_and_persists_both_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("account.json");
+        let phone = PhoneHandle::start(path.clone());
+        assert!(!phone.status.borrow().record_calls);
+
+        for enabled in [true, false] {
+            phone
+                .perform(Action::SetCallRecording(enabled))
+                .await
+                .unwrap();
+            assert_eq!(phone.status.borrow().record_calls, enabled);
+            let restarted = PhoneHandle::start(path.clone());
+            assert_eq!(restarted.status.borrow().record_calls, enabled);
+            restarted.shutdown().await;
+        }
+        phone.shutdown().await;
+    }
 
     #[test]
     fn validates_dial_targets_and_secure_transport() {
@@ -1374,6 +1461,8 @@ mod hangup_tests {
             call: None,
             audio: AudioSelection::default(),
             notice: None,
+            record_calls: false,
+            recording_error: None,
         };
         let (publish, _receive) = watch::channel(status.clone());
         let mut phone = Phone {

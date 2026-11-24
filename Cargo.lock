@@ -4621,8 +4621,6 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "rvoip-audio-device"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2921c664039ef664f18af4ccda43982a8655af6df9ffc8d95f23cb7ed2adac21"
 dependencies = [
  "anyhow",
  "cpal",
@@ -5468,6 +5466,7 @@ dependencies = [
  "cpal",
  "dirs",
  "eframe",
+ "hound",
  "jni 0.21.1",
  "keyring",
  "ndk-context",

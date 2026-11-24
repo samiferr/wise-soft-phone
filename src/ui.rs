@@ -414,6 +414,7 @@ mod tests {
             kind: CallType::Incoming,
             timestamp: chrono::Local::now().timestamp(),
             seconds: Some(31),
+            recording: None,
         }]);
         let desktop = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 720.));
         let phone = egui::Rect::from_center_size(desktop.center(), PHONE_SIZE);
@@ -530,6 +531,7 @@ mod tests {
             peer: "test".into(),
             phase: CallPhase::Connected,
             muted: false,
+            recording: false,
         };
         let mut rect = egui::Rect::NOTHING;
         let input = || egui::RawInput {
