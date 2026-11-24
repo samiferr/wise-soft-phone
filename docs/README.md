@@ -26,6 +26,8 @@ These seven views explain the Rust/egui voice-only SIP app using [the supplied d
 | [6. Implementation and development](06-implementation-view.md) | Contributors | Source layout, dependencies, build, tests, patch maintenance |
 | [7. Deployment and operations](07-deployment-view.md) | Operators, support, security reviewers | Desktop topology, prerequisites, networking, startup, diagnosis, recovery |
 
+The separate [Android APK build guide](android-build.md) covers the mobile packaging toolchain (JDK, Android SDK/NDK, environment, and signing) used to rebuild the Android distribution.
+
 ## Baseline and evidence
 
 These docs describe `softphone` **0.2.0**, Rust edition 2024, egui/eframe **0.37.0**, and RVoIP **0.4.0** with the local dialog patch. Development and testing target Linux. Startup logs identify the latest routing fix as `ack-hostname-v3`.

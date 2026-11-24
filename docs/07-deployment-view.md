@@ -55,6 +55,8 @@ Run the resulting executable:
 
 The app needs a graphical session, OpenGL, audio, and OS libraries and services. Windows/macOS and installer packages have not been tested. Any launcher or package must provide the same settings, certificate trust, audio access, and writable log location.
 
+The Android distribution needs a separate JDK 17 / Android SDK / NDK toolchain; see the [Android APK build guide](android-build.md).
+
 For development, use `cargo run --locked`. Tests need local sockets. A sandbox error that blocks socket creation means the SIP checks could not run.
 
 ## Environment and configuration

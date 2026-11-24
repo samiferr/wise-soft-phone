@@ -28,7 +28,7 @@ Cargo builds the whole app from `src/` and the root `Cargo.toml`. No JavaScript,
 
 The ARM64 distribution runs on Android 9 or later. Open the APK on the phone and allow microphone access for calls. Keep the app open to receive incoming calls. Android may suspend the SIP connection in the background.
 
-To rebuild on Linux or macOS, install JDK 17, Android SDK Platform 35, Build Tools 35.0.1, and NDK r28c. Set `JAVA_HOME`, `ANDROID_HOME`, and `ANDROID_NDK_HOME` to those installations. From the repository root, run:
+To rebuild on Linux or macOS, install JDK 17, Android SDK Platform 35, Build Tools 35.0.1, and NDK r28c, and set `JAVA_HOME`, `ANDROID_HOME`, and `ANDROID_NDK_HOME` to those installations. Step-by-step setup commands are in the [Android APK build guide](docs/android-build.md). From the repository root, run:
 
 ```sh
 rustup target add aarch64-linux-android
