@@ -17,6 +17,7 @@ use tokio::time::{Instant, interval, timeout};
 use crate::account::Account;
 use crate::audio::{AudioSelection, CallAudio, DeviceList};
 use crate::library::{self, CallLog, Record};
+use crate::recording;
 use crate::ringer::Ringer;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,6 +50,9 @@ pub enum Action {
         digit: char,
     },
     SetCallRecording(bool),
+    DeleteRecording {
+        filename: String,
+    },
     SelectAudio {
         input: Option<String>,
         output: Option<String>,
@@ -67,6 +71,7 @@ impl Action {
             Self::SetMute { .. } => "set_mute",
             Self::SendDtmf { .. } => "send_dtmf",
             Self::SetCallRecording(_) => "set_call_recording",
+            Self::DeleteRecording { .. } => "delete_recording",
             Self::SelectAudio { .. } => "select_audio",
         }
     }
@@ -463,6 +468,18 @@ impl Phone {
                 self.status.recording_error = None;
                 Ok(())
             }
+            Action::DeleteRecording { filename } => {
+                recording::delete(&self.account_path.with_file_name("recordings"), &filename)?;
+                library::forget_recording(
+                    Arc::make_mut(&mut self.status.history).as_mut_slice(),
+                    &filename,
+                );
+                if let Some(path) = &self.history_path {
+                    library::save(path, self.status.history.as_ref())?;
+                }
+                self.update();
+                Ok(())
+            }
             Action::SelectAudio { input, output } => {
                 if self.call.is_some() {
                     return Err("Change audio devices between calls.".into());
@@ -717,10 +734,16 @@ impl Phone {
                 }
                 Ok(Err(error)) => {
                     self.status.notice = Some(error);
+                    self.status.recording_error = self.status.record_calls.then(|| {
+                        "This call is not being recorded because call audio could not start.".into()
+                    });
                     None
                 }
                 Err(_) => {
                     self.status.notice = Some("Opening the call audio timed out.".into());
+                    self.status.recording_error = self.status.record_calls.then(|| {
+                        "This call is not being recorded because call audio could not start.".into()
+                    });
                     None
                 }
             }

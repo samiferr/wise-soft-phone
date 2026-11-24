@@ -17,6 +17,29 @@ pub fn init(app: AndroidApp) {
     EDITOR.with_borrow_mut(|editor| *editor = Some((app, None)));
 }
 
+/// Space covered by system bars, display cutouts and the keyboard, as
+/// (left, top, right, bottom) in physical pixels.
+pub fn insets() -> [f32; 4] {
+    EDITOR.with_borrow(|editor| {
+        let Some((app, _)) = editor else {
+            return [0.; 4];
+        };
+        let (Some(window), rect) = (app.native_window(), app.content_rect()) else {
+            return [0.; 4];
+        };
+        // The content rectangle is empty until Android reports it.
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return [0.; 4];
+        }
+        [
+            rect.left.max(0) as f32,
+            rect.top.max(0) as f32,
+            (window.width() - rect.right).max(0) as f32,
+            (window.height() - rect.bottom).max(0) as f32,
+        ]
+    })
+}
+
 pub fn sync(response: &Response, value: &mut String, password: bool) {
     EDITOR.with_borrow_mut(|editor| {
         let Some((app, active)) = editor else {

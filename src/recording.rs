@@ -173,7 +173,9 @@ fn write_recording(
         .map(|name| name.to_string_lossy().into_owned()))
 }
 
-pub fn open(directory: &Path, filename: &str) -> Result<(), String> {
+/// Resolves a stored recording name to a file inside `directory`, rejecting
+/// anything that is not a plain `.wav` filename.
+pub fn path(directory: &Path, filename: &str) -> Result<PathBuf, String> {
     let mut components = Path::new(filename).components();
     if !matches!(components.next(), Some(Component::Normal(_)))
         || components.next().is_some()
@@ -185,22 +187,47 @@ pub fn open(directory: &Path, filename: &str) -> Result<(), String> {
     if !path.is_file() {
         return Err("The recording file is unavailable.".into());
     }
-    open_file(&path).map_err(|_| "Could not open the call recording.".into())
+    Ok(path)
+}
+
+/// Hands the recording to another app: the Android share sheet, or the file
+/// manager showing the file on desktop.
+pub fn share(directory: &Path, filename: &str) -> Result<(), String> {
+    share_file(&path(directory, filename)?)
+        .map_err(|_| "Could not share the call recording.".into())
+}
+
+/// Deletes the recording file. A file that is already gone counts as deleted.
+pub fn delete(directory: &Path, filename: &str) -> Result<(), String> {
+    match path(directory, filename) {
+        Ok(path) => {
+            fs::remove_file(path).map_err(|_| "Could not delete the call recording.".into())
+        }
+        Err(error) if error == "The recording file is unavailable." => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(target_os = "android"))]
-fn open_file(path: &Path) -> Result<(), ()> {
+fn share_file(path: &Path) -> Result<(), ()> {
+    // Desktop sharing reveals the file so it can be dragged into mail or chat.
+    let mut command;
     #[cfg(target_os = "macos")]
-    let command = "open";
+    {
+        command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
+    }
     #[cfg(target_os = "windows")]
-    let command = "explorer";
+    {
+        command = std::process::Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let command = "xdg-open";
-
-    let mut child = std::process::Command::new(command)
-        .arg(path)
-        .spawn()
-        .map_err(|_| ())?;
+    {
+        command = std::process::Command::new("xdg-open");
+        command.arg(path.parent().ok_or(())?);
+    }
+    let mut child = command.spawn().map_err(|_| ())?;
     thread::spawn(move || {
         let _ = child.wait();
     });
@@ -208,7 +235,7 @@ fn open_file(path: &Path) -> Result<(), ()> {
 }
 
 #[cfg(target_os = "android")]
-fn open_file(path: &Path) -> Result<(), ()> {
+fn share_file(path: &Path) -> Result<(), ()> {
     use jni::{JavaVM, objects::JObject};
 
     let context = ndk_context::android_context();
@@ -278,5 +305,25 @@ mod tests {
         let (recording, _capture) = Recording::start(directory.path()).unwrap();
         assert_eq!(recording.finish().unwrap(), None);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn recording_names_are_confined_to_the_recordings_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("call.wav"), b"x").unwrap();
+        assert!(path(directory.path(), "call.wav").is_ok());
+        for name in ["../call.wav", "/etc/passwd.wav", "a/b.wav", "call.txt", ""] {
+            assert!(path(directory.path(), name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn deleting_removes_the_file_and_tolerates_a_missing_one() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("call.wav"), b"x").unwrap();
+        delete(directory.path(), "call.wav").unwrap();
+        assert!(!directory.path().join("call.wav").exists());
+        delete(directory.path(), "call.wav").unwrap();
+        assert!(delete(directory.path(), "../call.wav").is_err());
     }
 }

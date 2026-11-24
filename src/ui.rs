@@ -2,6 +2,7 @@ use crate::{
     account::Account,
     audio::DeviceList,
     phone::{Action, CallPhase, PhoneHandle, Registration, Status},
+    player::{Player, PlayerState},
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -48,6 +49,9 @@ struct Navigation {
     searching: bool,
     query: String,
     filter: Option<CallType>,
+    /// History row whose recording controls are open, by recording filename.
+    recording: Option<String>,
+    confirm_delete: bool,
     book_path: Option<PathBuf>,
     book: AddressBook,
     draft: Contact,
@@ -84,6 +88,7 @@ pub struct SoftphoneApp {
     ringing: bool,
     error: Option<String>,
     connected: Option<(String, Instant)>,
+    playback: Option<(String, Player)>,
 }
 
 impl SoftphoneApp {
@@ -132,6 +137,7 @@ impl SoftphoneApp {
             ringing: false,
             error: theme.err(),
             connected: None,
+            playback: None,
         };
         app.scan(ctx);
         app
@@ -162,6 +168,25 @@ impl SoftphoneApp {
             });
             ctx.request_repaint();
         });
+    }
+
+    /// Keeps the progress bar moving, reports playback failures, and releases
+    /// the speaker as soon as a call needs it.
+    fn poll_playback(&mut self, ctx: &egui::Context, in_call: bool) {
+        let Some((_, player)) = &self.playback else {
+            return;
+        };
+        match player.state() {
+            _ if in_call => self.playback = None,
+            PlayerState::Failed => {
+                self.playback = None;
+                self.error = Some("Could not play the recording.".into());
+            }
+            PlayerState::Loading | PlayerState::Playing => {
+                ctx.request_repaint_after(Duration::from_millis(100))
+            }
+            PlayerState::Paused | PlayerState::Finished => {}
+        }
     }
 
     fn can_dispatch(&self, ending_call: bool) -> bool {
@@ -346,6 +371,7 @@ impl eframe::App for SoftphoneApp {
         if self.connected.is_some() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        self.poll_playback(ctx, status.call.is_some());
         if ctx.input(|input| input.viewport().close_requested()) && !self.closed {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if !self.closing {
@@ -514,6 +540,7 @@ mod tests {
             ringing: false,
             error: None,
             connected: None,
+            playback: None,
         }
     }
 
@@ -577,5 +604,124 @@ mod tests {
             })
         ));
         phone.shutdown().await;
+    }
+
+    fn run_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        ui: impl FnMut(&mut egui::Ui),
+    ) -> Vec<(String, egui::Pos2)> {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400., 700.),
+                )),
+                events,
+                ..Default::default()
+            },
+            ui,
+        );
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.visual_bounding_rect().center(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn switch_flips_on_click_and_is_inert_when_disabled() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut value = false;
+        let rect = std::cell::Cell::new(egui::Rect::NOTHING);
+        let frame = |ctx: &egui::Context, enabled: bool, value: &mut bool, events| {
+            run_frame(ctx, events, |ui| {
+                ui.add_enabled_ui(enabled, |ui| {
+                    rect.set(switch(ui, value, "Record calls").rect);
+                });
+            });
+        };
+        frame(&ctx, true, &mut value, vec![]);
+        let pointer = rect.get().center();
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        frame(
+            &ctx,
+            false,
+            &mut value,
+            vec![egui::Event::PointerMoved(pointer)],
+        );
+        for pressed in [true, false] {
+            frame(&ctx, false, &mut value, click(pressed));
+        }
+        assert!(!value, "a disabled switch must not change");
+        frame(
+            &ctx,
+            true,
+            &mut value,
+            vec![egui::Event::PointerMoved(pointer)],
+        );
+        for pressed in [true, false] {
+            frame(&ctx, true, &mut value, click(pressed));
+        }
+        assert!(value);
+    }
+
+    #[tokio::test]
+    async fn history_row_with_a_recording_offers_controls_and_delete_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path().join("account.json"));
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut status = app.phone.status.borrow().clone();
+        status.history = Arc::new(vec![library::Record {
+            peer: "Test caller".into(),
+            target: Some("1002".into()),
+            kind: CallType::Incoming,
+            timestamp: chrono::Local::now().timestamp(),
+            seconds: Some(31),
+            recording: Some("call.wav".into()),
+        }]);
+        let show = |app: &mut SoftphoneApp, ctx: &egui::Context, status: &Status| {
+            run_frame(ctx, vec![], |ui| app.history(ui, status))
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        let labels = show(&mut app, &ctx, &status);
+        assert!(labels.contains(&"Test caller".to_owned()));
+        assert!(
+            !labels.contains(&"Ready".to_owned()),
+            "controls start hidden"
+        );
+
+        app.nav.recording = Some("call.wav".into());
+        let labels = show(&mut app, &ctx, &status);
+        assert!(labels.contains(&"Ready".to_owned()));
+        assert!(!labels.contains(&"Delete this recording?".to_owned()));
+
+        app.nav.confirm_delete = true;
+        let labels = show(&mut app, &ctx, &status);
+        assert!(labels.contains(&"Delete this recording?".to_owned()));
+
+        app.close_recording();
+        assert!(app.nav.recording.is_none() && !app.nav.confirm_delete);
     }
 }

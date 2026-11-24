@@ -46,7 +46,7 @@ The script builds and verifies `dist/wise-softphone-0.2.0-arm64-v8a.apk`. It cre
 
 The phone-sized window supports light and dark appearances. Search or filter recent calls in **History**. Selecting a call or a saved contact fills the keypad. Press **Call** to place the call. **Menu → Profile** lets you edit your display name and description or log out. The latest 500 calls, contacts, and profile are stored locally per SIP account.
 
-To save both sides of connected calls, enable **Menu → Settings → Record calls automatically**. Recording is off by default. Open a saved WAV from **Call history** on desktop or use **Share recording** on Android.
+To save both sides of connected calls, turn on the **Record calls** switch in **Menu → Settings**. Recording is off by default, applies to the next call, and shows a red "● Recording" label during the call. In **Call history**, tap the record icon on a call to open its recording controls: play, pause, stop, share, and delete (with confirmation). Share opens the Android share sheet, or shows the file in your file manager on desktop. On Android the app fills the whole screen and keeps controls clear of system bars.
 
 The app supports one account and one call. RVoIP refreshes registration. After a connection failure, register again. If registration fails while the endpoint is still open, choose **Disconnect** first. Calls are not redialed automatically.
 
