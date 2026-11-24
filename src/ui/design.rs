@@ -137,6 +137,12 @@ pub enum Icon {
     Outgoing,
     Missed,
     Next,
+    Record,
+    Play,
+    Pause,
+    Stop,
+    Trash,
+    Share,
 }
 
 pub fn icon(p: &Painter, center: Pos2, size: f32, glyph: Icon, color: Color32) {
@@ -263,6 +269,48 @@ pub fn icon(p: &Painter, center: Pos2, size: f32, glyph: Icon, color: Color32) {
             path(&[(21., 7.), (13., 15.), (4., 6.), (4., 12.)]);
             path(&[(4., 6.), (10., 6.)]);
         }
+        Icon::Record => {
+            circle(12., 12., 8.8);
+            p.circle_filled(point(12., 12.), size * 4.2 / 24., color);
+        }
+        Icon::Play => {
+            p.add(egui::Shape::convex_polygon(
+                vec![point(7., 4.5), point(19., 12.), point(7., 19.5)],
+                color,
+                Stroke::new(size / 12., color),
+            ));
+        }
+        Icon::Pause => {
+            for x in [6.5, 14.] {
+                p.rect_filled(
+                    Rect::from_min_max(point(x, 5.), point(x + 3.5, 19.)),
+                    1,
+                    color,
+                );
+            }
+        }
+        Icon::Stop => {
+            p.rect_filled(Rect::from_min_max(point(6., 6.), point(18., 18.)), 2, color);
+        }
+        Icon::Trash => {
+            path(&[(4., 7.), (20., 7.)]);
+            path(&[(9., 7.), (9., 4.5), (15., 4.5), (15., 7.)]);
+            path(&[(6., 7.), (7., 20.), (17., 20.), (18., 7.)]);
+            path(&[(10., 11.), (10., 16.)]);
+            path(&[(14., 11.), (14., 16.)]);
+        }
+        Icon::Share => {
+            path(&[(12., 15.), (12., 3.5)]);
+            path(&[(8., 7.5), (12., 3.5), (16., 7.5)]);
+            path(&[
+                (7., 11.),
+                (5., 11.),
+                (5., 20.),
+                (19., 20.),
+                (19., 11.),
+                (17., 11.),
+            ]);
+        }
     }
 }
 
@@ -277,6 +325,65 @@ pub fn icon_button(ui: &mut Ui, glyph: Icon, label: &str) -> Response {
         egui::WidgetInfo::labeled(egui::accesskit::Role::Button, ui.is_enabled(), label)
     });
     res.on_hover_text(label)
+}
+
+/// A 34 px icon button for inline controls. `active` tints the button, and
+/// `color` overrides the ink for destructive or recording actions.
+pub fn tool_button(
+    ui: &mut Ui,
+    glyph: Icon,
+    label: &str,
+    active: bool,
+    color: Option<Color32>,
+) -> Response {
+    let c = Colors::of(ui);
+    let enabled = ui.is_enabled();
+    let (r, res) = ui.allocate_exact_size(vec2(34., 34.), Sense::click());
+    if active || (enabled && (res.hovered() || res.has_focus())) {
+        ui.painter().rect_filled(r, 11, c.tint);
+    }
+    let ink = if enabled {
+        color.unwrap_or(c.ink)
+    } else {
+        c.muted.gamma_multiply(0.5)
+    };
+    icon(ui.painter(), r.center(), 17., glyph, ink);
+    res.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, label));
+    res.on_hover_text(label)
+}
+
+/// A labelled on/off switch. Returns the response; `value` flips on click.
+pub fn switch(ui: &mut Ui, value: &mut bool, label: &str) -> Response {
+    let c = Colors::of(ui);
+    let enabled = ui.is_enabled();
+    let (r, mut res) = ui.allocate_exact_size(vec2(46., 28.), Sense::click());
+    if res.clicked() {
+        *value = !*value;
+        res.mark_changed();
+    }
+    let on = ui.ctx().animate_bool_responsive(res.id, *value);
+    let track = if *value { c.primary } else { c.line };
+    let track = if enabled {
+        track
+    } else {
+        track.gamma_multiply(0.5)
+    };
+    ui.painter().rect_filled(r.shrink2(vec2(0., 2.)), 12, track);
+    let knob = pos2(r.left() + 14. + on * (r.width() - 28.), r.center().y);
+    ui.painter().circle_filled(knob, 10., Color32::WHITE);
+    if res.has_focus() {
+        ui.painter().rect_stroke(
+            r.expand(2.),
+            14,
+            Stroke::new(1.5, c.primary),
+            egui::StrokeKind::Outside,
+        );
+    }
+    let state = *value;
+    res.widget_info(|| {
+        egui::WidgetInfo::selected(egui::accesskit::Role::Switch, enabled, state, label)
+    });
+    res
 }
 
 pub fn brand(ui: &Ui, center: Pos2) {

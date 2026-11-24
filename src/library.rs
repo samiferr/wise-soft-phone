@@ -64,6 +64,15 @@ pub struct Record {
     pub recording: Option<String>,
 }
 
+/// Clears the stored recording name from history once its file is deleted.
+pub fn forget_recording(history: &mut [Record], filename: &str) {
+    for record in history {
+        if record.recording.as_deref() == Some(filename) {
+            record.recording = None;
+        }
+    }
+}
+
 pub struct CallLog {
     record: Record,
     connected: Option<Instant>,
@@ -123,4 +132,21 @@ pub struct AddressBook {
 pub struct Contact {
     pub name: String,
     pub target: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forgetting_a_recording_clears_only_that_call() {
+        let mut first = CallLog::new("a".into(), None, false);
+        first.set_recording("one.wav".into());
+        let mut second = CallLog::new("b".into(), None, false);
+        second.set_recording("two.wav".into());
+        let mut history = vec![first.finish(), second.finish()];
+        forget_recording(&mut history, "one.wav");
+        assert_eq!(history[0].recording, None);
+        assert_eq!(history[1].recording.as_deref(), Some("two.wav"));
+    }
 }

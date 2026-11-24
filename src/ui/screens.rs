@@ -22,6 +22,9 @@ fn inset(rect: Rect, x: f32) -> Rect {
 
 impl SoftphoneApp {
     fn navigate(&mut self, page: Page) {
+        if page != Page::History {
+            self.close_recording();
+        }
         self.nav.page = page;
         self.nav.drawer = false;
         self.nav.searching = false;
@@ -90,6 +93,19 @@ impl SoftphoneApp {
         }
     }
 
+    /// Points covered by system UI at each screen edge: left, top, right, bottom.
+    fn screen_insets(&self, pixels_per_point: f32) -> [f32; 4] {
+        #[cfg(target_os = "android")]
+        {
+            crate::android_input::insets().map(|pixels| pixels / pixels_per_point.max(1.))
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = pixels_per_point;
+            [0.; 4]
+        }
+    }
+
     pub(super) fn show(&mut self, ui: &mut Ui, status: &Status) {
         if status.registration == Registration::Registered && !self.nav.signed_in {
             self.load_line(status);
@@ -126,15 +142,23 @@ impl SoftphoneApp {
 
         let c = Colors::of(ui);
         let outer = ui.max_rect();
-        let bounds = Rect::from_center_size(outer.center(), outer.size().min(PHONE_SIZE));
-        ui.painter().rect_filled(outer, 0, c.line);
-        ui.painter().rect_filled(bounds, 14, c.bg);
-        ui.painter().rect_stroke(
-            bounds,
-            14,
-            Stroke::new(1., c.line),
-            egui::StrokeKind::Inside,
-        );
+        let bounds = if cfg!(target_os = "android") {
+            // Use the whole screen, keeping controls clear of system bars.
+            ui.painter().rect_filled(outer, 0, c.bg);
+            let [left, top, right, bottom] = self.screen_insets(ui.ctx().pixels_per_point());
+            Rect::from_min_max(outer.min + vec2(left, top), outer.max - vec2(right, bottom))
+        } else {
+            let bounds = Rect::from_center_size(outer.center(), outer.size().min(PHONE_SIZE));
+            ui.painter().rect_filled(outer, 0, c.line);
+            ui.painter().rect_filled(bounds, 14, c.bg);
+            ui.painter().rect_stroke(
+                bounds,
+                14,
+                Stroke::new(1., c.line),
+                egui::StrokeKind::Inside,
+            );
+            bounds
+        };
         let mut shell = region(ui, "phone", bounds.shrink(2.));
         let progress = shell.ctx().animate_bool_with_time(
             shell.scope_id().with("side menu"),
@@ -591,7 +615,169 @@ impl SoftphoneApp {
             });
     }
 
-    fn history(&mut self, ui: &mut Ui, status: &Status) {
+    /// Stops playback and collapses the open recording controls.
+    pub(super) fn close_recording(&mut self) {
+        self.playback = None;
+        self.nav.recording = None;
+        self.nav.confirm_delete = false;
+    }
+
+    fn recordings_directory(&self) -> std::path::PathBuf {
+        self.account_path.with_file_name("recordings")
+    }
+
+    /// Plays, pauses, or resumes the recording, starting playback on demand.
+    fn toggle_playback(&mut self, filename: &str) {
+        if let Some((playing, player)) = &self.playback
+            && playing == filename
+        {
+            match player.state() {
+                PlayerState::Playing => player.pause(),
+                PlayerState::Paused | PlayerState::Finished => player.resume(),
+                PlayerState::Loading => {}
+                PlayerState::Failed => self.playback = None,
+            }
+            if self.playback.is_some() {
+                return;
+            }
+        }
+        self.playback = None;
+        match crate::recording::path(&self.recordings_directory(), filename)
+            .and_then(|path| Player::start(path, self.phone.status.borrow().audio.output.clone()))
+        {
+            Ok(player) => self.playback = Some((filename.to_owned(), player)),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn recording_controls(&mut self, ui: &mut Ui, filename: &str, in_call: bool) {
+        let c = Colors::of(ui);
+        let (state, progress, played, length) = match &self.playback {
+            Some((playing, player)) if playing == filename => (
+                Some(player.state()),
+                player.progress(),
+                player.position_seconds(),
+                player.total_seconds(),
+            ),
+            _ => (None, 0., 0, 0),
+        };
+        let playing = state == Some(PlayerState::Playing);
+        Frame::new()
+            .fill(c.tint)
+            .corner_radius(12)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (bar, response) = ui.allocate_exact_size(
+                        vec2(ui.available_width() - 82., 24.),
+                        Sense::click_and_drag(),
+                    );
+                    let track = Rect::from_center_size(bar.center(), vec2(bar.width(), 4.));
+                    ui.painter().rect_filled(track, 2, c.line);
+                    let filled = Rect::from_min_max(
+                        track.min,
+                        pos2(track.left() + track.width() * progress, track.bottom()),
+                    );
+                    ui.painter().rect_filled(filled, 2, c.primary);
+                    if state.is_some() {
+                        ui.painter().circle_filled(
+                            pos2(filled.right(), bar.center().y),
+                            6.,
+                            c.primary,
+                        );
+                    }
+                    if let (Some((_, player)), Some(pointer)) =
+                        (&self.playback, response.interact_pointer_pos())
+                        && state.is_some()
+                        && (response.clicked() || response.dragged())
+                    {
+                        player.seek((pointer.x - track.left()) / track.width().max(1.));
+                    }
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::accesskit::Role::Slider,
+                            state.is_some(),
+                            "Recording position",
+                        )
+                    });
+                    let text = match state {
+                        None => "Ready".to_owned(),
+                        Some(PlayerState::Loading) => "Loading…".to_owned(),
+                        Some(_) => format!("{} / {}", duration(played), duration(length)),
+                    };
+                    ui.label(RichText::new(text).size(11.).color(c.muted));
+                });
+                if self.nav.confirm_delete {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Delete this recording?").size(13.));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let enabled = self.can_dispatch(false);
+                            if ui
+                                .add_enabled(
+                                    enabled,
+                                    Button::new(RichText::new("Delete").color(c.danger)),
+                                )
+                                .clicked()
+                            {
+                                self.playback = None;
+                                self.nav.recording = None;
+                                self.nav.confirm_delete = false;
+                                self.dispatch(
+                                    ui.ctx(),
+                                    Action::DeleteRecording {
+                                        filename: filename.to_owned(),
+                                    },
+                                );
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.nav.confirm_delete = false;
+                            }
+                        });
+                    });
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!in_call, |ui| {
+                        let (glyph, label) = if playing {
+                            (Icon::Pause, "Pause recording")
+                        } else {
+                            (Icon::Play, "Play recording")
+                        };
+                        if tool_button(ui, glyph, label, false, None).clicked() {
+                            self.toggle_playback(filename);
+                        }
+                        ui.add_enabled_ui(state.is_some(), |ui| {
+                            if tool_button(ui, Icon::Stop, "Stop recording", false, None).clicked()
+                            {
+                                self.playback = None;
+                            }
+                        });
+                    });
+                    if in_call {
+                        ui.label(
+                            RichText::new("Playback is off during calls")
+                                .size(11.)
+                                .color(c.muted),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if tool_button(ui, Icon::Trash, "Delete recording", false, Some(c.danger))
+                            .clicked()
+                        {
+                            self.nav.confirm_delete = true;
+                        }
+                        if tool_button(ui, Icon::Share, "Share recording", false, None).clicked() {
+                            self.error =
+                                crate::recording::share(&self.recordings_directory(), filename)
+                                    .err();
+                        }
+                    });
+                });
+            });
+    }
+
+    pub(super) fn history(&mut self, ui: &mut Ui, status: &Status) {
         let c = Colors::of(ui);
         let query = self.nav.query.trim().to_lowercase();
         let today = Local::now().date_naive();
@@ -646,31 +832,48 @@ impl SoftphoneApp {
                 |secs| format!("{} · {}", record.kind.label(), duration(secs)),
             );
             let time = time.format("%H:%M").to_string();
-            if person_row(
+            let recording = record.recording.as_deref();
+            let row = person_row(
                 ui,
                 name,
                 &meta,
                 Some((glyph, color)),
                 &time,
                 !target.is_empty(),
-            )
-            .clicked()
-                && !target.is_empty()
-            {
+                if recording.is_some() { 40. } else { 0. },
+            );
+            if row.clicked() && !target.is_empty() {
                 destination = Some(target.to_owned());
             }
-            if let Some(filename) = &record.recording {
-                let label = if cfg!(target_os = "android") {
-                    "Share recording"
-                } else {
-                    "Open recording"
-                };
-                if ui.small_button(label).clicked() {
-                    self.error = crate::recording::open(
-                        &self.account_path.with_file_name("recordings"),
-                        filename,
-                    )
-                    .err();
+            if let Some(filename) = recording {
+                let open = self.nav.recording.as_deref() == Some(filename);
+                let button = Rect::from_center_size(
+                    pos2(row.rect.right() - 25., row.rect.center().y),
+                    vec2(34., 34.),
+                );
+                let toggle = ui
+                    .scope_builder(UiBuilder::new().max_rect(button), |ui| {
+                        tool_button(
+                            ui,
+                            Icon::Record,
+                            if open {
+                                "Hide recording controls"
+                            } else {
+                                "Show recording controls"
+                            },
+                            open,
+                            Some(c.danger),
+                        )
+                    })
+                    .inner;
+                if toggle.clicked() {
+                    self.close_recording();
+                    if !open {
+                        self.nav.recording = Some(filename.to_owned());
+                    }
+                }
+                if open {
+                    self.recording_controls(ui, filename, status.call.is_some());
                 }
             }
         }
@@ -820,7 +1023,7 @@ impl SoftphoneApp {
         for contact in &self.nav.book.contacts {
             if matches_query(&query, &contact.name, &contact.target) {
                 found = true;
-                if person_row(ui, &contact.name, &contact.target, None, "", true).clicked() {
+                if person_row(ui, &contact.name, &contact.target, None, "", true, 0.).clicked() {
                     destination = Some(contact.target.clone());
                 }
             }
@@ -980,16 +1183,29 @@ impl SoftphoneApp {
         ui.add_space(12.);
         ui.separator();
         let mut record_calls = status.record_calls;
-        if ui
-            .add_enabled(
-                self.can_dispatch(false),
-                egui::Checkbox::new(&mut record_calls, "Record calls automatically"),
-            )
-            .changed()
-        {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 56.).max(0.));
+                ui.label(RichText::new("Record calls").size(15.).family(semibold()));
+                caption(
+                    ui,
+                    if status.call.is_some() {
+                        "Change this between calls."
+                    } else {
+                        "Saves both sides of connected calls to this device."
+                    },
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(self.can_dispatch(false) && status.call.is_none(), |ui| {
+                    changed = switch(ui, &mut record_calls, "Record calls").changed();
+                });
+            });
+        });
+        if changed {
             self.dispatch(ui.ctx(), Action::SetCallRecording(record_calls));
         }
-        caption(ui, "Saves both sides of connected calls to this device.");
         ui.add_space(12.);
         ui.separator();
         caption(
@@ -1043,6 +1259,7 @@ fn person_row(
     glyph: Option<(Icon, Color32)>,
     time: &str,
     enabled: bool,
+    reserved: f32,
 ) -> egui::Response {
     let c = Colors::of(ui);
     let (r, res) = ui.allocate_exact_size(
@@ -1072,7 +1289,7 @@ fn person_row(
         c,
     );
     let x = r.left() + 49.;
-    let title_right = r.right() - if time.is_empty() { 20. } else { 44. };
+    let title_right = r.right() - reserved - if time.is_empty() { 20. } else { 44. };
     let mut title = region(
         ui,
         "row name",
@@ -1088,7 +1305,7 @@ fn person_row(
         "row detail",
         Rect::from_min_max(
             pos2(x + if glyph.is_some() { 15. } else { 0. }, r.top() + 29.),
-            pos2(r.right() - 10., r.bottom() - 3.),
+            pos2(r.right() - reserved - 10., r.bottom() - 3.),
         ),
     );
     let color = glyph.map_or(c.muted, |(_, color)| color);
@@ -1110,7 +1327,7 @@ fn person_row(
         );
     } else {
         ui.painter().text(
-            pos2(r.right() - 9., r.top() + 16.),
+            pos2(r.right() - reserved - 9., r.top() + 16.),
             Align2::RIGHT_CENTER,
             time,
             FontId::proportional(11.),
