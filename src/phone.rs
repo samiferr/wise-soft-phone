@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, interval, timeout};
 
 use crate::account::Account;
-use crate::audio::{AudioSelection, CallAudio, DeviceList};
+use crate::audio::{AudioSelection, CallAudio, DeviceList, VoiceEnhancements};
 use crate::library::{self, CallLog, Record};
 use crate::recording;
 use crate::ringer::Ringer;
@@ -50,6 +50,7 @@ pub enum Action {
         digit: char,
     },
     SetCallRecording(bool),
+    SetVoiceEnhancements(VoiceEnhancements),
     DeleteRecording {
         filename: String,
     },
@@ -71,6 +72,7 @@ impl Action {
             Self::SetMute { .. } => "set_mute",
             Self::SendDtmf { .. } => "send_dtmf",
             Self::SetCallRecording(_) => "set_call_recording",
+            Self::SetVoiceEnhancements(_) => "set_voice_enhancements",
             Self::DeleteRecording { .. } => "delete_recording",
             Self::SelectAudio { .. } => "select_audio",
         }
@@ -95,6 +97,7 @@ pub struct Status {
     pub audio: AudioSelection,
     pub notice: Option<String>,
     pub record_calls: bool,
+    pub enhancements: VoiceEnhancements,
     pub recording_error: Option<String>,
 }
 
@@ -227,6 +230,13 @@ impl PhoneHandle {
             Err(err) => (Account::default(), Some(err)),
         };
         let recording_setting = library::load::<bool>(&path.with_file_name("call-recording.json"));
+        let (enhancements, enhancements_error) = match library::load::<VoiceEnhancements>(
+            &path.with_file_name("voice-enhancements.json"),
+        ) {
+            Ok(enhancements) => (enhancements, None),
+            Err(error) => (VoiceEnhancements::default(), Some(error)),
+        };
+        let notice = notice.or(enhancements_error);
         let (record_calls, recording_error) = match recording_setting {
             Ok(enabled) => (enabled, None),
             Err(error) => (false, Some(error)),
@@ -240,6 +250,7 @@ impl PhoneHandle {
             audio: AudioSelection::default(),
             notice,
             record_calls,
+            enhancements,
             recording_error,
         };
         let (publish, receive) = watch::channel(status.clone());
@@ -466,6 +477,17 @@ impl Phone {
                 )?;
                 self.status.record_calls = enabled;
                 self.status.recording_error = None;
+                Ok(())
+            }
+            Action::SetVoiceEnhancements(enhancements) => {
+                if self.call.is_some() {
+                    return Err("Change voice settings between calls.".into());
+                }
+                library::save(
+                    &self.account_path.with_file_name("voice-enhancements.json"),
+                    &enhancements,
+                )?;
+                self.status.enhancements = enhancements;
                 Ok(())
             }
             Action::DeleteRecording { filename } => {
@@ -724,7 +746,13 @@ impl Phone {
         let audio = if self.audio_enabled() {
             match timeout(
                 ACTION_TIMEOUT,
-                CallAudio::start(&call, &self.status.audio, muted.clone(), record_to),
+                CallAudio::start(
+                    &call,
+                    &self.status.audio,
+                    muted.clone(),
+                    record_to,
+                    self.status.enhancements,
+                ),
             )
             .await
             {
@@ -1144,6 +1172,30 @@ mod tests {
         phone.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn voice_enhancements_default_on_and_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("account.json");
+        let phone = PhoneHandle::start(path.clone());
+        assert_eq!(
+            phone.status.borrow().enhancements,
+            VoiceEnhancements::default()
+        );
+        let changed = VoiceEnhancements {
+            echo_cancellation: false,
+            noise_suppression: true,
+            voice_enhancement: false,
+        };
+        phone
+            .perform(Action::SetVoiceEnhancements(changed))
+            .await
+            .unwrap();
+        let restarted = PhoneHandle::start(path.clone());
+        assert_eq!(restarted.status.borrow().enhancements, changed);
+        restarted.shutdown().await;
+        phone.shutdown().await;
+    }
+
     #[test]
     fn validates_dial_targets_and_secure_transport() {
         for target in [
@@ -1485,6 +1537,7 @@ mod hangup_tests {
             audio: AudioSelection::default(),
             notice: None,
             record_calls: false,
+            enhancements: Default::default(),
             recording_error: None,
         };
         let (publish, _receive) = watch::channel(status.clone());

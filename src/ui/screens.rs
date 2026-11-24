@@ -106,6 +106,40 @@ impl SoftphoneApp {
         }
     }
 
+    /// A titled switch row for a setting that can only change between calls.
+    /// Returns true when the person flipped it.
+    fn setting_switch(
+        &self,
+        ui: &mut Ui,
+        status: &Status,
+        title: &str,
+        detail: &str,
+        value: &mut bool,
+    ) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 56.).max(0.));
+                ui.label(RichText::new(title).size(15.).family(semibold()));
+                caption(
+                    ui,
+                    if status.call.is_some() {
+                        "Change this between calls."
+                    } else {
+                        detail
+                    },
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(self.can_dispatch(false) && status.call.is_none(), |ui| {
+                    changed = switch(ui, value, title).changed();
+                });
+            });
+        });
+        ui.add_space(4.);
+        changed
+    }
+
     pub(super) fn show(&mut self, ui: &mut Ui, status: &Status) {
         if status.registration == Registration::Registered && !self.nav.signed_in {
             self.load_line(status);
@@ -1165,7 +1199,7 @@ impl SoftphoneApp {
         }
     }
 
-    fn settings(&mut self, ui: &mut Ui, status: &Status) {
+    pub(super) fn settings(&mut self, ui: &mut Ui, status: &Status) {
         ui.label(RichText::new("Appearance").size(17.).family(semibold()));
         let dark = ui.visuals().dark_mode;
         ui.horizontal(|ui| {
@@ -1182,28 +1216,45 @@ impl SoftphoneApp {
         self.audio_devices(ui, status);
         ui.add_space(12.);
         ui.separator();
-        let mut record_calls = status.record_calls;
+        ui.add_space(6.);
+        ui.label(RichText::new("Voice quality").size(17.).family(semibold()));
+        let mut enhancements = status.enhancements;
         let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width((ui.available_width() - 56.).max(0.));
-                ui.label(RichText::new("Record calls").size(15.).family(semibold()));
-                caption(
-                    ui,
-                    if status.call.is_some() {
-                        "Change this between calls."
-                    } else {
-                        "Saves both sides of connected calls to this device."
-                    },
-                );
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(self.can_dispatch(false) && status.call.is_none(), |ui| {
-                    changed = switch(ui, &mut record_calls, "Record calls").changed();
-                });
-            });
-        });
+        changed |= self.setting_switch(
+            ui,
+            status,
+            "Echo cancellation",
+            "Stops the other person hearing themselves through your speaker.",
+            &mut enhancements.echo_cancellation,
+        );
+        changed |= self.setting_switch(
+            ui,
+            status,
+            "Noise suppression",
+            "Reduces steady background noise such as fans and traffic.",
+            &mut enhancements.noise_suppression,
+        );
+        changed |= self.setting_switch(
+            ui,
+            status,
+            "Voice enhancement",
+            "Evens out your volume and filters low-frequency rumble.",
+            &mut enhancements.voice_enhancement,
+        );
         if changed {
+            self.dispatch(ui.ctx(), Action::SetVoiceEnhancements(enhancements));
+        }
+        ui.add_space(12.);
+        ui.separator();
+        ui.add_space(6.);
+        let mut record_calls = status.record_calls;
+        if self.setting_switch(
+            ui,
+            status,
+            "Record calls",
+            "Saves both sides of connected calls to this device.",
+            &mut record_calls,
+        ) {
             self.dispatch(ui.ctx(), Action::SetCallRecording(record_calls));
         }
         ui.add_space(12.);

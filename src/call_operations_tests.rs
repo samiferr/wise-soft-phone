@@ -43,6 +43,7 @@ impl Pair {
             audio: AudioSelection::default(),
             notice: None,
             record_calls: false,
+            enhancements: Default::default(),
             recording_error: None,
         };
         let (publish, receive) = watch::channel(status.clone());
@@ -582,6 +583,7 @@ async fn direct_phone() -> (Phone, Endpoint) {
         audio: AudioSelection::default(),
         notice: None,
         record_calls: false,
+        enhancements: Default::default(),
         recording_error: None,
     };
     let (publish, _) = watch::channel(status.clone());

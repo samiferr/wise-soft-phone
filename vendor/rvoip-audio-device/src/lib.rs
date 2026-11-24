@@ -49,6 +49,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use rvoip_sip::{AudioFrame, AudioSender, AudioStream};
 
+mod voice;
+pub use voice::VoiceProcessing;
+use voice::VoiceProcessor;
+
 /// SIP audio is negotiated as 8 kHz mono PCM (G.711).
 const SAMPLE_RATE: u32 = 8_000;
 const FRAME_MS: u32 = 20;
@@ -91,6 +95,7 @@ pub struct DeviceOptions {
     muted: Option<Arc<AtomicBool>>,
     level_sink: Option<LevelSink>,
     frame_sink: Option<FrameSink>,
+    voice: VoiceProcessing,
 }
 
 impl DeviceOptions {
@@ -130,6 +135,14 @@ impl DeviceOptions {
     /// Observe call audio on the bridge thread. The callback must not block.
     pub fn with_frame_callback(mut self, callback: FrameSink) -> Self {
         self.frame_sink = Some(callback);
+        self
+    }
+
+    /// Apply echo cancellation, noise suppression, and voice enhancement to
+    /// the microphone. If the processor cannot start, the call continues
+    /// with unprocessed audio.
+    pub fn with_voice_processing(mut self, voice: VoiceProcessing) -> Self {
+        self.voice = voice;
         self
     }
 }
@@ -188,6 +201,7 @@ async fn run_bridge(
         muted,
         level_sink,
         frame_sink,
+        voice,
     } = opts;
     let muted = muted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
@@ -213,7 +227,21 @@ async fn run_bridge(
         last: 0.0,
         prime_samples: (output_sample_rate as usize * 50) / 1000, // ~50 ms pre-roll
         cap_samples: (output_sample_rate as usize * 300) / 1000,  // ~300 ms cap
+        render: VecDeque::new(),
+        tap: voice.any(),
     }));
+    let voice_processor = if voice.any() {
+        match VoiceProcessor::new(voice, input_sample_rate, output_sample_rate) {
+            Ok(processor) => Some(processor),
+            Err(error) => {
+                log::warn!("voice processing unavailable: {error}");
+                playback.lock().map(|mut pb| pb.tap = false).ok();
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // cpal streams are `!Send` and stay on this thread for their whole life.
     let input_stream = build_input_stream(
@@ -235,6 +263,7 @@ async fn run_bridge(
     // Mic pump (Send): captured f32 @ device rate -> 8 kHz i16 frames -> rvoip.
     let mic_level_sink = level_sink.clone();
     let mic_frame_sink = frame_sink.clone();
+    let mic_playback = playback.clone();
     let input_task = tokio::spawn(async move {
         send_microphone_frames(
             &mut mic_rx,
@@ -243,6 +272,8 @@ async fn run_bridge(
             mic_level_sink,
             mic_frame_sink,
             muted,
+            voice_processor,
+            mic_playback,
         )
         .await;
     });
@@ -310,6 +341,8 @@ async fn send_microphone_frames(
     level_sink: Option<LevelSink>,
     frame_sink: Option<FrameSink>,
     muted: Arc<AtomicBool>,
+    mut voice: Option<VoiceProcessor>,
+    playback: Arc<Mutex<Playback>>,
 ) {
     let mut mono_buffer = Vec::<f32>::new();
     let mut timestamp = 0u32;
@@ -356,6 +389,10 @@ async fn send_microphone_frames(
                 level_tick = level_tick.wrapping_add(1);
                 if level_tick % 5 == 0 {
                     emit_level(&level_sink, AudioDirection::Input, rms(&samples));
+                }
+                // Clean up the full-band signal before it is narrowed to 8 kHz.
+                if let Some(voice) = voice.as_mut() {
+                    samples = voice.process(&samples, &playback);
                 }
                 // Band-limit before decimating to 8 kHz to avoid aliasing.
                 if input_sample_rate > SAMPLE_RATE {
@@ -446,7 +483,14 @@ struct Playback {
     prime_samples: usize,
     /// Hard cap (~300 ms); drop oldest beyond this so latency self-corrects.
     cap_samples: usize,
+    /// Samples handed to the speaker, kept for the echo canceller to read.
+    render: VecDeque<f32>,
+    /// Whether to record what is played for the echo canceller.
+    tap: bool,
 }
+
+/// Longest echo reference kept if the microphone side stops reading.
+const RENDER_CAP: usize = 96_000;
 
 fn build_output_stream(
     device: &cpal::Device,
@@ -512,6 +556,13 @@ fn fill_output<T: Copy>(
                 pb.last *= 0.85;
                 pb.last
             };
+            if pb.tap {
+                // Silence and underruns are part of the timeline too.
+                pb.render.push_back(sample);
+                if pb.render.len() > RENDER_CAP {
+                    pb.render.pop_front();
+                }
+            }
             let converted = convert(sample);
             for out in frame {
                 *out = converted;

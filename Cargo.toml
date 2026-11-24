@@ -47,3 +47,20 @@ strip = "symbols"
 rvoip-audio-device = { path = "vendor/rvoip-audio-device" }
 # Preserve outbound-proxy routing for ACK/BYE with private provider Contacts.
 rvoip-sip-dialog = { path = "vendor/rvoip-sip-dialog" }
+
+# The WebRTC audio processing port is real-time DSP; unoptimized builds are too
+# slow for its tests and for debug sessions with a live microphone.
+[profile.dev.package."sonora"]
+opt-level = 3
+[profile.dev.package."sonora-aec3"]
+opt-level = 3
+[profile.dev.package."sonora-agc2"]
+opt-level = 3
+[profile.dev.package."sonora-common-audio"]
+opt-level = 3
+[profile.dev.package."sonora-fft"]
+opt-level = 3
+[profile.dev.package."sonora-ns"]
+opt-level = 3
+[profile.dev.package."sonora-simd"]
+opt-level = 3

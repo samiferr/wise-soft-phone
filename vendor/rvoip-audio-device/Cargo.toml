@@ -11,4 +11,6 @@ anyhow = "1"
 cpal = "0.15"
 log = "0.4"
 rvoip-sip = "=0.4.0"
+# WebRTC audio processing (AEC3, noise suppression, AGC2) in pure Rust.
+sonora = "0.3"
 tokio = { version = "1.36", features = ["full"] }

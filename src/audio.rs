@@ -6,8 +6,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use rvoip_audio_device::{AudioDirection, DeviceBridge, DeviceOptions, RunningAudio};
+use rvoip_audio_device::{
+    AudioDirection, DeviceBridge, DeviceOptions, RunningAudio, VoiceProcessing,
+};
 use rvoip_sip::{AudioSender, EndpointCall};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::recording::Recording;
@@ -16,6 +19,37 @@ use crate::recording::Recording;
 pub struct AudioSelection {
     pub input: Option<String>,
     pub output: Option<String>,
+}
+
+/// Microphone clean-up applied to calls. All three are on by default: they are
+/// what a phone call needs on a speaker or an open microphone, and the echo
+/// canceller backs off by itself when a headset leaves nothing to cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceEnhancements {
+    pub echo_cancellation: bool,
+    pub noise_suppression: bool,
+    pub voice_enhancement: bool,
+}
+
+impl Default for VoiceEnhancements {
+    fn default() -> Self {
+        Self {
+            echo_cancellation: true,
+            noise_suppression: true,
+            voice_enhancement: true,
+        }
+    }
+}
+
+impl VoiceEnhancements {
+    fn processing(self) -> VoiceProcessing {
+        VoiceProcessing {
+            echo_cancellation: self.echo_cancellation,
+            noise_suppression: self.noise_suppression,
+            voice_enhancement: self.voice_enhancement,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -113,6 +147,7 @@ impl CallAudio {
         selected: &AudioSelection,
         muted: Arc<AtomicBool>,
         recordings: Option<&Path>,
+        enhancements: VoiceEnhancements,
     ) -> Result<(Self, Option<String>), String> {
         let selected = selected.clone();
         let (input, output) = tokio::task::spawn_blocking(move || {
@@ -140,6 +175,7 @@ impl CallAudio {
         let pulse = heartbeat.clone();
         let started = Instant::now();
         let mut options = DeviceOptions::new()
+            .with_voice_processing(enhancements.processing())
             .with_mute_flag(muted)
             .with_level_callback(move |level| {
                 if level.direction == AudioDirection::Input {
@@ -179,6 +215,22 @@ impl CallAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn enhancements_default_on_and_tolerate_partial_files() {
+        assert_eq!(
+            VoiceEnhancements::default().processing(),
+            VoiceProcessing {
+                echo_cancellation: true,
+                noise_suppression: true,
+                voice_enhancement: true
+            }
+        );
+        let partial: VoiceEnhancements =
+            serde_json::from_str(r#"{"noise_suppression":false}"#).unwrap();
+        assert!(partial.echo_cancellation && partial.voice_enhancement);
+        assert!(!partial.noise_suppression);
+    }
+
     #[test]
     fn device_selection_rejects_disconnected_input_and_output() {
         let devices = DeviceList {

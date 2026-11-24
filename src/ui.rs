@@ -724,4 +724,39 @@ mod tests {
         app.close_recording();
         assert!(app.nav.recording.is_none() && !app.nav.confirm_delete);
     }
+
+    #[tokio::test]
+    async fn settings_offer_voice_quality_switches_that_lock_during_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(temp.path().join("account.json"));
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut status = app.phone.status.borrow().clone();
+        let show = |app: &mut SoftphoneApp, status: &Status| {
+            run_frame(&ctx, vec![], |ui| app.settings(ui, status))
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        let labels = show(&mut app, &status);
+        for title in [
+            "Voice quality",
+            "Echo cancellation",
+            "Noise suppression",
+            "Voice enhancement",
+            "Record calls",
+        ] {
+            assert!(labels.contains(&title.to_owned()), "{title}");
+        }
+        assert!(!labels.contains(&"Change this between calls.".to_owned()));
+
+        status.call = Some(crate::phone::CallStatus {
+            id: "active".into(),
+            peer: "test".into(),
+            phase: CallPhase::Connected,
+            muted: false,
+            recording: false,
+        });
+        assert!(show(&mut app, &status).contains(&"Change this between calls.".to_owned()));
+    }
 }
