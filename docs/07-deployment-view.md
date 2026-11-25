@@ -53,7 +53,7 @@ Run the resulting executable:
 ./target/release/softphone
 ```
 
-The app needs a graphical session, OpenGL, audio, and OS libraries and services. Windows/macOS and installer packages have not been tested. Any launcher or package must provide the same settings, certificate trust, audio access, and writable log location.
+The app needs a graphical session, OpenGL, audio, and OS libraries and services. Windows 10 / 11 has an installer and portable zip (see the [Windows distribution guide](windows-build.md)); it is compile-checked but not yet acceptance-tested on real Windows machines. macOS has not been tested. Any launcher or package must provide the same settings, certificate trust, audio access, and writable log location.
 
 The Android distribution needs a separate JDK 17 / Android SDK / NDK toolchain; see the [Android APK build guide](android-build.md).
 
@@ -64,9 +64,10 @@ For development, use `cargo run --locked`. Tests need local sockets. A sandbox e
 | Setting / resource | Location / behavior |
 | --- | --- |
 | Account configuration | `dirs::config_dir()/com.softphone.desktop/account.json` |
+| Windows | `%APPDATA%\com.softphone.desktop\account.json`; keyring is Windows Credential Manager; logs in `%LOCALAPPDATA%\com.softphone.desktop\logs` |
 | Linux default | `$XDG_CONFIG_HOME/com.softphone.desktop/account.json`, or `~/.config/com.softphone.desktop/account.json` |
 | Password persistence | OS keyring service `com.softphone.desktop`, when enabled |
-| Log directory | `SOFTPHONE_LOG_DIR` if set; otherwise `<build-time project directory>/logs` |
+| Log directory | `SOFTPHONE_LOG_DIR` if set; otherwise `<build-time project directory>/logs` (Linux), `%LOCALAPPDATA%\com.softphone.desktop\logs` (Windows) |
 | Main / previous log | `softphone.log` and `softphone.log.1` |
 | Routing revision | `ack-hostname-v3` in startup diagnostics |
 | Audio selection | In-memory microphone/output choice; default devices when unset |

@@ -1,6 +1,6 @@
 # Softphone
 
-A Rust desktop app for voice calls over SIP, tested on Linux. It uses **egui / eframe 0.37** with OpenGL for the interface and CPAL for the microphone and speaker. **RVoIP 0.4** handles SIP Digest registration, SDP, G.711 (PCMU / PCMA), RTP / SRTP, and RFC 4733 keypad tones.
+A Rust desktop app for voice calls over SIP, tested on Linux and distributed for Windows 10 and 11 and Android. It uses **egui / eframe 0.37** with OpenGL for the interface and CPAL for the microphone and speaker. **RVoIP 0.4** handles SIP Digest registration, SDP, G.711 (PCMU / PCMA), RTP / SRTP, and RFC 4733 keypad tones.
 
 ## System documentation
 
@@ -23,6 +23,12 @@ cargo build --locked --release
 ```
 
 Cargo builds the whole app from `src/` and the root `Cargo.toml`. No JavaScript, webview, Tauri CLI, or Node tools are needed.
+
+## Windows 10 and 11
+
+Run `wise-softphone-0.2.0-windows-x64-setup.exe` (per-user install, no administrator rights) or unzip `wise-softphone-0.2.0-windows-x64.zip` and run `softphone.exe`. Both Windows 10 and Windows 11 (64-bit) are supported, with no extra runtime to install. Allow microphone access for desktop apps in Windows Settings, and allow the app through Windows Defender Firewall when prompted. Settings are stored in `%APPDATA%\com.softphone.desktop`, remembered passwords in Windows Credential Manager, and logs in `%LOCALAPPDATA%\com.softphone.desktop\logs`.
+
+To rebuild on Windows with Rust 1.95+ and Visual Studio Build Tools (and Inno Setup 6.3+ for the installer), run `./windows/package-windows.ps1` in PowerShell. The same script runs in GitHub Actions ([`windows.yml`](.github/workflows/windows.yml)). See the [Windows distribution guide](docs/windows-build.md).
 
 ## Android APK
 
@@ -74,7 +80,7 @@ Tests cover account and destination checks, commands for ended calls, caller lab
 
 ## Diagnostic log
 
-Each run adds records to `logs/softphone.log` in this project folder. The startup message shows the full path. Logs include actions, state changes, timings, registration updates, and the direction and numeric response codes of SIP REGISTER / INVITE / ACK / BYE / CANCEL messages. Separate records for clicks and backend receipt help locate delays.
+Each run adds records to `logs/softphone.log` in this project folder (on Windows, `%LOCALAPPDATA%\com.softphone.desktop\logs\softphone.log`). The startup message shows the full path. Logs include actions, state changes, timings, registration updates, and the direction and numeric response codes of SIP REGISTER / INVITE / ACK / BYE / CANCEL messages. Separate records for clicks and backend receipt help locate delays.
 
 At 5 MiB, the log rotates and keeps the previous file as `logs/softphone.log.1`. Share both files after reproducing a problem. Set `SOFTPHONE_LOG_DIR` to change the directory. Git ignores logs. They exclude passwords, dialed digits, caller addresses, authentication headers, SDP, and full SIP messages. Socket addresses and internal call IDs help match related events.
 
