@@ -34,6 +34,10 @@ eframe = { version = "=0.37.0", default-features = false, features = ["android-g
 jni = "0.21"
 ndk-context = "0.1"
 
+[build-dependencies]
+# Embeds the icon, version info, and manifest into the Windows executable.
+winresource = "0.1"
+
 [profile.dev]
 debug = 0
 incremental = false

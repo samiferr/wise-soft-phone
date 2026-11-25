@@ -26,6 +26,8 @@ These seven views explain the Rust/egui voice-only SIP app using [the supplied d
 | [6. Implementation and development](06-implementation-view.md) | Contributors | Source layout, dependencies, build, tests, patch maintenance |
 | [7. Deployment and operations](07-deployment-view.md) | Operators, support, security reviewers | Desktop topology, prerequisites, networking, startup, diagnosis, recovery |
 
+The [Windows distribution guide](windows-build.md) covers building, installing, and troubleshooting the Windows 10 / 11 installer and portable zip.
+
 The separate [Android APK build guide](android-build.md) covers the mobile packaging toolchain (JDK, Android SDK/NDK, environment, and signing) used to rebuild the Android distribution.
 
 ## Baseline and evidence

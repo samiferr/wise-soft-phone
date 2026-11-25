@@ -39,11 +39,25 @@ fn android_main(app: android_activity::AndroidApp) {
     }
 }
 
+/// Windows installs have no project folder, so logs go to the per-user local
+/// application data directory. Other desktops keep the project `logs` folder.
+#[cfg(not(target_os = "android"))]
+fn desktop_log_directory() -> std::path::PathBuf {
+    if cfg!(windows) {
+        dirs::data_local_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("com.softphone.desktop")
+            .join("logs")
+    } else {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("logs")
+    }
+}
+
 fn run(directory: std::path::PathBuf, native_options: eframe::NativeOptions) -> eframe::Result {
     #[cfg(target_os = "android")]
     diagnostics::init(directory.join("logs"));
     #[cfg(not(target_os = "android"))]
-    diagnostics::init(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("logs"));
+    diagnostics::init(desktop_log_directory());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
